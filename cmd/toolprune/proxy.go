@@ -439,9 +439,3 @@ func runRouterStdioLoop(ctx context.Context, r *router.Router, logger *slog.Logg
 		}
 	}
 }
-
-func bindEnvFallback(flagName, envVar string, setter func(string)) {
-	if val := os.Getenv(envVar); val != "" {
-		setter(val)
-	}
-}

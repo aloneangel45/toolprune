@@ -1,0 +1,12 @@
+version: "1"
+server:
+  transport: "stdio"
+pruning:
+  tier: "aggressive"
+routing:
+  default_profile: "full"
+upstreams:
+  - id: "test_bad_timeout"
+    transport: "stdio"
+    command: "go"
+    timeout: "-5s"

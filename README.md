@@ -162,10 +162,10 @@ toolprune bench -- npx -y @modelcontextprotocol/server-github
                                        │
                  Outbound Bidirectional JSON-RPC 2.0
                                        ▼
-   ┌───────────────────────┬─────────────────────────┬───────────────────┐
-   │  Upstream Server 1    │   Upstream Server 2     │ Upstream Server 3 │
-   │  (e.g., GitHub MCP)   │   (e.g., SQLite MCP)    │ (e.g., Cloudflare)│
-   └───────────────────────┴─────────────────────────┴───────────────────┘
+  ┌───────────────────────┬─────────────────────────┬───────────────────┐
+  │  Upstream Server 1    │   Upstream Server 2     │ Upstream Server 3 │
+  │  (e.g., GitHub MCP)   │   (e.g., SQLite MCP)    │ (e.g., Cloudflare)│
+  └───────────────────────┴─────────────────────────┴───────────────────┘
 ```
 
 ```mermaid

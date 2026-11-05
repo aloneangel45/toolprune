@@ -49,6 +49,6 @@ var versionCmd = &cobra.Command{
 }
 
 func init() {
-	versionCmd.Flags().BoolVar(&shortVersion, "short", false, "Print version number only")
-	versionCmd.Flags().BoolVar(&jsonVersion, "json", false, "Output version telemetry in JSON")
+	versionCmd.Flags().BoolVar(&shortVersion, "short", false, "Print only version string")
+	versionCmd.Flags().BoolVar(&jsonVersion, "json", false, "Output version details in JSON format")
 }
