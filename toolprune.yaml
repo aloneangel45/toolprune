@@ -1,0 +1,168 @@
+# ==============================================================================
+# ToolPrune Configuration Reference (toolprune.yaml)
+# ==============================================================================
+# ToolPrune is a high-utility, zero-bloat MCP (Model Context Protocol) tool router
+# and token squeezer designed for Claude Desktop, Cursor, and developer workflows.
+# ==============================================================================
+
+version: "1"
+
+# ------------------------------------------------------------------------------
+# 1. Server Configuration
+# Inbound transport listening for AI client connections (Claude Desktop / Cursor)
+# ------------------------------------------------------------------------------
+server:
+  # Inbound transport protocol: "stdio" or "sse"
+  # - "stdio": Listens on stdin/stdout using newline-delimited JSON-RPC 2.0 (standard for Claude Desktop)
+  # - "sse": Starts an HTTP Server-Sent Events server at http://<host>:<port><base_path>/sse
+  transport: "stdio"
+
+  # Host interface and TCP port when transport is "sse"
+  host: "127.0.0.1"
+  port: 8080
+
+  # Optional base path prefix for SSE endpoints (e.g. "/mcp" -> "/mcp/sse", "/mcp/messages")
+  base_path: ""
+
+  # Allowed CORS origins for SSE web clients (default: ["*"])
+  cors_origins:
+    - "*"
+
+  # Global timeout duration for in-flight client requests (e.g. "30s", "1m", "2m")
+  timeout: "60s"
+
+  # Whether to inject ToolPrune version banner into the MCP initialize response
+  inject_proxy_info: true
+
+# ------------------------------------------------------------------------------
+# 2. Schema Pruning Configuration (Token Squeezer Engine)
+# Compresses verbose JSON Schema definitions to reduce LLM context token consumption
+# ------------------------------------------------------------------------------
+pruning:
+  # Schema optimization tier:
+  # - "none": Passthrough raw schemas without modifications (0% token savings)
+  # - "lossless": Strips $schema, comments, titles, examples, and redundant attributes (~12% savings)
+  # - "compact": Condenses descriptions and regex patterns to standard formats (~37% savings)
+  # - "aggressive": Strips self-evident parameter descriptions while preserving types & enums (~47-65% savings)
+  # - "dynamic": Compact catalog indexing with on-demand hydration (>80% savings)
+  tier: "aggressive"
+
+  # Maximum character limit for top-level tool descriptions before truncation
+  max_description_length: 120
+
+  # Maximum character limit for parameter descriptions in non-self-evident properties
+  max_param_desc_length: 80
+
+  # Whether to strip verbose regular expressions longer than max_regex_length
+  strip_regex: true
+
+  # Character threshold beyond which regex patterns are compressed or dropped
+  max_regex_length: 25
+
+  # Whether to strip descriptions for self-evident parameters (e.g. id, query, repo, path)
+  strip_self_evident: true
+
+  # Ensure all output schemas strictly conform to JSON Schema Draft-07
+  strict_draft07: true
+
+  # Strip markdown code blocks (```...```) from descriptions
+  strip_code_blocks: true
+
+  # Strip HTML markup (<tag>...</tag>) from descriptions
+  strip_html_tags: true
+
+# ------------------------------------------------------------------------------
+# 3. Router and Windowing Configuration
+# Dynamic tool catalog, active LRU sliding window, and profile-based filtering
+# ------------------------------------------------------------------------------
+routing:
+  # Active security and operational profile on startup:
+  # Built-in profiles: "full", "read_only", "dev", "minimal"
+  default_profile: "full"
+
+  # Tool namespacing strategy when multiplexing multiple upstream MCP servers:
+  # - "auto": Unprefixed if 1 upstream server, prefixed ("<prefix>__<tool>") if >= 2 upstreams
+  # - "always": Always prefix all exposed tool names ("<prefix>__<tool>")
+  # - "on_collision": Prefix only tool names that collide across different upstream servers
+  # - "none": Never prefix tools; throws an error on duplicate tool names
+  namespace_mode: "auto"
+
+  # Capacity of the sliding active tool window (LRU eviction threshold)
+  active_window_size: 15
+
+  # Automatically promote a dormant tool into the active window when called by the AI model
+  auto_promote: true
+
+  # Meta-tools and essential utilities immune to LRU window eviction
+  pinned_tools:
+    - "toolprune_search_tools"
+    - "toolprune_activate_tools"
+    - "toolprune_get_tool_schema"
+
+  # Global exclusion patterns (glob expressions) dropped across all profiles
+  global_exclude:
+    - "*_internal_*"
+
+  # Custom profile definitions (extends or overrides built-in profiles)
+  profiles:
+    custom_safe:
+      name: "custom_safe"
+      description: "Custom read-only profile protecting cloud production environments"
+      include:
+        - "*"
+      exclude:
+        - "*_delete_*"
+        - "*_drop_*"
+        - "*_destroy_*"
+        - "*_purge_*"
+        - "*_kill_*"
+
+    coding:
+      name: "coding"
+      description: "Development tools for coding, file operations, and git management"
+      include:
+        - "github__*"
+        - "git_*"
+        - "filesystem__*"
+        - "file_*"
+        - "*search*"
+        - "*read*"
+      exclude:
+        - "*deploy*"
+        - "*admin*"
+
+# ------------------------------------------------------------------------------
+# 4. Upstream Server Definitions
+# Backend MCP servers to launch, supervise, multiplex, and route
+# ------------------------------------------------------------------------------
+upstreams:
+  # Example 1: GitHub MCP server spawned as a supervised stdio subprocess
+  - id: "github"
+    prefix: "gh"
+    transport: "stdio"
+    command: "npx"
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-github"
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+    disabled: false
+    description: "Official GitHub MCP server for issues, PRs, and repository management"
+
+  # Example 2: SQLite database MCP server
+  - id: "sqlite"
+    transport: "stdio"
+    command: "uvx"
+    args:
+      - "mcp-server-sqlite"
+      - "--db-path"
+      - "${SQLITE_DB_PATH:-./local.db}"
+    disabled: false
+
+  # Example 3: Remote MCP server over HTTP/SSE
+  - id: "remote_agent"
+    transport: "sse"
+    url: "http://${REMOTE_HOST:-127.0.0.1}:${REMOTE_PORT:-9000}/sse"
+    timeout: "30s"
+    disabled: false
+    description: "Remote telemetry and analytics server"
