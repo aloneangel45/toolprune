@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
@@ -565,8 +564,9 @@ func TestAdversarial_Objective3_SubprocessCrashRecovery(t *testing.T) {
 	pid := sup.Pid()
 	t.Logf("Killing upstream subprocess PID %d abruptly...", pid)
 
-	killCmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
-	_ = killCmd.Run()
+	if p, findErr := os.FindProcess(pid); findErr == nil {
+		_ = p.Kill()
+	}
 
 	// 6. Read next SSE event. It MUST be an internal error (-32603) or EOF, not hang indefinitely!
 	type sseResult struct {
@@ -665,7 +665,9 @@ func TestAdversarial_Objective3_SubsequentRequestAfterCrash(t *testing.T) {
 
 	// Kill upstream process immediately
 	pid := sup.Pid()
-	_ = exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid)).Run()
+	if p, findErr := os.FindProcess(pid); findErr == nil {
+		_ = p.Kill()
+	}
 	time.Sleep(200 * time.Millisecond)
 
 	// Now send a request to the proxy when upstream is ALREADY DEAD

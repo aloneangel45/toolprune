@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -169,10 +170,16 @@ func TestAdversarial_Wrapper_ChildCrashDetection(t *testing.T) {
 	defer cancel()
 
 	logger := slog.Default()
+	cmdName := "cmd.exe"
+	cmdArgs := []string{"/c", "exit 42"}
+	if runtime.GOOS != "windows" {
+		cmdName = "sh"
+		cmdArgs = []string{"-c", "exit 42"}
+	}
 	supCfg := proxy.SupervisorConfig{
 		Name:         "crash-test",
-		Command:      "cmd.exe",
-		Args:         []string{"/c", "exit 42"},
+		Command:      cmdName,
+		Args:         cmdArgs,
 		GracePeriod:  500 * time.Millisecond,
 		Logger:       logger,
 		RingCapacity: 10,

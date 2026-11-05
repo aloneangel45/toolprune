@@ -147,7 +147,10 @@ func TestDebouncedNotifier(t *testing.T) {
 		})
 
 		notifier.Trigger()
-		time.Sleep(25 * time.Millisecond)
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for !secondCalled.Load() && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
 
 		if firstCalled.Load() {
 			t.Errorf("first broadcaster should not have been called")
