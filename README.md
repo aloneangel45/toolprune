@@ -63,7 +63,7 @@ The **Model Context Protocol (MCP)** has revolutionized agentic software enginee
 │                                  ▼                                     │
 │ 💸 Ballooning API Inference Invoices ($100s/developer/month)           │
 │ 🐢 Sluggish Time-To-First-Token (TTFT) and Request Latency             │
-│ 📉 Attention Drift and Schema Hallucination on Long Prompts            │
+│  Attention Drift and Schema Hallucination on Long Prompts            │
 │ ❌ Context Window Starvation (Less room for code and file history)     │
 └────────────────────────────────────────────────────────────────────────┘
 ```
