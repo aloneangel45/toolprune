@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT"/></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tests-100%25%20Pass%20(Race%20Clean)-brightgreen?style=flat-square" alt="Test Status"/></a>
+  <a href="https://github.com/aloneangel45/toolprune/actions/workflows/ci.yml"><img src="https://github.com/aloneangel45/toolprune/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Token%20Reduction-91.4%25-success?style=flat-square" alt="Token Savings"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Schema-Draft--07%20Compliant-orange?style=flat-square" alt="Draft-07 Compliant"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-JSON--RPC%202.0%20%7C%20SSE-blueviolet?style=flat-square" alt="MCP Protocol"/></a>
