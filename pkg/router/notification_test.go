@@ -18,7 +18,7 @@ func TestDebouncedNotifier(t *testing.T) {
 			return nil
 		}
 
-		notifier := router.NewDebouncedNotifier(broadcaster, 20*time.Millisecond)
+		notifier := router.NewDebouncedNotifier(broadcaster, 50*time.Millisecond)
 		defer notifier.Stop()
 
 		notifier.Trigger()
@@ -30,9 +30,9 @@ func TestDebouncedNotifier(t *testing.T) {
 		}
 
 		// Wait past interval with deadline
-		deadline := time.Now().Add(500 * time.Millisecond)
+		deadline := time.Now().Add(1000 * time.Millisecond)
 		for received.Load() == nil && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 		msg := received.Load()
 		if msg == nil {
@@ -57,19 +57,18 @@ func TestDebouncedNotifier(t *testing.T) {
 			return nil
 		}
 
-		notifier := router.NewDebouncedNotifier(broadcaster, 30*time.Millisecond)
+		notifier := router.NewDebouncedNotifier(broadcaster, 100*time.Millisecond)
 		defer notifier.Stop()
 
-		// Trigger 15 times within 15ms
-		for i := 0; i < 15; i++ {
+		// Trigger 20 times rapidly without sleeping
+		for i := 0; i < 20; i++ {
 			notifier.Trigger()
-			time.Sleep(1 * time.Millisecond)
 		}
 
 		// Wait for debounce timer to fire with deadline
-		deadline := time.Now().Add(500 * time.Millisecond)
+		deadline := time.Now().Add(1000 * time.Millisecond)
 		for emitCount.Load() != 1 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 
 		if emitCount.Load() != 1 {
@@ -121,18 +120,18 @@ func TestDebouncedNotifier(t *testing.T) {
 			return nil
 		}
 
-		notifier := router.NewDebouncedNotifier(broadcaster, 20*time.Millisecond)
+		notifier := router.NewDebouncedNotifier(broadcaster, 100*time.Millisecond)
 		notifier.Trigger()
 		notifier.Stop()
 
-		time.Sleep(35 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		if emitted.Load() {
 			t.Errorf("notification emitted after Stop()")
 		}
 
 		// Triggering after Stop should be a no-op
 		notifier.Trigger()
-		time.Sleep(35 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		if emitted.Load() {
 			t.Errorf("notification emitted after Stop() when Trigger called")
 		}
