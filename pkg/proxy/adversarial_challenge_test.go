@@ -47,6 +47,10 @@ func TestAdversarialHelperProcess(t *testing.T) {
 
 		// Emit single valid JSON-RPC message to stdout
 		_, _ = os.Stdout.WriteString(`{"jsonrpc":"2.0","id":100,"result":{"status":"drained_5mb"}}` + "\n")
+		// Wait for supervisor to close stdin on Stop() before exiting to prevent premature pipe closure by cmd.Wait()
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+		}
 		os.Exit(0)
 
 	case "echo_and_hang":

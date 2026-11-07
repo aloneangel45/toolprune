@@ -40,6 +40,10 @@ func TestHelperProcess(t *testing.T) {
 		}
 		// Write a valid JSON-RPC message to stdout so supervisor can read it
 		_, _ = os.Stdout.WriteString(`{"jsonrpc":"2.0","id":1,"result":{"status":"ok"}}` + "\n")
+		// Wait for supervisor to close stdin on Stop() before exiting to prevent premature pipe closure by cmd.Wait()
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+		}
 		os.Exit(0)
 
 	case "echo":
