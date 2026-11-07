@@ -29,8 +29,11 @@ func TestDebouncedNotifier(t *testing.T) {
 			t.Errorf("notification emitted prematurely")
 		}
 
-		// Wait past interval
-		time.Sleep(30 * time.Millisecond)
+		// Wait past interval with deadline
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for received.Load() == nil && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
 		msg := received.Load()
 		if msg == nil {
 			t.Fatalf("expected notification to be emitted after interval")
@@ -63,8 +66,11 @@ func TestDebouncedNotifier(t *testing.T) {
 			time.Sleep(1 * time.Millisecond)
 		}
 
-		// Wait for debounce timer to fire
-		time.Sleep(60 * time.Millisecond)
+		// Wait for debounce timer to fire with deadline
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for emitCount.Load() != 1 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
 
 		if emitCount.Load() != 1 {
 			t.Fatalf("expected 1 coalesced emission, got %d", emitCount.Load())

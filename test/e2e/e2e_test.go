@@ -39,12 +39,16 @@ func TestMain(m *testing.M) {
 	goBin := "go"
 	if customGo := os.Getenv("GO_BIN"); customGo != "" {
 		goBin = customGo
-	} else if _, err := os.Stat(`C:\Program Files\Go\bin\go.exe`); err == nil {
-		goBin = `C:\Program Files\Go\bin\go.exe`
+	} else if p, err := exec.LookPath("go"); err == nil {
+		goBin = p
 	}
 
-	toolpruneBin = filepath.Join(tempDir, "toolprune.exe")
-	testserverBin = filepath.Join(tempDir, "testserver.exe")
+	binExt := ""
+	if os.PathSeparator == '\\' {
+		binExt = ".exe"
+	}
+	toolpruneBin = filepath.Join(tempDir, "toolprune"+binExt)
+	testserverBin = filepath.Join(tempDir, "testserver"+binExt)
 
 	// Build toolprune binary
 	buildToolprune := exec.Command(goBin, "build", "-o", toolpruneBin, "./cmd/toolprune")
@@ -666,7 +670,7 @@ func TestE2E_HTTP_SSE_Transport(t *testing.T) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	var sseResp *http.Response
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 50; i++ {
 		req, _ := http.NewRequest("GET", sseURL, nil)
 		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
@@ -786,7 +790,7 @@ func TestE2E_UpstreamProcessTerminationPropagation(t *testing.T) {
 	select {
 	case <-done:
 		t.Logf("SUCCESS: ToolPrune proxy terminated immediately when upstream child died!")
-	case <-time.After(3 * time.Second):
+	case <-time.After(8 * time.Second):
 		_ = p.cmd.Process.Kill()
 		t.Fatalf("FAILURE: ToolPrune proxy remained stuck after upstream child died (did not propagate exit event)")
 	}

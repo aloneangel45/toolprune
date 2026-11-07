@@ -359,6 +359,17 @@ func TestMultiplexer_ReaderLoopAndFailureIsolation(t *testing.T) {
 	_ = mux.RegisterUpstream(ctx, router.UpstreamConfig{ID: "server1", Transport: tr1})
 	_ = mux.RegisterUpstream(ctx, router.UpstreamConfig{ID: "server2", Transport: tr2})
 
+	waitFor := func(cond func() bool, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return cond()
+	}
+
 	t.Run("upstream response is delivered to handler", func(t *testing.T) {
 		reqID := mcp.NewIntID(100)
 		respMsg, _ := mcp.NewResponse(reqID, map[string]string{"result": "success"})
@@ -366,13 +377,21 @@ func TestMultiplexer_ReaderLoopAndFailureIsolation(t *testing.T) {
 		// Feed into tr1
 		tr1.in <- respMsg
 
-		time.Sleep(30 * time.Millisecond)
+		ok := waitFor(func() bool {
+			handler.mu.Lock()
+			defer handler.mu.Unlock()
+			return len(handler.responses) == 1
+		}, 1*time.Second)
+
+		if !ok {
+			handler.mu.Lock()
+			count := len(handler.responses)
+			handler.mu.Unlock()
+			t.Fatalf("expected 1 response delivered, got %d", count)
+		}
 
 		handler.mu.Lock()
 		defer handler.mu.Unlock()
-		if len(handler.responses) != 1 {
-			t.Fatalf("expected 1 response delivered, got %d", len(handler.responses))
-		}
 		if handler.responses[0].ID == nil || handler.responses[0].ID.String() != "100" {
 			t.Errorf("unexpected response ID: %+v", handler.responses[0].ID)
 		}
@@ -384,13 +403,21 @@ func TestMultiplexer_ReaderLoopAndFailureIsolation(t *testing.T) {
 		// Feed into tr2
 		tr2.in <- notifMsg
 
-		time.Sleep(30 * time.Millisecond)
+		ok := waitFor(func() bool {
+			handler.mu.Lock()
+			defer handler.mu.Unlock()
+			return len(handler.notifications) == 1
+		}, 1*time.Second)
+
+		if !ok {
+			handler.mu.Lock()
+			count := len(handler.notifications)
+			handler.mu.Unlock()
+			t.Fatalf("expected 1 notification delivered, got %d", count)
+		}
 
 		handler.mu.Lock()
 		defer handler.mu.Unlock()
-		if len(handler.notifications) != 1 {
-			t.Fatalf("expected 1 notification delivered, got %d", len(handler.notifications))
-		}
 		if handler.notifications[0].Method != mcp.MethodNotificationsToolsListChanged {
 			t.Errorf("unexpected notification method: %s", handler.notifications[0].Method)
 		}
@@ -400,13 +427,14 @@ func TestMultiplexer_ReaderLoopAndFailureIsolation(t *testing.T) {
 		// Close server1's transport to simulate crash/EOF
 		_ = tr1.Close()
 
-		time.Sleep(30 * time.Millisecond)
+		ok := waitFor(func() bool {
+			handler.mu.Lock()
+			defer handler.mu.Unlock()
+			crashErr, crashed := handler.crashes["server1"]
+			return crashed && crashErr != nil
+		}, 1*time.Second)
 
-		handler.mu.Lock()
-		crashErr, crashed := handler.crashes["server1"]
-		handler.mu.Unlock()
-
-		if !crashed || crashErr == nil {
+		if !ok {
 			t.Errorf("expected server1 crash to be reported to handler")
 		}
 
@@ -415,12 +443,17 @@ func TestMultiplexer_ReaderLoopAndFailureIsolation(t *testing.T) {
 		respMsg2, _ := mcp.NewResponse(reqID2, map[string]string{"server2": "ok"})
 		tr2.in <- respMsg2
 
-		time.Sleep(30 * time.Millisecond)
+		ok2 := waitFor(func() bool {
+			handler.mu.Lock()
+			defer handler.mu.Unlock()
+			return len(handler.responses) == 2
+		}, 1*time.Second)
 
-		handler.mu.Lock()
-		defer handler.mu.Unlock()
-		if len(handler.responses) != 2 {
-			t.Fatalf("expected server2 to process response despite server1 crash, got %d responses", len(handler.responses))
+		if !ok2 {
+			handler.mu.Lock()
+			count := len(handler.responses)
+			handler.mu.Unlock()
+			t.Fatalf("expected server2 to process response despite server1 crash, got %d responses", count)
 		}
 	})
 }
