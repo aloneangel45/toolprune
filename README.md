@@ -42,6 +42,7 @@
   - [`toolprune bench`](#toolprune-bench)
   - [`toolprune routes`](#toolprune-routes)
   - [`toolprune config`](#toolprune-config)
+  - [`toolprune preset`](#toolprune-preset)
   - [`toolprune version`](#toolprune-version)
 - [Configuration Reference (`toolprune.yaml`)](#configuration-reference-toolpruneyaml)
 - [Contributing & License](#contributing--license)
@@ -448,6 +449,18 @@ Available Commands:
   init          Initialize a new toolprune.yaml configuration file with defaults
   validate      Validate toolprune.yaml syntax, schema rules, and upstream definitions
   patch-claude  Inspect and wrap existing Claude Desktop MCP server configurations
+```
+
+### `toolprune preset`
+Generates and validates out-of-the-box MCP client configuration presets for **Cursor** (`.cursor/mcp.json`) and **Windsurf** (`~/.codeium/windsurf/mcp_config.json`).
+
+```
+Usage:
+  toolprune preset [command]
+
+Available Commands:
+  generate    Generate a client MCP config preset for ToolPrune
+  validate    Validate a client MCP config file against the expected schema
 ```
 
 ### `toolprune version`

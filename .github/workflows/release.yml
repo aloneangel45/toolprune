@@ -85,5 +85,5 @@ jobs:
             dist/toolprune-windows-amd64.zip
             dist/toolprune-windows-amd64.exe
             dist/checksums.txt
-          title: "v1.0.0 - AST-Driven MCP Context Pruner"
+          title: "${{ env.VERSION }} - High-Performance MCP Proxy & Dynamic Schema Pruner"
           generate_release_notes: true

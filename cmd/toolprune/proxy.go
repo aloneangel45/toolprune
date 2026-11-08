@@ -387,8 +387,11 @@ func runRouterStdioLoop(ctx context.Context, r *router.Router, logger *slog.Logg
 			case mcp.MethodInitialize:
 				initRes := mcp.InitializeResult{
 					ProtocolVersion: mcp.LatestProtocolVersion,
-					ServerInfo:      mcp.Implementation{Name: "ToolPrune Unified Proxy", Version: Version},
-					Instructions:    "ToolPrune multiplexed MCP proxy: tools pruned and dynamically routed.",
+					Capabilities: mcp.ServerCapabilities{
+						Tools: &mcp.ToolsCapability{ListChanged: true},
+					},
+					ServerInfo:   mcp.Implementation{Name: "ToolPrune Unified Proxy", Version: Version},
+					Instructions: "ToolPrune multiplexed MCP proxy: tools pruned and dynamically routed.",
 				}
 				resp, _ := mcp.NewResponse(*msg.ID, initRes)
 				_ = stdioTransport.WriteMessage(resp)
