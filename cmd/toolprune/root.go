@@ -4,6 +4,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	presetcmd "github.com/aloneangel45/toolprune/cmd/preset"
 )
 
 var (
@@ -51,5 +53,6 @@ func init() {
 	rootCmd.AddCommand(benchCmd)
 	rootCmd.AddCommand(routesCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(presetcmd.NewCommand())
 	rootCmd.AddCommand(versionCmd)
 }
