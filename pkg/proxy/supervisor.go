@@ -395,9 +395,10 @@ func (s *Supervisor) Done() <-chan struct{} {
 	return s.doneCh
 }
 
-// Wait blocks until the supervised process exits and returns its termination error.
+// Wait blocks until the supervised process exits and all I/O streams are fully drained.
 func (s *Supervisor) Wait() error {
 	<-s.doneCh
+	s.wg.Wait()
 	s.waitErrMu.Lock()
 	defer s.waitErrMu.Unlock()
 	return s.waitErr

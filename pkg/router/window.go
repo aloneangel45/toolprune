@@ -144,9 +144,10 @@ func (w *ToolWindow) RecordUsage(toolName string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.usageTouches.Add(1)
+
 	node, ok := w.activeMap[toolName]
 	if ok {
-		w.usageTouches.Add(1)
 		node.usageCount++
 		node.lastUsed = time.Now()
 		w.moveToHead(node)
