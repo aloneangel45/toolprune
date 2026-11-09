@@ -16,7 +16,32 @@
   <a href="#"><img src="https://img.shields.io/badge/Token%20Reduction-91.4%25-success?style=flat-square" alt="Token Savings"/></a>
   <a href="#"><img src="https://img.shields.io/badge/Schema-Draft--07%20Compliant-orange?style=flat-square" alt="Draft-07 Compliant"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-JSON--RPC%202.0%20%7C%20SSE-blueviolet?style=flat-square" alt="MCP Protocol"/></a>
+  <a href="https://github.com/aloneangel45/toolprune/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/toolprune?style=flat-square&color=blue" alt="Latest Release"/></a>
 </p>
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 🚀 toolprune proxy --preset balanced                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ [MCP Gateway]  Intercepted 6 upstream MCP servers (42 tools loaded)         │
+│ [Context Tax]  Raw JSON Schema payload:               46,210 tokens         │
+│ [AST Optimizer]Pruned docstrings & optional bloat:     3,890 tokens         │
+│ [Prompt Cache] Claude 3.7 stable prefix:              STABILIZED (Cached)   │
+│ ─────────────────────────────────────────────────────────────────────────── │
+│ ⚡ Token Squeezed:  -91.6%   │   Turn Latency:  11.8s ➔ 0.9s                │
+│ 💰 Saved / Session: 42,320 tokens/turn (~$4.50/hr on Claude 3.7 Sonnet)     │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### ⚡ One-Line Install
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | iex
+```
 
 ---
 
@@ -208,7 +233,33 @@ flowchart LR
 
 ## Installation
 
-### Via `go install` (Recommended)
+### 1. Automated One-Line Install (Recommended)
+
+Automatically detects your operating system and CPU architecture, downloads the verified binary release from GitHub, and sets up your PATH:
+
+**macOS & Linux (Bash / Zsh):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | iex
+```
+
+---
+
+### 2. Docker Container
+
+Run directly without installing Go or native dependencies:
+
+```bash
+docker run -it --rm ghcr.io/aloneangel45/toolprune:latest proxy --preset balanced
+```
+
+---
+
+### 3. Via `go install`
 
 Requires Go 1.22+:
 
@@ -216,7 +267,9 @@ Requires Go 1.22+:
 go install github.com/aloneangel45/toolprune/cmd/toolprune@latest
 ```
 
-### Build from Source
+---
+
+### 4. Build from Source
 
 ```bash
 git clone https://github.com/aloneangel45/toolprune.git
