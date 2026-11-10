@@ -18,7 +18,7 @@ const (
 
 	// Standard MCP method names
 	MethodInitialize                    = "initialize"
-	MethodNotificationsInitialized       = "notifications/initialized"
+	MethodNotificationsInitialized      = "notifications/initialized"
 	MethodPing                          = "ping"
 	MethodToolsList                     = "tools/list"
 	MethodToolsCall                     = "tools/call"

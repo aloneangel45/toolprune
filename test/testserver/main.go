@@ -502,13 +502,13 @@ func executeCloudConfigValidator(args map[string]any) (string, bool) {
 	}
 
 	report := map[string]any{
-		"provider":        provider,
-		"region":          region,
-		"valid":           len(violations) == 0,
+		"provider":         provider,
+		"region":           region,
+		"valid":            len(violations) == 0,
 		"violations_count": len(violations),
-		"violations":      violations,
-		"framework":       args["compliance_framework"],
-		"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		"violations":       violations,
+		"framework":        args["compliance_framework"],
+		"timestamp":        time.Now().UTC().Format(time.RFC3339),
 	}
 	out, _ := json.MarshalIndent(report, "", "  ")
 	return string(out), false
@@ -1142,7 +1142,7 @@ Enables sliding window pagination across large document datasets with boundary-s
 			},
 		},
 		{
-			Name: "kubernetes_manifest_linter",
+			Name:        "kubernetes_manifest_linter",
 			Description: `Automated static analysis and security benchmarking linter for Cloud Native Computing Foundation (CNCF) Kubernetes workload resources, validating declarative YAML/JSON configurations against CIS Benchmarks, NSA/CISA Hardening guidelines, and Pod Security Standards (Privileged, Baseline, Restricted).`,
 			InputSchema: mcp.InputSchema{
 				Type: "object",

@@ -103,32 +103,26 @@ func (e *Engine) PruneToolsWithContext(tools []mcp.Tool, ctx proxy.BudgetContext
 		return pruned, proxy.BudgetPruneMetrics{PruneMetrics: pm}, err
 	}
 
-	// Preserve numeric/array/additionalProperties constraints so EnforceTokenBudget retains full structural fidelity
-	tierOpts := opts
-	tierOpts.Minify.StripAdditionalPropsFalse = false
-	tierOpts.Params.StripValidators = false
-
-	var base []mcp.Tool
-	if tierOpts.Tier == TierNone {
-		base = DeepCopyTools(tools)
-	} else {
-		base = make([]mcp.Tool, len(tools))
-		cloned := DeepCopyTools(tools)
-		for i, tool := range cloned {
-			pt, err := e.pruneSingleTool(tool, tierOpts)
-			if err != nil {
-				return nil, proxy.BudgetPruneMetrics{}, fmt.Errorf("failed to prune tool %q: %w", tool.Name, err)
-			}
-			base[i] = pt
-		}
-	}
-
 	rawEst := EstimateToolsBudgetTokens(tools)
-	compacted, bMetrics := EnforceTokenBudget(base, BudgetOptions{
+	compacted, bMetrics := EnforceTokenBudget(tools, BudgetOptions{
 		MaxSchemaTokens:   maxTokens,
 		PinnedTools:       ctx.PinnedTools,
 		ContextBoostTools: ctx.ContextBoostTools,
 	})
+	if bMetrics.PassReached == 0 && opts.Tier != TierNone {
+		// Budget was generous enough to require no budget compaction; still apply configured tier pruning.
+		tierOpts := opts
+		tierOpts.Minify.StripAdditionalPropsFalse = false
+		tierOpts.Params.StripValidators = false
+		for i := range compacted {
+			pt, err := e.pruneSingleTool(compacted[i], tierOpts)
+			if err != nil {
+				return nil, proxy.BudgetPruneMetrics{}, fmt.Errorf("failed to prune tool %q: %w", compacted[i].Name, err)
+			}
+			compacted[i] = pt
+		}
+		bMetrics.CompactedToken = EstimateToolsBudgetTokens(compacted)
+	}
 
 	if opts.StrictDraft07 {
 		for _, pt := range compacted {

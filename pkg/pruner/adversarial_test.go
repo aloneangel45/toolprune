@@ -177,13 +177,13 @@ func TestAdversarial_20LevelNesting(t *testing.T) {
 
 func buildRecursiveDefsTool() mcp.Tool {
 	return mcp.Tool{
-		Name: "pathological_recursive_defs_tool",
+		Name:        "pathological_recursive_defs_tool",
 		Description: "Schema with self-referencing and mutually recursive $defs and definitions.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"rootTree": map[string]any{
-					"type": "object",
+					"type":        "object",
 					"description": "Binary tree node root referencing $defs/treeNode",
 					"$ref":        "#/$defs/treeNode",
 					"$defs": map[string]any{
@@ -302,7 +302,7 @@ func buildLargePolymorphicUnionsTool(branchCount int) mcp.Tool {
 					"enum": []any{fmt.Sprintf("variant_%d_a", i), fmt.Sprintf("variant_%d_b", i)},
 				},
 				"payload": map[string]any{
-					"type": "string",
+					"type":    "string",
 					"pattern": `^[0-9a-fA-F]{8}$`,
 				},
 			},
@@ -335,7 +335,7 @@ func buildLargePolymorphicUnionsTool(branchCount int) mcp.Tool {
 	}
 
 	return mcp.Tool{
-		Name: "pathological_large_unions_tool",
+		Name:        "pathological_large_unions_tool",
 		Description: "Tool with large polymorphic unions: 50 anyOf branches, oneOf, and allOf combinations.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
@@ -437,7 +437,7 @@ func buildHeterogeneousArrayTool() mcp.Tool {
 		map[string]any{"type": "integer", "description": "Index 1: integer age", "minimum": float64(0)},
 		map[string]any{"type": "boolean", "description": "Index 2: boolean flag"},
 		map[string]any{
-			"type": "object",
+			"type":        "object",
 			"description": "Index 3: nested address",
 			"properties": map[string]any{
 				"city": map[string]any{"type": "string"},
@@ -445,14 +445,14 @@ func buildHeterogeneousArrayTool() mcp.Tool {
 			"required": []string{"city"},
 		},
 		map[string]any{
-			"type": "array",
+			"type":        "array",
 			"description": "Index 4: sub-array of numbers",
-			"items": map[string]any{"type": "number"},
+			"items":       map[string]any{"type": "number"},
 		},
 	}
 
 	return mcp.Tool{
-		Name: "pathological_heterogeneous_array_tool",
+		Name:        "pathological_heterogeneous_array_tool",
 		Description: "Tool containing heterogeneous tuple array items and nested multi-type collections.",
 		InputSchema: mcp.InputSchema{
 			Type: "object",
@@ -897,7 +897,7 @@ func TestAdversarial_UnicodeAndLargeStrings(t *testing.T) {
 			Type: "object",
 			Properties: map[string]any{
 				"unicode_param": map[string]any{
-					"type": "string",
+					"type":        "string",
 					"description": "Param with 4-byte UTF-8 truncation: 𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹 and Turkish chars: ğüşiöç İĞÜŞÖÇ",
 				},
 				"iso_date": map[string]any{

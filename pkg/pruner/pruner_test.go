@@ -170,8 +170,8 @@ func TestPruningTiers_TokenReductions(t *testing.T) {
 		minReduction float64
 	}{
 		{pruner.TierNone, 0.0},
-		{pruner.TierLossless, 0.02},  // At least 2% on compact JSON
-		{pruner.TierCompact, 0.30},   // Target > 30% reduction
+		{pruner.TierLossless, 0.02},   // At least 2% on compact JSON
+		{pruner.TierCompact, 0.30},    // Target > 30% reduction
 		{pruner.TierAggressive, 0.45}, // Target > 45% reduction
 	}
 

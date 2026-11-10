@@ -702,4 +702,3 @@ func TestAdversarial_Objective3_SubsequentRequestAfterCrash(t *testing.T) {
 		t.Fatalf("Expected -32603 JSON-RPC error response, got: %s", dt)
 	}
 }
-

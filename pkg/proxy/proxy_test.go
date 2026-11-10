@@ -1114,4 +1114,3 @@ func TestSSE_StreamableHTTP_Lifecycle(t *testing.T) {
 		t.Fatalf("expected 404 Not Found for terminated session, got %d", postDeletedResp.StatusCode)
 	}
 }
-

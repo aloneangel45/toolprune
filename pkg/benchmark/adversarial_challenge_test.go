@@ -384,7 +384,6 @@ func TestAdversarialEncoderSequentialReset(t *testing.T) {
 	}
 }
 
-
 // TestAdversarialTableFormatterRobustness verifies table and markdown generation on extreme values.
 func TestAdversarialTableFormatterRobustness(t *testing.T) {
 	t.Run("nil report", func(t *testing.T) {

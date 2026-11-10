@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	toolpruneBin string
+	toolpruneBin  string
 	testserverBin string
 )
 

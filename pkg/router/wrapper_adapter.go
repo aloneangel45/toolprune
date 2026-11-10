@@ -15,14 +15,14 @@ import (
 // wrapper mode supports full Tier 4 dynamic catalog indexing, sliding window promotion,
 // profile enforcement, and all 4 ToolPrune meta-tools.
 type WrapperCatalogAdapter struct {
-	mu          sync.RWMutex
-	store       *SchemaStore
-	window      *ToolWindow
-	filter      FilterEngine
-	pruner      *pruner.Engine
-	catalogCfg  CatalogConfig
-	rawCatalog  *wrapperCatalogProvider
-	onChanged   func()
+	mu         sync.RWMutex
+	store      *SchemaStore
+	window     *ToolWindow
+	filter     FilterEngine
+	pruner     *pruner.Engine
+	catalogCfg CatalogConfig
+	rawCatalog *wrapperCatalogProvider
+	onChanged  func()
 }
 
 type wrapperCatalogProvider struct {

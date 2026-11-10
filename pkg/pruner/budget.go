@@ -94,14 +94,23 @@ func EnforceTokenBudget(tools []mcp.Tool, opts BudgetOptions) ([]mcp.Tool, Budge
 		}
 	}
 
+	// Build cold-to-hot tool index order: lowest priority tools compacted first
+	coldOrder := rankToolsColdFirst(work, perTool, opts.PinnedTools, opts.ContextBoostTools)
+
 	// -------------------------------------------------------------------------
-	// Pass 2: Depth-weighted leaf docstring compaction (boost-aware)
+	// Pass 2: Depth-weighted leaf docstring compaction (boost-aware, in-place)
+	// Skip expensive string condensation on cold tools if even stripping all
+	// parameter docstrings (Pass 3) will still exceed effectiveCap.
 	// -------------------------------------------------------------------------
 	selfEvident := GetDefaultSelfEvidentDictionary()
+	skipColdPass2 := total > effectiveCap*2
 	for i := range work {
 		boost := 0.0
 		if opts.ContextBoostTools != nil {
 			boost = opts.ContextBoostTools[work[i].Name]
+		}
+		if skipColdPass2 && boost <= 0 && !isToolPinned(work[i].Name, opts.PinnedTools) {
+			continue
 		}
 		work[i] = budgetPass2DepthWeightedDocstrings(work[i], boost, selfEvident)
 	}
@@ -114,9 +123,6 @@ func EnforceTokenBudget(tools []mcp.Tool, opts BudgetOptions) ([]mcp.Tool, Budge
 			PassReached:    2,
 		}
 	}
-
-	// Build cold-to-hot tool index order: lowest priority tools compacted first
-	coldOrder := rankToolsColdFirst(work, perTool, opts.PinnedTools, opts.ContextBoostTools)
 
 	// -------------------------------------------------------------------------
 	// Pass 3: Strip all parameter-level docstrings (depth >= 1), cold tools first
@@ -171,16 +177,22 @@ func EnforceTokenBudget(tools []mcp.Tool, opts BudgetOptions) ([]mcp.Tool, Budge
 		}
 	}
 
-	// Secondary Pass 4 sweep: strip remaining top-level descriptions on cold tools if just slightly over
+	// Secondary Pass 4 sweep: strip remaining top-level descriptions & redundant display titles on cold tools
 	for _, idx := range coldOrder {
 		if opts.ContextBoostTools != nil && opts.ContextBoostTools[work[idx].Name] >= 0.5 {
 			continue
 		}
-		if work[idx].Description == "" {
+		if work[idx].Description == "" && work[idx].Title == "" && (work[idx].Annotations == nil || work[idx].Annotations.Title == "") {
 			continue
 		}
 		updated := work[idx]
 		updated.Description = ""
+		updated.Title = ""
+		if updated.Annotations != nil && updated.Annotations.Title != "" {
+			annCopy := *updated.Annotations
+			annCopy.Title = ""
+			updated.Annotations = &annCopy
+		}
 		newCost := EstimateToolBudgetTokens(updated)
 		delta := perTool[idx] - newCost
 		work[idx] = updated
@@ -207,9 +219,15 @@ func EnforceTokenBudget(tools []mcp.Tool, opts BudgetOptions) ([]mcp.Tool, Budge
 			continue
 		}
 		stub := ProjectCompactTool(work[idx], 36, len(work[idx].InputSchema.Required) <= 4)
-		// Under ultra-tight budgets, omit summary description on cold stubs if stub isn't smaller
+		// Under ultra-tight budgets, omit summary description and decorative titles on cold stubs
 		minStub := stub
 		if EstimateToolBudgetTokens(minStub) >= perTool[idx] || total-(perTool[idx]-EstimateToolBudgetTokens(minStub)) > effectiveCap {
+			minStub.Title = ""
+			if minStub.Annotations != nil && minStub.Annotations.Title != "" {
+				annCopy := *minStub.Annotations
+				annCopy.Title = ""
+				minStub.Annotations = &annCopy
+			}
 			if len(work[idx].InputSchema.Required) > 0 && len(work[idx].InputSchema.Required) <= 3 {
 				minStub.Description = "Req: " + strings.Join(work[idx].InputSchema.Required, ",")
 			} else {
@@ -437,83 +455,59 @@ func budgetPass1LosslessAndReachableDefs(t mcp.Tool) mcp.Tool {
 }
 
 func budgetCleanMapPass1(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
 	for k, v := range m {
 		if vm, ok := v.(map[string]any); ok {
-			out[k] = budgetCleanNodePass1(vm)
-		} else {
-			out[k] = v
+			m[k] = budgetCleanNodePass1(vm)
 		}
 	}
-	return out
+	return m
 }
 
 func budgetCleanSlicePass1(s []any) []any {
-	out := make([]any, len(s))
 	for i, v := range s {
 		if vm, ok := v.(map[string]any); ok {
-			out[i] = budgetCleanNodePass1(vm)
-		} else {
-			out[i] = v
+			s[i] = budgetCleanNodePass1(vm)
 		}
 	}
-	return out
+	return s
 }
 
 func budgetCleanNodePass1(node map[string]any) map[string]any {
-	out := make(map[string]any, len(node))
 	for k, v := range node {
 		switch k {
 		case "$schema", "$id", "title", "$comment", "comment", "examples", "example":
-			continue
+			delete(node, k)
 		case "required":
 			if arr, ok := v.([]any); ok && len(arr) == 0 {
-				continue
+				delete(node, k)
+			} else if arr, ok := v.([]string); ok && len(arr) == 0 {
+				delete(node, k)
 			}
-			if arr, ok := v.([]string); ok && len(arr) == 0 {
-				continue
-			}
-			out[k] = v
 		case "properties", "patternProperties", "$defs", "definitions", "dependentSchemas":
 			if sub, ok := v.(map[string]any); ok {
 				if len(sub) == 0 {
-					continue
+					delete(node, k)
+				} else {
+					node[k] = budgetCleanMapPass1(sub)
 				}
-				out[k] = budgetCleanMapPass1(sub)
-			} else {
-				out[k] = v
 			}
 		case "items":
 			if sub, ok := v.(map[string]any); ok {
-				out[k] = budgetCleanNodePass1(sub)
+				node[k] = budgetCleanNodePass1(sub)
 			} else if arr, ok := v.([]any); ok {
-				out[k] = budgetCleanSlicePass1(arr)
-			} else {
-				out[k] = v
+				node[k] = budgetCleanSlicePass1(arr)
 			}
 		case "anyOf", "oneOf", "allOf":
 			if arr, ok := v.([]any); ok {
-				out[k] = budgetCleanSlicePass1(arr)
-			} else {
-				out[k] = v
+				node[k] = budgetCleanSlicePass1(arr)
 			}
-		case "not", "if", "then", "else":
+		case "not", "if", "then", "else", "additionalProperties":
 			if sub, ok := v.(map[string]any); ok {
-				out[k] = budgetCleanNodePass1(sub)
-			} else {
-				out[k] = v
+				node[k] = budgetCleanNodePass1(sub)
 			}
-		case "additionalProperties":
-			if sub, ok := v.(map[string]any); ok {
-				out[k] = budgetCleanNodePass1(sub)
-			} else {
-				out[k] = v
-			}
-		default:
-			out[k] = v
 		}
 	}
-	return out
+	return node
 }
 
 func collectReachableRefs(s mcp.InputSchema) (map[string]bool, map[string]bool) {
@@ -623,38 +617,27 @@ func compactMapByDepth(m map[string]any, depth int, boost float64, selfEvident m
 	if m == nil {
 		return nil
 	}
-	out := make(map[string]any, len(m))
 	for name, raw := range m {
 		if nm, ok := raw.(map[string]any); ok {
-			out[name] = compactNodeByDepth(nm, name, depth, boost, selfEvident, condOpts)
-		} else {
-			out[name] = raw
+			m[name] = compactNodeByDepth(nm, name, depth, boost, selfEvident, condOpts)
 		}
 	}
-	return out
+	return m
 }
 
 func compactSliceByDepth(s []any, depth int, boost float64, selfEvident map[string]struct{}, condOpts CondenseOptions) []any {
 	if s == nil {
 		return nil
 	}
-	out := make([]any, len(s))
 	for i, item := range s {
 		if nm, ok := item.(map[string]any); ok {
-			out[i] = compactNodeByDepth(nm, "", depth, boost, selfEvident, condOpts)
-		} else {
-			out[i] = item
+			s[i] = compactNodeByDepth(nm, "", depth, boost, selfEvident, condOpts)
 		}
 	}
-	return out
+	return s
 }
 
-func compactNodeByDepth(node map[string]any, propName string, depth int, boost float64, selfEvident map[string]struct{}, condOpts CondenseOptions) map[string]any {
-	out := make(map[string]any, len(node))
-	for k, v := range node {
-		out[k] = v
-	}
-
+func compactNodeByDepth(out map[string]any, propName string, depth int, boost float64, selfEvident map[string]struct{}, condOpts CondenseOptions) map[string]any {
 	if desc, ok := out["description"].(string); ok && desc != "" {
 		maxLen := 0
 		switch {
@@ -762,52 +745,39 @@ func stripAllDocstringsMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
 	}
-	out := make(map[string]any, len(m))
 	for k, v := range m {
 		if nm, ok := v.(map[string]any); ok {
-			out[k] = stripAllDocstringsNode(nm)
-		} else {
-			out[k] = v
+			m[k] = stripAllDocstringsNode(nm)
 		}
 	}
-	return out
+	return m
 }
 
 func stripAllDocstringsSlice(s []any) []any {
 	if s == nil {
 		return nil
 	}
-	out := make([]any, len(s))
 	for i, item := range s {
 		if nm, ok := item.(map[string]any); ok {
-			out[i] = stripAllDocstringsNode(nm)
-		} else {
-			out[i] = item
+			s[i] = stripAllDocstringsNode(nm)
 		}
 	}
-	return out
+	return s
 }
 
 func stripAllDocstringsNode(node map[string]any) map[string]any {
-	out := make(map[string]any, len(node))
+	delete(node, "description")
 	for k, v := range node {
-		if k == "description" {
-			continue
-		}
 		switch sub := v.(type) {
 		case map[string]any:
-			out[k] = stripAllDocstringsNode(sub)
+			node[k] = stripAllDocstringsNode(sub)
 		case []any:
-			if k == "enum" {
-				out[k] = sub
-			} else {
-				out[k] = stripAllDocstringsSlice(sub)
+			if k != "enum" {
+				node[k] = stripAllDocstringsSlice(sub)
 			}
-		default:
-			out[k] = v
 		}
 	}
-	return out
+	return node
 }
 
 // =============================================================================
@@ -852,7 +822,23 @@ func EstimateToolBudgetTokens(t mcp.Tool) int {
 		proseBytes += len(t.Description)
 	}
 	if t.Annotations != nil {
-		structBytes += 48 + len(t.Annotations.Title)
+		structBytes += 18 // "annotations":{}
+		if t.Annotations.Title != "" {
+			structBytes += 11
+			proseBytes += len(t.Annotations.Title)
+		}
+		if t.Annotations.ReadOnlyHint != nil {
+			structBytes += 22
+		}
+		if t.Annotations.DestructiveHint != nil {
+			structBytes += 25
+		}
+		if t.Annotations.IdempotentHint != nil {
+			structBytes += 24
+		}
+		if t.Annotations.OpenWorldHint != nil {
+			structBytes += 23
+		}
 	}
 	if len(t.Icons) > 0 {
 		for _, ic := range t.Icons {
@@ -956,7 +942,7 @@ func EstimateToolBudgetTokens(t mcp.Tool) int {
 		structBytes += 18
 	}
 
-	est := float64(structBytes)/3.15 + float64(proseBytes)/3.95
+	est := float64(structBytes)/3.20 + float64(proseBytes)/3.95
 	return int(math.Ceil(est))
 }
 

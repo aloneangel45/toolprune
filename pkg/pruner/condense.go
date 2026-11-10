@@ -20,8 +20,8 @@ var (
 	reMultipleSpaces  = regexp.MustCompile(`[ \t\r\n]+`)
 
 	// Regex format detectors
-	reUUIDPattern = regexp.MustCompile(`(?i)(?:\[[0-9a-fA-F_\\]+\]\{8\}-\[[0-9a-fA-F_\\]+\]\{4\}|\[(?:0-9a-f|a-f0-9)[^\]]*\]\{8\}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4})`)
-	reISODateTime = regexp.MustCompile(`(?i)(?:\\d\{4\}-|\d{4}-|\[0-9\]\{4\}-|-(?:0[1-9]|1[0-2])-|-(?:0\[1-9\]|1\[0-2\])-|T\.\*Z|T\.\*|T\\d\{2\}|T\d{2}:\d{2}|\bUTC\b)`)
+	reUUIDPattern  = regexp.MustCompile(`(?i)(?:\[[0-9a-fA-F_\\]+\]\{8\}-\[[0-9a-fA-F_\\]+\]\{4\}|\[(?:0-9a-f|a-f0-9)[^\]]*\]\{8\}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4})`)
+	reISODateTime  = regexp.MustCompile(`(?i)(?:\\d\{4\}-|\d{4}-|\[0-9\]\{4\}-|-(?:0[1-9]|1[0-2])-|-(?:0\[1-9\]|1\[0-2\])-|T\.\*Z|T\.\*|T\\d\{2\}|T\d{2}:\d{2}|\bUTC\b)`)
 	reEmailPattern = regexp.MustCompile(`(?i)@.*(?:\.\w{2,}|\.com|\.org)`)
 	reURIPattern   = regexp.MustCompile(`(?i)https?://`)
 )
@@ -239,36 +239,45 @@ func CondenseDescription(desc string, maxLen int, opts CondenseOptions) string {
 	cleaned := raw
 
 	// Step A: Strip markdown code blocks (```...```)
-	if opts.StripCodeBlocks {
+	if opts.StripCodeBlocks && strings.Contains(cleaned, "```") {
 		cleaned = reCodeBlock.ReplaceAllString(cleaned, "")
 	}
 
 	// Step B: Strip markdown links [Text](url) -> Text
-	cleaned = reMarkdownLink.ReplaceAllString(cleaned, "$1")
+	if strings.IndexByte(cleaned, '[') >= 0 && strings.IndexByte(cleaned, '(') >= 0 {
+		cleaned = reMarkdownLink.ReplaceAllString(cleaned, "$1")
+	}
 
 	// Step C: Strip HTML tags
-	if opts.StripHTMLTags {
+	if opts.StripHTMLTags && strings.IndexByte(cleaned, '<') >= 0 && strings.IndexByte(cleaned, '>') >= 0 {
 		cleaned = reHTMLTag.ReplaceAllString(cleaned, "")
 	}
 
 	// Step D: Strip formatting marks (**bold**, *italic*, headers)
-	cleaned = reMarkdownFormat.ReplaceAllString(cleaned, "")
-	cleaned = reMarkdownHeader.ReplaceAllString(cleaned, "")
+	if strings.IndexAny(cleaned, "*_~") >= 0 {
+		cleaned = reMarkdownFormat.ReplaceAllString(cleaned, "")
+	}
+	if strings.IndexByte(cleaned, '#') >= 0 {
+		cleaned = reMarkdownHeader.ReplaceAllString(cleaned, "")
+	}
 
 	// Step E: Strip tutorial bullet and numbered step markers
 	if opts.StripTutorialLists {
-		cleaned = reTutorialBullets.ReplaceAllString(cleaned, "")
-		cleaned = reNumberedSteps.ReplaceAllString(cleaned, "")
+		if strings.IndexAny(cleaned, "-*\u2022") >= 0 {
+			cleaned = reTutorialBullets.ReplaceAllString(cleaned, "")
+		}
+		if strings.IndexAny(cleaned, "0123456789") >= 0 && strings.IndexAny(cleaned, ".)") >= 0 {
+			cleaned = reNumberedSteps.ReplaceAllString(cleaned, "")
+		}
 	}
 
 	// Step F: Strip meta-phrases (e.g. "IMPORTANT:", "Selection Process:")
-	if opts.StripInstructionMeta {
+	if opts.StripInstructionMeta && strings.IndexByte(cleaned, ':') >= 0 {
 		cleaned = reInstructionMeta.ReplaceAllString(cleaned, "")
 	}
 
-	// Step G: Normalize spaces and newlines
-	cleaned = reMultipleSpaces.ReplaceAllString(cleaned, " ")
-	cleaned = strings.TrimSpace(cleaned)
+	// Step G: Normalize spaces and newlines without regex overhead
+	cleaned = collapseWhitespaceFast(cleaned)
 
 	if cleaned == "" {
 		return truncateWordBoundary(raw, maxLen)
@@ -283,6 +292,40 @@ func CondenseDescription(desc string, maxLen int, opts CondenseOptions) string {
 	return truncateWordBoundary(cleaned, maxLen)
 }
 
+func collapseWhitespaceFast(s string) string {
+	needsCollapse := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\n' || c == '\r' || c == '\t' || (c == ' ' && (i == 0 || i+1 == len(s) || s[i+1] == ' ')) {
+			needsCollapse = true
+			break
+		}
+	}
+	if !needsCollapse {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	inSpace := true // trims leading whitespace automatically
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if !inSpace {
+				sb.WriteByte(' ')
+				inSpace = true
+			}
+			continue
+		}
+		sb.WriteByte(c)
+		inSpace = false
+	}
+	out := sb.String()
+	if len(out) > 0 && out[len(out)-1] == ' ' {
+		return out[:len(out)-1]
+	}
+	return out
+}
+
 // extractFirstSentence finds the first grammatical sentence avoiding common abbreviation traps.
 func extractFirstSentence(text string) string {
 	runes := []rune(text)
@@ -291,11 +334,15 @@ func extractFirstSentence(text string) string {
 	for i := 0; i < n; i++ {
 		r := runes[i]
 		if r == '.' || r == '!' || r == '?' {
-			// Check if this is an abbreviation
-			prefix := strings.ToLower(string(runes[:i+1]))
+			// Check only the trailing window (max 6 runes) for abbreviations
+			winStart := i - 5
+			if winStart < 0 {
+				winStart = 0
+			}
+			tail := strings.ToLower(string(runes[winStart : i+1]))
 			isAbbrev := false
 			for _, abbrev := range commonAbbreviations {
-				if strings.HasSuffix(prefix, abbrev) {
+				if strings.HasSuffix(tail, abbrev) {
 					isAbbrev = true
 					break
 				}

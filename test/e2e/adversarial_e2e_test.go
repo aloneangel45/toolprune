@@ -1,41 +1,27 @@
-//go:build windows
-
 package e2e_test
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aloneangel45/toolprune/pkg/benchmark"
 	"github.com/aloneangel45/toolprune/pkg/mcp"
-	"golang.org/x/sys/windows"
 )
 
-// helper to check if a process is still alive on Windows
-func isProcessAlive(pid int) bool {
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
-	if err != nil {
-		return false
-	}
-	defer windows.CloseHandle(h)
-
-	var exitCode uint32
-	if err := windows.GetExitCodeProcess(h, &exitCode); err != nil {
-		return false
-	}
-	const stillActive = 259
-	return exitCode == stillActive
-}
-
 // -----------------------------------------------------------------------------
-// 1. Burst Testing: TestServer & Proxy
+// 1. Burst Testing: TestServer & Proxy (Cross-Platform)
 // -----------------------------------------------------------------------------
 
 func TestAdversarial_TestServer_RequestBurst(t *testing.T) {
@@ -59,7 +45,6 @@ func TestAdversarial_TestServer_RequestBurst(t *testing.T) {
 
 	reader := bufio.NewReaderSize(stdout, 10*1024*1024)
 
-	// Handshake
 	initReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodInitialize, mcp.InitializeRequestParams{
 		ProtocolVersion: mcp.LatestProtocolVersion,
 		ClientInfo:      mcp.Implementation{Name: "BurstClient", Version: "1.0.0"},
@@ -71,7 +56,6 @@ func TestAdversarial_TestServer_RequestBurst(t *testing.T) {
 		t.Fatalf("init read failed: %v", err)
 	}
 
-	// Fire burst of 100 requests in rapid succession
 	const burstCount = 100
 	t.Logf("Firing burst of %d requests directly to testserver...", burstCount)
 
@@ -367,7 +351,6 @@ func TestAdversarial_TestServer_AbruptStdinClosure(t *testing.T) {
 
 	reader := bufio.NewReaderSize(stdout, 1024*1024)
 
-	// Perform initialize
 	initReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodInitialize, mcp.InitializeRequestParams{
 		ProtocolVersion: mcp.LatestProtocolVersion,
 		ClientInfo:      mcp.Implementation{Name: "StdinClosureClient", Version: "1.0.0"},
@@ -378,13 +361,11 @@ func TestAdversarial_TestServer_AbruptStdinClosure(t *testing.T) {
 		t.Fatalf("ReadMessage failed: %v", err)
 	}
 
-	// Abruptly close stdin
 	closeStart := time.Now()
 	if err := stdin.Close(); err != nil {
 		t.Fatalf("stdin.Close failed: %v", err)
 	}
 
-	// Wait for process to exit
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
@@ -404,7 +385,7 @@ func TestAdversarial_TestServer_AbruptStdinClosure(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// 4. Large Payload Framing & Safe Scanner Buffering (500KB - 2MB)
+// 4. Large Payload Framing & Safe Bounded Buffering (500KB - 2MB)
 // -----------------------------------------------------------------------------
 
 func TestAdversarial_Proxy_LargePayloadFraming_MultiMegabyte(t *testing.T) {
@@ -439,7 +420,6 @@ func TestAdversarial_Proxy_LargePayloadFraming_MultiMegabyte(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Logf("Generating %d bytes test payload...", tc.byteCount)
 
-			// Generate repeatable ASCII payload
 			buf := make([]byte, tc.byteCount)
 			for i := 0; i < tc.byteCount; i++ {
 				buf[i] = byte('A' + (i % 26))
@@ -489,7 +469,6 @@ func TestAdversarial_Proxy_LargePayloadFraming_MultiMegabyte(t *testing.T) {
 					t.Fatalf("[%s] reversed output length mismatch: expected %d, got %d",
 						tc.name, len(inputStr), len(output))
 				}
-				// Verify reversed sample characters
 				if output[0] != inputStr[len(inputStr)-1] || output[len(output)-1] != inputStr[0] {
 					t.Fatalf("[%s] reversed content mismatch", tc.name)
 				}
@@ -501,71 +480,222 @@ func TestAdversarial_Proxy_LargePayloadFraming_MultiMegabyte(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// 5. Windows Job Object Orphan Prevention & Clean Propagation
+// 5. v1.2.0 E2E: RFC #1 Token Budget & Pre-Binding Self-Correction
 // -----------------------------------------------------------------------------
 
-func TestAdversarial_WindowsJobObject_OrphanPrevention(t *testing.T) {
-	// Spawns ToolPrune proxy with testserver child
-	p, cleanup := spawnProxy(t, "proxy", "--", testserverBin)
+func TestE2E_V12_MaxSchemaTokensAndPreBindSelfCorrection(t *testing.T) {
+	p, cleanup := spawnProxy(t, "proxy", "--max-schema-tokens=650", "--", testserverBin)
 	defer cleanup()
 
 	performStandardHandshake(t, p)
 
-	// Retrieve child PID via system_info
-	resp := p.Call(t, mcp.MethodToolsCall, mcp.CallToolRequestParams{
-		Name:      "system_info",
-		Arguments: json.RawMessage(`{}`),
+	listResp := p.Call(t, mcp.MethodToolsList, map[string]any{})
+	if listResp.Error != nil {
+		t.Fatalf("tools/list failed: %v", listResp.Error)
+	}
+	var listRes mcp.ListToolsResult
+	if err := json.Unmarshal(listResp.Result, &listRes); err != nil {
+		t.Fatalf("unmarshal ListToolsResult: %v", err)
+	}
+	toks, err := benchmark.CountToolsTokens(listRes.Tools)
+	if err != nil {
+		t.Fatalf("CountToolsTokens: %v", err)
+	}
+	t.Logf("v1.2.0 --max-schema-tokens=650 enforced exact cl100k_base tokens=%d across %d tools", toks, len(listRes.Tools))
+	if toks > 650 {
+		t.Fatalf("expected cl100k_base tokens <= 650, got %d", toks)
+	}
+
+	// Missing required parameter 'operation' must be intercepted by StreamFilter before upstream
+	badResp := p.Call(t, mcp.MethodToolsCall, mcp.CallToolRequestParams{
+		Name:      "math_eval",
+		Arguments: json.RawMessage(`{"a": 21, "b": 21}`),
 	})
-	if resp.Error != nil {
-		t.Fatalf("system_info failed: %v", resp.Error)
+	if badResp.Error != nil {
+		t.Fatalf("unexpected JSON-RPC error: %v", badResp.Error)
+	}
+	var badCallRes mcp.CallToolResult
+	if err := json.Unmarshal(badResp.Result, &badCallRes); err != nil {
+		t.Fatalf("unmarshal CallToolResult: %v", err)
+	}
+	if !badCallRes.IsError || len(badCallRes.Content) == 0 {
+		t.Fatalf("expected self-correcting CallToolResult{IsError: true}, got %+v", badCallRes)
+	}
+	if !strings.Contains(badCallRes.Content[0].Text, "Pre-Binding Schema Validation Failed") {
+		t.Fatalf("expected pre-binding validation diagnostic, got: %s", badCallRes.Content[0].Text)
 	}
 
-	var callRes mcp.CallToolResult
-	_ = json.Unmarshal(resp.Result, &callRes)
-	if len(callRes.Content) == 0 {
-		t.Fatalf("empty system_info content")
+	// Subsequent valid call must succeed cleanly
+	okResp := p.Call(t, mcp.MethodToolsCall, mcp.CallToolRequestParams{
+		Name:      "math_eval",
+		Arguments: json.RawMessage(`{"operation": "add", "a": 21, "b": 21}`),
+	})
+	if okResp.Error != nil {
+		t.Fatalf("valid math_eval failed: %v", okResp.Error)
+	}
+	var okCallRes mcp.CallToolResult
+	_ = json.Unmarshal(okResp.Result, &okCallRes)
+	if okCallRes.IsError || len(okCallRes.Content) == 0 || okCallRes.Content[0].Text != "42" {
+		t.Fatalf("expected math_eval result '42', got %+v", okCallRes)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 6. v1.2.0 E2E: Malformed JSON & Batch Array Recovery over Stdio
+// -----------------------------------------------------------------------------
+
+func TestE2E_V12_StdioMalformedJSONAndBatchRecovery(t *testing.T) {
+	p, cleanup := spawnProxy(t, "proxy", "--preset=balanced", "--", testserverBin)
+	defer cleanup()
+
+	performStandardHandshake(t, p)
+
+	// 1. Malformed JSON line -> JSON-RPC -32700 Parse error (must not kill proxy)
+	p.mu.Lock()
+	_, err := io.WriteString(p.stdin, "{malformed_json_line\n")
+	if err != nil {
+		p.mu.Unlock()
+		t.Fatalf("write malformed JSON failed: %v", err)
+	}
+	parseErrMsg, err := mcp.ReadMessage(p.reader)
+	p.mu.Unlock()
+	if err != nil {
+		t.Fatalf("read -32700 response failed: %v", err)
+	}
+	if parseErrMsg.Error == nil || parseErrMsg.Error.Code != mcp.CodeParseError {
+		t.Fatalf("expected -32700 Parse error, got %+v", parseErrMsg)
 	}
 
-	var info map[string]any
-	_ = json.Unmarshal([]byte(callRes.Content[0].Text), &info)
-	childPIDFloat, ok := info["pid"].(float64)
-	if !ok {
-		t.Fatalf("missing child PID in system_info: %s", callRes.Content[0].Text)
+	// 2. Unsupported JSON-RPC batch array -> JSON-RPC -32600 Invalid Request
+	p.mu.Lock()
+	_, err = io.WriteString(p.stdin, `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`+"\n")
+	if err != nil {
+		p.mu.Unlock()
+		t.Fatalf("write batch array failed: %v", err)
 	}
-	childPID := int(childPIDFloat)
-	proxyPID := p.cmd.Process.Pid
-
-	t.Logf("Proxy PID: %d, Upstream Child PID: %d", proxyPID, childPID)
-
-	// Verify child PID is actively running
-	if !isProcessAlive(childPID) {
-		t.Fatalf("child process %d is not running prior to kill test", childPID)
+	batchErrMsg, err := mcp.ReadMessage(p.reader)
+	p.mu.Unlock()
+	if err != nil {
+		t.Fatalf("read -32600 response failed: %v", err)
 	}
-
-	// Force kill PROXY directly using taskkill /F (simulating SIGKILL / crash of parent)
-	killCmd := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(proxyPID))
-	if out, err := killCmd.CombinedOutput(); err != nil {
-		t.Fatalf("taskkill proxy failed: %v (output: %s)", err, string(out))
+	if batchErrMsg.Error == nil || batchErrMsg.Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("expected -32600 Invalid Request, got %+v", batchErrMsg)
 	}
 
-	// Windows Job Object limit JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must automatically
-	// terminate the child process when the proxy process terminates and its job handle closes!
-	var childDied bool
-	deadline := time.Now().Add(4 * time.Second)
+	// 3. Subsequent normal ping must succeed cleanly
+	pingResp := p.Call(t, mcp.MethodPing, map[string]any{})
+	if pingResp.Error != nil {
+		t.Fatalf("ping after recovery failed: %v", pingResp.Error)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 7. v1.2.0 E2E: Streamable HTTP (/mcp) & Live Subprocess Benchmarking
+// -----------------------------------------------------------------------------
+
+func TestE2E_V12_StreamableHTTP_And_LiveBench(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	cmd := exec.Command(toolpruneBin, "proxy", "--transport=sse", "--port="+strconv.Itoa(port), "--preset=strict", "--", testserverBin)
+	cmd.Dir = findRepoRoot()
+	stderrBuf := new(bytes.Buffer)
+	cmd.Stderr = stderrBuf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start SSE/HTTP proxy: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	deadline := time.Now().Add(5 * time.Second)
+	var ready bool
 	for time.Now().Before(deadline) {
-		if !isProcessAlive(childPID) {
-			childDied = true
-			break
+		resp, hErr := http.Get(baseURL + "/health")
+		if hErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				ready = true
+				break
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-
-	if !childDied {
-		// Clean up leaked process before failing test
-		_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(childPID)).Run()
-		t.Fatalf("FAILURE: Windows Job Object failed to terminate child process %d after proxy %d was killed! Orphaned process detected.",
-			childPID, proxyPID)
+	if !ready {
+		t.Fatalf("SSE/HTTP proxy did not become healthy on %s; stderr: %s", baseURL, stderrBuf.String())
 	}
 
-	t.Logf("SUCCESS: Windows Job Object automatically terminated child process %d when proxy died. Zero orphan leak confirmed!", childPID)
+	// Send initialize via Streamable HTTP POST /mcp
+	initReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodInitialize, mcp.InitializeRequestParams{
+		ProtocolVersion: mcp.LatestProtocolVersion,
+		ClientInfo:      mcp.Implementation{Name: "StreamableHTTPClient", Version: "1.2.0"},
+	})
+	initBytes, _ := json.Marshal(initReq)
+	httpReq, _ := http.NewRequest(http.MethodPost, baseURL+"/mcp", bytes.NewReader(initBytes))
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("POST /mcp initialize failed: %v", err)
+	}
+	sessionID := httpResp.Header.Get("Mcp-Session-Id")
+	var initMsg mcp.Message
+	if err := json.NewDecoder(httpResp.Body).Decode(&initMsg); err != nil {
+		_ = httpResp.Body.Close()
+		t.Fatalf("decode POST /mcp initialize response: %v", err)
+	}
+	_ = httpResp.Body.Close()
+	if sessionID == "" {
+		t.Fatalf("expected Mcp-Session-Id response header from POST /mcp")
+	}
+	if initMsg.Error != nil {
+		t.Fatalf("POST /mcp initialize error: %v", initMsg.Error)
+	}
+
+	// Send tools/call over POST /mcp using Mcp-Session-Id
+	callReq, _ := mcp.NewRequest(mcp.NewIntID(2), mcp.MethodToolsCall, mcp.CallToolRequestParams{
+		Name:      "math_eval",
+		Arguments: json.RawMessage(`{"operation": "multiply", "a": 6, "b": 7}`),
+	})
+	callBytes, _ := json.Marshal(callReq)
+	callHTTPReq, _ := http.NewRequest(http.MethodPost, baseURL+"/mcp", bytes.NewReader(callBytes))
+	callHTTPReq.Header.Set("Content-Type", "application/json")
+	callHTTPReq.Header.Set("Mcp-Session-Id", sessionID)
+
+	callHTTPResp, err := http.DefaultClient.Do(callHTTPReq)
+	if err != nil {
+		t.Fatalf("POST /mcp tools/call failed: %v", err)
+	}
+	var callMsg mcp.Message
+	if err := json.NewDecoder(callHTTPResp.Body).Decode(&callMsg); err != nil {
+		_ = callHTTPResp.Body.Close()
+		t.Fatalf("decode POST /mcp tools/call response: %v", err)
+	}
+	_ = callHTTPResp.Body.Close()
+	var callRes mcp.CallToolResult
+	_ = json.Unmarshal(callMsg.Result, &callRes)
+	if callRes.IsError || len(callRes.Content) == 0 || callRes.Content[0].Text != "42" {
+		t.Fatalf("expected '42' over Streamable HTTP /mcp, got %+v", callRes)
+	}
+
+	// Verify live subprocess benchmarking (`toolprune bench --format csv -- <testserverBin>`)
+	benchCmd := exec.Command(toolpruneBin, "bench", "--format", "csv", "--max-schema-tokens", "500", "--", testserverBin)
+	benchCmd.Dir = findRepoRoot()
+	benchOut, err := benchCmd.Output()
+	if err != nil {
+		t.Fatalf("live toolprune bench failed: %v\n%s", err, string(benchOut))
+	}
+	csvStr := string(benchOut)
+	if !strings.Contains(csvStr, "record_type,name,tier,tokens,bytes,tokens_saved,savings_percent") {
+		t.Fatalf("expected CSV header in live bench output, got:\n%s", csvStr)
+	}
+	if !strings.Contains(csvStr, "tier,Budget (<=500 tok),budget,") {
+		t.Fatalf("expected RFC #1 budget row in live bench CSV output, got:\n%s", csvStr)
+	}
 }

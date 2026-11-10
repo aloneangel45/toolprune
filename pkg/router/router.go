@@ -17,12 +17,12 @@ import (
 // RouterConfig holds settings for the Unified Router Engine.
 type RouterConfig struct {
 	NamespaceMode   NamespaceMode `json:"namespaceMode" yaml:"namespace_mode"`
-	PruneMode       string        `json:"pruneMode" yaml:"prune_mode"`               // "none", "lossless", "compact", "aggressive", "dynamic"
-	MaxSchemaTokens int           `json:"maxSchemaTokens" yaml:"max_schema_tokens"`  // RFC #1 progressive token budget cap (0 = unlimited)
-	ActiveProfile   string        `json:"activeProfile" yaml:"active_profile"`       // e.g. "read_only", "dev", "full", "minimal"
-	MaxActiveTools  int           `json:"maxActiveTools" yaml:"max_active_tools"`    // For active windowing (default: 15)
-	PinnedTools     []string      `json:"pinnedTools" yaml:"pinned_tools"`           // Tools immune to Pass 5 projection / window eviction
-	EnableCatalog   bool          `json:"enableCatalog" yaml:"enable_catalog"`       // Tier 4 dynamic catalog
+	PruneMode       string        `json:"pruneMode" yaml:"prune_mode"`                // "none", "lossless", "compact", "aggressive", "dynamic"
+	MaxSchemaTokens int           `json:"maxSchemaTokens" yaml:"max_schema_tokens"`   // RFC #1 progressive token budget cap (0 = unlimited)
+	ActiveProfile   string        `json:"activeProfile" yaml:"active_profile"`        // e.g. "read_only", "dev", "full", "minimal"
+	MaxActiveTools  int           `json:"maxActiveTools" yaml:"max_active_tools"`     // For active windowing (default: 15)
+	PinnedTools     []string      `json:"pinnedTools" yaml:"pinned_tools"`            // Tools immune to Pass 5 projection / window eviction
+	EnableCatalog   bool          `json:"enableCatalog" yaml:"enable_catalog"`        // Tier 4 dynamic catalog
 	Catalog         CatalogConfig `json:"catalog,omitempty" yaml:"catalog,omitempty"` // Optional Tier 4 catalog overrides
 }
 
