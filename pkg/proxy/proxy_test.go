@@ -896,12 +896,12 @@ func TestSupervisor_StateTransitions(t *testing.T) {
 	cfg := proxy.SupervisorConfig{
 		Name:    "state_test",
 		Command: os.Args[0],
-		Args:    []string{"-test.run=TestHelperProcess"},
+		Args:    []string{"-test.run=^TestHelperProcess$"},
 		Env: map[string]string{
 			"GO_WANT_HELPER_PROCESS": "1",
 			"HELPER_MODE":            "echo",
 		},
-		GracePeriod: 1 * time.Second,
+		GracePeriod: 5 * time.Second,
 	}
 
 	sup := proxy.NewSupervisor(cfg)

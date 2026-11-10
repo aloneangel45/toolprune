@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -335,7 +336,7 @@ func (m *Multiplexer) ResolveRoute(exposedName string) (ToolRoute, bool) {
 	return ToolRoute{}, false
 }
 
-// ListAllTools returns all active tools with their exposed names.
+// ListAllTools returns all active tools with their exposed names in deterministic sorted order.
 func (m *Multiplexer) ListAllTools() []mcp.Tool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -344,6 +345,9 @@ func (m *Multiplexer) ListAllTools() []mcp.Tool {
 	for _, route := range m.routes {
 		tools = append(tools, route.Tool)
 	}
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
 	return tools
 }
 

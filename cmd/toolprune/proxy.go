@@ -480,7 +480,7 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 
 	winCfg := cfg.ToWindowConfig()
 	var toolWindow *router.ToolWindow
-	if winCfg.Enabled {
+	if winCfg.Enabled && rCfg.EnableCatalog {
 		toolWindow, err = router.NewToolWindow(winCfg, r.Multiplexer(), gw.Notifier())
 		if err != nil {
 			return fmt.Errorf("failed to initialize active tool window: %w", err)
@@ -548,21 +548,6 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 			return fmt.Errorf("failed to register upstream %q: %w", u.ID, regErr)
 		}
 		r.Multiplexer().SyncUpstreamTools(ctx, u.ID, tools)
-	}
-
-	// Pre-seed up to MaxActive allowed tools into the window for non-dynamic tiers so initial tools/list is populated
-	if toolWindow != nil && !rCfg.EnableCatalog {
-		seeded := 0
-		for _, t := range r.Multiplexer().ListAllTools() {
-			if seeded >= winCfg.MaxActive {
-				break
-			}
-			if toolFilter == nil || toolFilter.IsAllowed(t.Name) {
-				if promoted, _, pErr := toolWindow.Promote(t.Name); pErr == nil && promoted {
-					seeded++
-				}
-			}
-		}
 	}
 
 	if err := gw.Start(); err != nil {
