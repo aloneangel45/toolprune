@@ -100,10 +100,11 @@ type UpstreamConfig struct {
 	Description string            `json:"description,omitempty" yaml:"description,omitempty"`
 }
 
-// PruningConfig specifies schema optimization parameters for Tiers 0-4.
+// PruningConfig specifies schema optimization parameters for Tiers 0-4 and RFC #1 token budgeting.
 type PruningConfig struct {
-	Tier                 string `json:"tier" yaml:"tier"`                                   // "none"|"lossless"|"compact"|"aggressive"|"dynamic"
-	MaxDescriptionLength int    `json:"maxDescriptionLength" yaml:"max_description_length"` // Top-level tool description rune limit (default: 120)
+	Tier                 string `json:"tier" yaml:"tier"`                                               // "none"|"lossless"|"compact"|"aggressive"|"dynamic"
+	MaxSchemaTokens      int    `json:"maxSchemaTokens,omitempty" yaml:"max_schema_tokens,omitempty"`   // RFC #1 maximum token budget for tools/list (0 = unlimited)
+	MaxDescriptionLength int    `json:"maxDescriptionLength" yaml:"max_description_length"`             // Top-level tool description rune limit (default: 120)
 	MaxParamDescLength   int    `json:"maxParamDescLength" yaml:"max_param_desc_length"`     // Parameter description rune limit (default: 80)
 	StripRegex           bool   `json:"stripRegex" yaml:"strip_regex"`                       // Strip verbose regex patterns (default: true)
 	MaxRegexLength       int    `json:"maxRegexLength" yaml:"max_regex_length"`             // Regex length threshold before compression (default: 25)
@@ -333,6 +334,9 @@ func (c *Config) Validate() error {
 	if c.Pruning.MaxRegexLength < 0 {
 		errs = append(errs, "pruning.max_regex_length cannot be negative")
 	}
+	if c.Pruning.MaxSchemaTokens < 0 {
+		errs = append(errs, "pruning.max_schema_tokens cannot be negative")
+	}
 
 	// 3. Routing validation
 	validModes := map[string]bool{
@@ -446,6 +450,8 @@ func Validate(cfg *Config) error {
 func (c *Config) ToProxyConfig() proxy.ProxyConfig {
 	return proxy.ProxyConfig{
 		PruneMode:              c.Pruning.Tier,
+		MaxSchemaTokens:        c.Pruning.MaxSchemaTokens,
+		PinnedTools:            append([]string(nil), c.Routing.PinnedTools...),
 		RequestTimeout:         time.Duration(c.Server.Timeout),
 		TimeoutSweeperInterval: 0, // Automatically dynamically calibrated
 		InjectProxyInfo:        c.Server.InjectProxyInfo,
@@ -512,6 +518,9 @@ func (c *Config) ToWindowConfig() router.WindowConfig {
 // ToPrunerOptions converts configuration to a pruner.PruneOptions instance.
 func (c *Config) ToPrunerOptions() pruner.PruneOptions {
 	opts := pruner.DefaultPruneOptions(pruner.PruneTier(c.Pruning.Tier))
+	if c.Pruning.MaxSchemaTokens > 0 {
+		opts.MaxSchemaTokens = c.Pruning.MaxSchemaTokens
+	}
 	if c.Pruning.MaxDescriptionLength > 0 {
 		opts.MaxToolDescLength = c.Pruning.MaxDescriptionLength
 		opts.Condense.MaxToolDescLen = c.Pruning.MaxDescriptionLength

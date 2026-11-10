@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -83,12 +85,30 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	cfg.ApplyDefaults()
+	if err := cfg.ApplyEnvOverrides(); err != nil {
+		return nil, err
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
+}
+
+// ApplyEnvOverrides applies TOOLPRUNE_* runtime environment variable overrides.
+func (c *Config) ApplyEnvOverrides() error {
+	if raw, ok := os.LookupEnv("TOOLPRUNE_MAX_SCHEMA_TOKENS"); ok {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed != "" {
+			n, err := strconv.Atoi(trimmed)
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid TOOLPRUNE_MAX_SCHEMA_TOKENS=%q: must be a non-negative integer", raw)
+			}
+			c.Pruning.MaxSchemaTokens = n
+		}
+	}
+	return nil
 }
 
 // Load reads and parses a configuration file from the specified path.
@@ -208,6 +228,7 @@ server:
 
 pruning:
   tier: "aggressive"
+  max_schema_tokens: 0
   max_description_length: 120
   max_param_desc_length: 80
   strip_regex: true

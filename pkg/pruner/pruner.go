@@ -3,7 +3,9 @@ package pruner
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math"
+	"strconv"
 	"sync"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
@@ -41,6 +43,27 @@ func (e *Engine) GetOptions() Options {
 	return e.opts
 }
 
+// ConfigFingerprint returns a fast FNV-1a hash of the active Engine options for stream cache keying.
+func (e *Engine) ConfigFingerprint() uint64 {
+	e.mu.RLock()
+	opts := e.opts
+	e.mu.RUnlock()
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(opts.Tier))
+	var buf [16]byte
+	_, _ = h.Write(strconv.AppendInt(buf[:0], int64(opts.MaxSchemaTokens), 10))
+	_, _ = h.Write(strconv.AppendInt(buf[:0], int64(opts.Condense.MaxToolDescLen), 10))
+	_, _ = h.Write(strconv.AppendInt(buf[:0], int64(opts.Condense.MaxParamDescLen), 10))
+	_, _ = h.Write(strconv.AppendInt(buf[:0], int64(opts.Params.MaxNonSelfEvidentLen), 10))
+	if opts.StripSelfEvident {
+		_, _ = h.Write([]byte{1})
+	} else {
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
+
 // PruneTools satisfies the proxy.PruneEngine interface.
 func (e *Engine) PruneTools(tools []mcp.Tool) ([]mcp.Tool, proxy.PruneMetrics, error) {
 	e.mu.RLock()
@@ -60,10 +83,94 @@ func (e *Engine) PruneToolsForProfile(tools []mcp.Tool, profile string) ([]mcp.T
 	return pruned, err
 }
 
+// PruneToolsWithContext satisfies proxy.ContextBudgetEngine for fast (<0.5ms) RFC #1 budget enforcement.
+func (e *Engine) PruneToolsWithContext(tools []mcp.Tool, ctx proxy.BudgetContext) ([]mcp.Tool, proxy.BudgetPruneMetrics, error) {
+	if len(tools) == 0 {
+		return tools, proxy.BudgetPruneMetrics{}, nil
+	}
+
+	e.mu.RLock()
+	opts := e.opts
+	e.mu.RUnlock()
+
+	maxTokens := ctx.MaxSchemaTokens
+	if maxTokens <= 0 {
+		maxTokens = opts.MaxSchemaTokens
+	}
+
+	if maxTokens <= 0 {
+		pruned, pm, err := e.PruneToolsWithTier(tools, opts.Tier)
+		return pruned, proxy.BudgetPruneMetrics{PruneMetrics: pm}, err
+	}
+
+	// Preserve numeric/array/additionalProperties constraints so EnforceTokenBudget retains full structural fidelity
+	tierOpts := opts
+	tierOpts.Minify.StripAdditionalPropsFalse = false
+	tierOpts.Params.StripValidators = false
+
+	var base []mcp.Tool
+	if tierOpts.Tier == TierNone {
+		base = DeepCopyTools(tools)
+	} else {
+		base = make([]mcp.Tool, len(tools))
+		cloned := DeepCopyTools(tools)
+		for i, tool := range cloned {
+			pt, err := e.pruneSingleTool(tool, tierOpts)
+			if err != nil {
+				return nil, proxy.BudgetPruneMetrics{}, fmt.Errorf("failed to prune tool %q: %w", tool.Name, err)
+			}
+			base[i] = pt
+		}
+	}
+
+	rawEst := EstimateToolsBudgetTokens(tools)
+	compacted, bMetrics := EnforceTokenBudget(base, BudgetOptions{
+		MaxSchemaTokens:   maxTokens,
+		PinnedTools:       ctx.PinnedTools,
+		ContextBoostTools: ctx.ContextBoostTools,
+	})
+
+	if opts.StrictDraft07 {
+		for _, pt := range compacted {
+			res := ValidateTool(pt)
+			if !res.Valid {
+				return nil, proxy.BudgetPruneMetrics{}, fmt.Errorf("budget-compacted tool %q failed Draft-07 validation: %v", pt.Name, res.Errors)
+			}
+		}
+	}
+
+	var ratio float64
+	if rawEst > 0 && rawEst >= bMetrics.CompactedToken {
+		ratio = float64(rawEst-bMetrics.CompactedToken) / float64(rawEst)
+	}
+
+	return compacted, proxy.BudgetPruneMetrics{
+		PruneMetrics: proxy.PruneMetrics{
+			RawTokens:    rawEst,
+			PrunedTokens: bMetrics.CompactedToken,
+			SavingsRatio: ratio,
+		},
+		PassReached:    bMetrics.PassReached,
+		ProjectedTools: bMetrics.ProjectedTools,
+	}, nil
+}
+
 // PruneToolsWithTier prunes tools with an explicit tier.
 func (e *Engine) PruneToolsWithTier(tools []mcp.Tool, tier PruneTier) ([]mcp.Tool, proxy.PruneMetrics, error) {
 	if len(tools) == 0 {
 		return tools, proxy.PruneMetrics{}, nil
+	}
+
+	e.mu.RLock()
+	opts := e.opts
+	e.mu.RUnlock()
+	opts.Tier = tier
+
+	if opts.MaxSchemaTokens > 0 {
+		compacted, bm, err := e.PruneToolsWithContext(tools, proxy.BudgetContext{
+			MaxSchemaTokens: opts.MaxSchemaTokens,
+		})
+		return compacted, bm.PruneMetrics, err
 	}
 
 	rawTokens := EstimateToolsTokens(tools)
@@ -75,11 +182,6 @@ func (e *Engine) PruneToolsWithTier(tools []mcp.Tool, tier PruneTier) ([]mcp.Too
 			SavingsRatio: 0.0,
 		}, nil
 	}
-
-	e.mu.RLock()
-	opts := e.opts
-	e.mu.RUnlock()
-	opts.Tier = tier
 
 	// Deep-copy tools to enforce immutability
 	cloned := DeepCopyTools(tools)

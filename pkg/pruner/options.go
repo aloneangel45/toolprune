@@ -189,6 +189,7 @@ func GetDefaultSelfEvidentDictionary() map[string]struct{} {
 // PruneOptions encapsulates tier selection and detailed configuration.
 type PruneOptions struct {
 	Tier                   PruneTier       `json:"tier"`
+	MaxSchemaTokens        int             `json:"maxSchemaTokens,omitempty"`
 	MaxToolDescLength      int             `json:"maxToolDescLength"`
 	MaxParamDescLength     int             `json:"maxParamDescLength"`
 	StripRegexThresholdLen int             `json:"stripRegexThresholdLen"`
