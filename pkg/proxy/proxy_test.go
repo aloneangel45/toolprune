@@ -70,6 +70,12 @@ func TestHelperProcess(t *testing.T) {
 		_, _ = os.Stderr.WriteString("FATAL: database connection refused on port 5432\n")
 		os.Exit(1)
 
+	case "emit_and_exit_immediately":
+		for i := 1; i <= 3; i++ {
+			_, _ = fmt.Fprintf(os.Stdout, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"seq\":%d}}\n", i, i)
+		}
+		os.Exit(0)
+
 	default:
 		os.Exit(0)
 	}
@@ -552,6 +558,7 @@ func TestSSE_CORS_PreflightAndHeaders(t *testing.T) {
 	ts := httptest.NewServer(sseSrv.Handler())
 	defer ts.Close()
 
+	// 1. Localhost browser origin echoes single matched origin + Vary: Origin
 	req, _ := http.NewRequest(http.MethodOptions, ts.URL+"/sse", nil)
 	req.Header.Set("Origin", "http://localhost:3000")
 	req.Header.Set("Access-Control-Request-Method", "GET")
@@ -560,11 +567,57 @@ func TestSSE_CORS_PreflightAndHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OPTIONS request failed: %v", err)
 	}
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204 No Content for CORS preflight, got: %d", resp.StatusCode)
 	}
-	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
-		t.Fatalf("expected Access-Control-Allow-Origin: *, got: %s", resp.Header.Get("Access-Control-Allow-Origin"))
+	if resp.Header.Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
+		t.Fatalf("expected Access-Control-Allow-Origin: http://localhost:3000, got: %s", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+	if !strings.Contains(resp.Header.Get("Vary"), "Origin") {
+		t.Fatalf("expected Vary: Origin header, got: %s", resp.Header.Get("Vary"))
+	}
+
+	// 2. External cross-origin browser request against localhost listener is rejected (403 Forbidden)
+	evilOriginReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/health", nil)
+	evilOriginReq.Header.Set("Origin", "https://evil.example.com")
+	evilOriginResp, err := http.DefaultClient.Do(evilOriginReq)
+	if err != nil {
+		t.Fatalf("evil origin request failed: %v", err)
+	}
+	_ = evilOriginResp.Body.Close()
+	if evilOriginResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for external Origin on localhost, got: %d", evilOriginResp.StatusCode)
+	}
+
+	// 3. DNS-rebinding Host header against localhost listener is rejected (403 Forbidden)
+	rebindReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/health", nil)
+	rebindReq.Host = "evil-rebind.example.com:8080"
+	rebindResp, err := http.DefaultClient.Do(rebindReq)
+	if err != nil {
+		t.Fatalf("DNS rebind request failed: %v", err)
+	}
+	_ = rebindResp.Body.Close()
+	if rebindResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for DNS-rebinding Host header, got: %d", rebindResp.StatusCode)
+	}
+
+	// 4. Multi-origin allowlist echoes ONLY the single matched origin (never comma-joined)
+	multiCfg := proxy.DefaultSSEServerConfig()
+	multiCfg.CORSOrigins = []string{"https://app.example.com", "https://studio.example.com"}
+	multiSrv := proxy.NewSSEServer(multiCfg, nil)
+	multiTS := httptest.NewServer(multiSrv.Handler())
+	defer multiTS.Close()
+
+	allowedReq, _ := http.NewRequest(http.MethodOptions, multiTS.URL+"/sse", nil)
+	allowedReq.Header.Set("Origin", "https://studio.example.com")
+	allowedResp, err := http.DefaultClient.Do(allowedReq)
+	if err != nil {
+		t.Fatalf("multi-origin OPTIONS failed: %v", err)
+	}
+	_ = allowedResp.Body.Close()
+	if got := allowedResp.Header.Get("Access-Control-Allow-Origin"); got != "https://studio.example.com" {
+		t.Fatalf("expected single matched origin 'https://studio.example.com', got %q", got)
 	}
 }
 
@@ -892,6 +945,173 @@ func TestStdioSession_Lifecycle(t *testing.T) {
 
 	if err := session.Close(); err != nil {
 		t.Fatalf("session.Close failed: %v", err)
+	}
+}
+
+func TestSupervisor_BufferedExitMessagesPreserved(t *testing.T) {
+	cfg := proxy.SupervisorConfig{
+		Name:    "emit_and_exit",
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestHelperProcess"},
+		Env: map[string]string{
+			"GO_WANT_HELPER_PROCESS": "1",
+			"HELPER_MODE":            "emit_and_exit_immediately",
+		},
+		GracePeriod: 2 * time.Second,
+	}
+
+	sup := proxy.NewSupervisor(cfg)
+	if err := sup.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Wait until child has completely terminated BEFORE calling ReadMessage()
+	<-sup.Done()
+
+	for i := 1; i <= 3; i++ {
+		msg, err := sup.ReadMessage()
+		if err != nil {
+			t.Fatalf("expected buffered message %d after process exit, got err: %v", i, err)
+		}
+		if msg.ID == nil || msg.ID.String() != fmt.Sprintf("%d", i) {
+			t.Fatalf("expected message ID %d, got %+v", i, msg.ID)
+		}
+	}
+
+	_, err := sup.ReadMessage()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF after draining buffered exit messages, got: %v", err)
+	}
+}
+
+func TestStdio_ErrorToJSONRPCResponse_Resilience(t *testing.T) {
+	input := strings.Join([]string{
+		`{malformed_json`,
+		`[{"jsonrpc":"2.0","id":1,"method":"ping"}]`,
+		`{"jsonrpc":"2.0","id":null,"method":"ping"}`,
+		`{}`,
+		`{"jsonrpc":"2.0","id":7,"method":"ping"}`,
+	}, "\n") + "\n"
+
+	transport := proxy.NewStdioTransport(proxy.StdioOptions{
+		In:  strings.NewReader(input),
+		Out: &bytes.Buffer{},
+	})
+
+	expectedCodes := []int{
+		mcp.CodeParseError,
+		mcp.CodeInvalidRequest,
+		mcp.CodeInvalidRequest,
+		mcp.CodeInvalidRequest,
+	}
+
+	for idx, wantCode := range expectedCodes {
+		_, err := transport.ReadMessage()
+		if err == nil {
+			t.Fatalf("case %d: expected error, got nil", idx)
+		}
+		rpcResp := proxy.ErrorToJSONRPCResponse(err)
+		if rpcResp == nil || rpcResp.Error == nil {
+			t.Fatalf("case %d: expected JSON-RPC error response for %v, got nil", idx, err)
+		}
+		if rpcResp.Error.Code != wantCode {
+			t.Fatalf("case %d: expected error code %d, got %d (%v)", idx, wantCode, rpcResp.Error.Code, err)
+		}
+		if rpcResp.ID == nil || !rpcResp.ID.IsNull() {
+			t.Fatalf("case %d: expected explicit null ID on error response", idx)
+		}
+	}
+
+	// Stream remains aligned and reads the valid message cleanly!
+	validMsg, err := transport.ReadMessage()
+	if err != nil {
+		t.Fatalf("expected stream recovery on valid message, got: %v", err)
+	}
+	if validMsg.Method != "ping" || validMsg.ID.String() != "7" {
+		t.Fatalf("unexpected valid message: %+v", validMsg)
+	}
+}
+
+func TestSSE_StreamableHTTP_Lifecycle(t *testing.T) {
+	mockUpstream := NewMockUpstream()
+	go func() {
+		for msg := range mockUpstream.outbound {
+			if msg == nil || msg.ID == nil {
+				continue
+			}
+			resp, _ := mcp.NewResponse(*msg.ID, map[string]any{"pong": msg.Method})
+			mockUpstream.PushToProxy(resp)
+		}
+	}()
+
+	prx := proxy.NewProxy(proxy.DefaultProxyConfig(), mockUpstream, nil)
+	prx.Start()
+	defer prx.Shutdown()
+
+	sseSrv := proxy.NewSSEServer(proxy.DefaultSSEServerConfig(), prx)
+	ts := httptest.NewServer(sseSrv.Handler())
+	defer ts.Close()
+
+	// 1. POST /mcp initialize creates session and returns 200 OK JSON response + Mcp-Session-Id
+	initPayload := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`
+	initResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(initPayload))
+	if err != nil {
+		t.Fatalf("POST /mcp initialize failed: %v", err)
+	}
+	defer initResp.Body.Close()
+
+	if initResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on POST /mcp request, got %d", initResp.StatusCode)
+	}
+	sessionID := initResp.Header.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("expected Mcp-Session-Id header in POST /mcp response")
+	}
+
+	var rpcResp mcp.Message
+	if err := json.NewDecoder(initResp.Body).Decode(&rpcResp); err != nil {
+		t.Fatalf("failed to decode JSON-RPC response: %v", err)
+	}
+	if rpcResp.ID == nil || rpcResp.ID.String() != "1" {
+		t.Fatalf("expected correlated response id=1, got %+v", rpcResp.ID)
+	}
+
+	// 2. POST /mcp notification with Mcp-Session-Id returns 202 Accepted
+	notifReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	notifReq.Header.Set("Content-Type", "application/json")
+	notifReq.Header.Set("Mcp-Session-Id", sessionID)
+	notifResp, err := http.DefaultClient.Do(notifReq)
+	if err != nil {
+		t.Fatalf("POST /mcp notification failed: %v", err)
+	}
+	_ = notifResp.Body.Close()
+	if notifResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for notification, got %d", notifResp.StatusCode)
+	}
+
+	// 3. DELETE /mcp closes session and returns 204 No Content
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/mcp", nil)
+	delReq.Header.Set("Mcp-Session-Id", sessionID)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatalf("DELETE /mcp failed: %v", err)
+	}
+	_ = delResp.Body.Close()
+	if delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content on DELETE /mcp, got %d", delResp.StatusCode)
+	}
+
+	// 4. Subsequent POST with deleted Mcp-Session-Id returns 404 Not Found
+	postDeletedReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"ping"}`))
+	postDeletedReq.Header.Set("Content-Type", "application/json")
+	postDeletedReq.Header.Set("Mcp-Session-Id", sessionID)
+	postDeletedResp, err := http.DefaultClient.Do(postDeletedReq)
+	if err != nil {
+		t.Fatalf("POST /mcp after DELETE failed: %v", err)
+	}
+	_ = postDeletedResp.Body.Close()
+	if postDeletedResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for terminated session, got %d", postDeletedResp.StatusCode)
 	}
 }
 

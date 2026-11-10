@@ -79,14 +79,15 @@ type ToolRoute struct {
 
 // UpstreamTarget represents an active upstream MCP server managed by the multiplexer.
 type UpstreamTarget struct {
-	mu        sync.RWMutex
-	id        string
-	prefix    string
-	transport UpstreamTransport
-	info      *mcp.InitializeResult
-	tools     map[string]mcp.Tool // originalName -> Tool
-	closed    atomic.Bool
-	lastSync  time.Time
+	mu          sync.RWMutex
+	id          string
+	prefix      string
+	transport   UpstreamTransport
+	info        *mcp.InitializeResult
+	tools       map[string]mcp.Tool // originalName -> Tool
+	closed      atomic.Bool
+	loopStarted atomic.Bool
+	lastSync    time.Time
 }
 
 // ID returns the upstream identifier.
@@ -145,8 +146,11 @@ func (m *Multiplexer) SetMessageHandler(handler UpstreamMessageHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.handler = handler
+	if handler == nil {
+		return
+	}
 	for _, target := range m.upstreams {
-		if target.transport != nil && !target.closed.Load() {
+		if target.transport != nil && !target.closed.Load() && target.loopStarted.CompareAndSwap(false, true) {
 			m.wg.Add(1)
 			go m.runUpstreamLoop(target)
 		}
@@ -184,7 +188,7 @@ func (m *Multiplexer) RegisterUpstream(ctx context.Context, cfg UpstreamConfig) 
 	m.upstreams[cfg.ID] = target
 
 	// If transport is active and handler is registered, launch dedicated background reader loop
-	if target.transport != nil && m.handler != nil {
+	if target.transport != nil && m.handler != nil && target.loopStarted.CompareAndSwap(false, true) {
 		m.wg.Add(1)
 		go m.runUpstreamLoop(target)
 	}

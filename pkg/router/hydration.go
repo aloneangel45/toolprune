@@ -154,7 +154,7 @@ func (v *ValidationError) Error() string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("ToolPrune Schema Validation Error for %q:\n", v.ToolName))
 	for _, issue := range v.Issues {
-		sb.WriteString(fmt.Sprintf("• %s\n", issue))
+		sb.WriteString(fmt.Sprintf("- %s\n", issue))
 	}
 	sb.WriteString("\nExpected Parameter Schema:\n")
 

@@ -269,7 +269,19 @@ func TestToolFilter(t *testing.T) {
 		if !filter.IsAllowed("get_user") || !filter.IsAllowed("list_repos") || !filter.IsAllowed("search_items") {
 			t.Errorf("expected discovery tools to be allowed in minimal profile")
 		}
-		if filter.IsAllowed("delete_repo") || filter.IsAllowed("admin_settings") || filter.IsAllowed("deploy_app") {
+		namespacedReadTools := []string{
+			"github__get_issue",
+			"github__list_issues",
+			"fs__read_file",
+			"docs__search_pages",
+			"web__fetch_url",
+		}
+		for _, nt := range namespacedReadTools {
+			if !filter.IsAllowed(nt) {
+				t.Errorf("expected namespaced read tool %q to be allowed in minimal profile", nt)
+			}
+		}
+		if filter.IsAllowed("delete_repo") || filter.IsAllowed("admin_settings") || filter.IsAllowed("deploy_app") || filter.IsAllowed("github__delete_repo") {
 			t.Errorf("expected admin/mutating tools to be excluded in minimal profile")
 		}
 	})

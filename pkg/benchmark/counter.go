@@ -15,27 +15,36 @@ const (
 )
 
 var (
-	encoderOnce sync.Once
 	encoderMu   sync.RWMutex
+	encoderInit bool
 	encoder     *tiktoken.Tiktoken
 	encoderErr  error
 )
 
-// getOrInitEncoder initializes or returns the singleton tiktoken cl100k encoder.
+// getOrInitEncoder initializes or returns the singleton tiktoken cl100k encoder safely under concurrency.
 func getOrInitEncoder() (*tiktoken.Tiktoken, error) {
-	encoderOnce.Do(func() {
-		encoderMu.Lock()
-		defer encoderMu.Unlock()
-		enc, err := tiktoken.GetEncoding(DefaultEncoding)
-		if err != nil {
-			encoderErr = fmt.Errorf("failed to load tiktoken encoding %q: %w", DefaultEncoding, err)
-			return
-		}
-		encoder = enc
-	})
-
 	encoderMu.RLock()
-	defer encoderMu.RUnlock()
+	if encoderInit {
+		enc, err := encoder, encoderErr
+		encoderMu.RUnlock()
+		return enc, err
+	}
+	encoderMu.RUnlock()
+
+	encoderMu.Lock()
+	defer encoderMu.Unlock()
+	if encoderInit {
+		return encoder, encoderErr
+	}
+
+	enc, err := tiktoken.GetEncoding(DefaultEncoding)
+	if err != nil {
+		encoderErr = fmt.Errorf("failed to load tiktoken encoding %q: %w", DefaultEncoding, err)
+	} else {
+		encoder = enc
+		encoderErr = nil
+	}
+	encoderInit = true
 	return encoder, encoderErr
 }
 
@@ -45,11 +54,11 @@ func IsExactAvailable() bool {
 	return err == nil && enc != nil
 }
 
-// ResetEncoder resets the singleton encoder (primarily used in tests).
+// ResetEncoder resets the singleton encoder safely without data races (primarily used in tests).
 func ResetEncoder() {
 	encoderMu.Lock()
 	defer encoderMu.Unlock()
-	encoderOnce = sync.Once{}
+	encoderInit = false
 	encoder = nil
 	encoderErr = nil
 }
