@@ -10,7 +10,7 @@ import (
 
 var (
 	// Build metadata populated via -ldflags during build
-	Version   = "1.0.0"
+	Version   = "1.2.0"
 	GitCommit = "dev"
 	BuildDate = "unknown"
 

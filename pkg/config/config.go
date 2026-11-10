@@ -473,11 +473,13 @@ func (c *Config) ToSSEServerConfig() proxy.SSEServerConfig {
 // ToRouterConfig converts configuration to a router.RouterConfig instance.
 func (c *Config) ToRouterConfig() router.RouterConfig {
 	return router.RouterConfig{
-		NamespaceMode:  router.NamespaceMode(c.Routing.NamespaceMode),
-		PruneMode:      c.Pruning.Tier,
-		ActiveProfile:  c.Routing.DefaultProfile,
-		MaxActiveTools: c.Routing.ActiveWindowSize,
-		EnableCatalog:  c.Pruning.Tier == "dynamic",
+		NamespaceMode:   router.NamespaceMode(c.Routing.NamespaceMode),
+		PruneMode:       c.Pruning.Tier,
+		MaxSchemaTokens: c.Pruning.MaxSchemaTokens,
+		ActiveProfile:   c.Routing.DefaultProfile,
+		MaxActiveTools:  c.Routing.ActiveWindowSize,
+		PinnedTools:     append([]string(nil), c.Routing.PinnedTools...),
+		EnableCatalog:   c.Pruning.Tier == "dynamic",
 	}
 }
 

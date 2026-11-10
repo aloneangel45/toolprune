@@ -283,6 +283,19 @@ func (p *Proxy) UnregisterClient(sessionID string) {
 	delete(p.clients, sessionID)
 }
 
+// BroadcastNotification delivers a server notification to all active client sessions.
+func (p *Proxy) BroadcastNotification(msg *mcp.Message) error {
+	if msg == nil {
+		return nil
+	}
+	p.clientsMu.RLock()
+	defer p.clientsMu.RUnlock()
+	for _, client := range p.clients {
+		_ = client.Send(msg)
+	}
+	return nil
+}
+
 // Start launches the background upstream reader and timeout supervisor.
 func (p *Proxy) Start() {
 	p.wg.Add(2)
