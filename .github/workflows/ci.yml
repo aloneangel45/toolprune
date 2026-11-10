@@ -36,5 +36,10 @@ jobs:
       - name: Static analysis (go vet)
         run: go vet ./...
 
-      - name: Run test suite
+      - name: Run test suite with race detector (Linux & macOS)
+        if: runner.os != 'Windows'
+        run: go test -race -v ./...
+
+      - name: Run test suite (Windows)
+        if: runner.os == 'Windows'
         run: go test -v ./...

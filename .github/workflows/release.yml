@@ -10,8 +10,28 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    name: Pre-Release Verification Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+
+      - name: Static analysis (go vet)
+        run: go vet ./...
+
+      - name: Run full test suite with race detector
+        run: go test -race ./...
+
   release:
     name: Build & Publish Release
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -29,8 +49,8 @@ jobs:
         id: meta
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"
-          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "refs/heads/main" ]; then
-            TAG_NAME="v1.0.0"
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "$GITHUB_REF" ]; then
+            TAG_NAME="v1.2.0"
           fi
           echo "VERSION=${TAG_NAME}" >> $GITHUB_ENV
           echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
@@ -43,39 +63,53 @@ jobs:
 
           # 1. Linux amd64
           mkdir -p dist/linux_amd64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/linux_amd64/toolprune ./cmd/toolprune
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/linux_amd64/toolprune ./cmd/toolprune
           tar -czvf dist/toolprune-linux-amd64.tar.gz -C dist/linux_amd64 toolprune
 
           # 2. Linux arm64
           mkdir -p dist/linux_arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/linux_arm64/toolprune ./cmd/toolprune
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/linux_arm64/toolprune ./cmd/toolprune
           tar -czvf dist/toolprune-linux-arm64.tar.gz -C dist/linux_arm64 toolprune
 
           # 3. macOS amd64
           mkdir -p dist/darwin_amd64
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/darwin_amd64/toolprune ./cmd/toolprune
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/darwin_amd64/toolprune ./cmd/toolprune
           tar -czvf dist/toolprune-darwin-amd64.tar.gz -C dist/darwin_amd64 toolprune
 
           # 4. macOS arm64
           mkdir -p dist/darwin_arm64
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/darwin_arm64/toolprune ./cmd/toolprune
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/darwin_arm64/toolprune ./cmd/toolprune
           tar -czvf dist/toolprune-darwin-arm64.tar.gz -C dist/darwin_arm64 toolprune
 
           # 5. Windows amd64
           mkdir -p dist/windows_amd64
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/windows_amd64/toolprune-windows-amd64.exe ./cmd/toolprune
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/windows_amd64/toolprune-windows-amd64.exe ./cmd/toolprune
           cp dist/windows_amd64/toolprune-windows-amd64.exe dist/toolprune-windows-amd64.exe
           (cd dist/windows_amd64 && zip -r ../toolprune-windows-amd64.zip toolprune-windows-amd64.exe)
+
+          # 6. Windows arm64
+          mkdir -p dist/windows_arm64
+          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/windows_arm64/toolprune-windows-arm64.exe ./cmd/toolprune
+          cp dist/windows_arm64/toolprune-windows-arm64.exe dist/toolprune-windows-arm64.exe
+          (cd dist/windows_arm64 && zip -r ../toolprune-windows-arm64.zip toolprune-windows-arm64.exe)
 
       - name: Generate Checksums
         run: |
           cd dist
-          sha256sum toolprune-linux-amd64.tar.gz toolprune-linux-arm64.tar.gz toolprune-darwin-amd64.tar.gz toolprune-darwin-arm64.tar.gz toolprune-windows-amd64.zip toolprune-windows-amd64.exe > checksums.txt
+          sha256sum \
+            toolprune-linux-amd64.tar.gz \
+            toolprune-linux-arm64.tar.gz \
+            toolprune-darwin-amd64.tar.gz \
+            toolprune-darwin-arm64.tar.gz \
+            toolprune-windows-amd64.zip \
+            toolprune-windows-amd64.exe \
+            toolprune-windows-arm64.zip \
+            toolprune-windows-arm64.exe > checksums.txt
           cat checksums.txt
 
       - name: Publish Release Assets
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
             dist/toolprune-linux-amd64.tar.gz
@@ -84,6 +118,8 @@ jobs:
             dist/toolprune-darwin-arm64.tar.gz
             dist/toolprune-windows-amd64.zip
             dist/toolprune-windows-amd64.exe
+            dist/toolprune-windows-arm64.zip
+            dist/toolprune-windows-arm64.exe
             dist/checksums.txt
           title: "${{ env.VERSION }} - High-Performance MCP Proxy & Dynamic Schema Pruner"
           generate_release_notes: true

@@ -45,6 +45,33 @@ log_error() {
     printf "${RED}[ERROR]${RESET} %s\n" "$1" >&2
 }
 
+download_file() {
+    local url="$1"
+    local dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${url}" -o "${dest}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "${dest}" "${url}"
+    else
+        log_error "Neither curl nor wget found in PATH. Please install one of them."
+        exit 1
+    fi
+}
+
+compute_sha256() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${file}" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${file}" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "${file}" | awk '{print $NF}'
+    else
+        log_error "No SHA-256 utility found (sha256sum, shasum, or openssl required)."
+        exit 1
+    fi
+}
+
 # 1. Detect OS
 OS_RAW="$(uname -s)"
 case "${OS_RAW}" in
@@ -71,10 +98,15 @@ log_info "Detected target platform: ${BOLD}${OS}/${ARCH}${RESET}"
 
 # 3. Resolve latest release version
 log_info "Fetching latest release version from GitHub..."
-TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+TAG=""
+if command -v curl >/dev/null 2>&1; then
+    TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+elif command -v wget >/dev/null 2>&1; then
+    TAG=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+fi
 
 if [ -z "${TAG}" ]; then
-    TAG="v0.2.0"
+    TAG="v1.2.0"
     log_warn "GitHub API rate limit reached or offline; falling back to release ${TAG}"
 fi
 
@@ -83,6 +115,7 @@ log_info "Target release: ${BOLD}${TAG}${RESET}"
 # 4. Prepare Download URL and Temp Directory
 ARCHIVE_NAME="toolprune-${OS}-${ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE_NAME}"
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/checksums.txt"
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -91,16 +124,34 @@ cleanup() {
 trap cleanup EXIT
 
 log_info "Downloading ${DOWNLOAD_URL}..."
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "${DOWNLOAD_URL}" -o "${TMP_DIR}/${ARCHIVE_NAME}"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "${TMP_DIR}/${ARCHIVE_NAME}" "${DOWNLOAD_URL}"
-else
-    log_error "Neither curl nor wget found in PATH. Please install one of them."
+download_file "${DOWNLOAD_URL}" "${TMP_DIR}/${ARCHIVE_NAME}"
+
+log_info "Downloading SHA-256 checksums from ${CHECKSUMS_URL}..."
+download_file "${CHECKSUMS_URL}" "${TMP_DIR}/checksums.txt"
+
+# 5. Verify SHA-256 Checksum
+EXPECTED_HASH=$(awk -v target="${ARCHIVE_NAME}" '{
+    fname = $2
+    sub(/^\*/, "", fname)
+    if (fname == target) {
+        print tolower($1)
+        exit
+    }
+}' "${TMP_DIR}/checksums.txt")
+
+if [ -z "${EXPECTED_HASH}" ]; then
+    log_error "Checksum entry for ${ARCHIVE_NAME} not found in checksums.txt"
     exit 1
 fi
 
-# 5. Extract Archive
+ACTUAL_HASH=$(compute_sha256 "${TMP_DIR}/${ARCHIVE_NAME}" | tr '[:upper:]' '[:lower:]')
+if [ "${ACTUAL_HASH}" != "${EXPECTED_HASH}" ]; then
+    log_error "SHA-256 checksum mismatch for ${ARCHIVE_NAME} (expected ${EXPECTED_HASH}, got ${ACTUAL_HASH})"
+    exit 1
+fi
+log_info "SHA-256 checksum verified: ${ACTUAL_HASH}"
+
+# 6. Extract Archive
 log_info "Extracting ${ARCHIVE_NAME}..."
 tar -xzf "${TMP_DIR}/${ARCHIVE_NAME}" -C "${TMP_DIR}"
 
@@ -111,7 +162,7 @@ fi
 
 chmod +x "${TMP_DIR}/${BINARY_NAME}"
 
-# 6. Determine Installation Target Directory
+# 7. Determine Installation Target Directory
 if [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/usr/local/bin"
     SUDO=""
@@ -127,7 +178,7 @@ fi
 
 log_success "toolprune installed successfully to ${BOLD}${INSTALL_DIR}/${BINARY_NAME}${RESET}"
 
-# 7. Check PATH
+# 8. Check PATH
 case ":$PATH:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
@@ -137,15 +188,15 @@ case ":$PATH:" in
         ;;
 esac
 
-# 8. Success Banner
+# 9. Success Banner
 printf "\n"
-printf "${CYAN}╔══════════════════════════════════════════════════════════════╗${RESET}\n"
-printf "${CYAN}║${RESET}  ${BOLD}🚀 toolprune is ready to optimize your LLM agent context!${RESET}  ${CYAN}║${RESET}\n"
-printf "${CYAN}╚══════════════════════════════════════════════════════════════╝${RESET}\n"
+printf "${CYAN}+--------------------------------------------------------------+${RESET}\n"
+printf "${CYAN}|${RESET}  ${BOLD}toolprune is ready to optimize your LLM agent context.${RESET}      ${CYAN}|${RESET}\n"
+printf "${CYAN}+--------------------------------------------------------------+${RESET}\n"
 printf "\n"
 printf "  Quick Start:\n"
 printf "    ${BOLD}toolprune proxy --help${RESET}                 # Inspect available commands\n"
 printf "    ${BOLD}toolprune proxy --preset balanced${RESET}      # Run proxy with balanced pruning\n"
-printf "    ${BOLD}toolprune proxy --preset strict${RESET}        # Maximum token savings (up to 91%%)\n"
+printf "    ${BOLD}toolprune proxy --preset strict${RESET}        # Maximum token savings\n"
 printf "\n"
 printf "  Documentation & Benchmarks: ${BLUE}https://github.com/${REPO}${RESET}\n\n"

@@ -104,6 +104,7 @@ func collectChangedFlags(cmd *cobra.Command) map[string]bool {
 }
 
 func runProxy(cmd *cobra.Command, args []string) error {
+	defer resetCommandFlags(cmd)
 	logger := slog.Default()
 	changed := collectChangedFlags(cmd)
 

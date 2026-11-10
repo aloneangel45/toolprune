@@ -69,19 +69,118 @@ func DefaultPath(client Client) (string, error) {
 }
 
 // ServerSpec describes a single MCP server entry in a client config file.
-// Cursor uses {command, args, env}; Windsurf uses {serverUrl} for remote servers
-// or {command, args, env} for stdio servers.
+// Cursor uses {command, args, env} or {url}; Windsurf uses {serverUrl} for remote servers
+// or {command, args, env} for stdio servers. ExtraFields preserves unknown sibling keys.
 type ServerSpec struct {
-	Command   string            `json:"command,omitempty"`
-	Args      []string          `json:"args,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	ServerURL string            `json:"serverUrl,omitempty"`
+	Command     string            `json:"command,omitempty"`
+	Args        []string          `json:"args,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	ServerURL   string            `json:"serverUrl,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	ExtraFields map[string]any    `json:"-"`
+}
+
+// MarshalJSON preserves unknown per-server sibling fields alongside typed fields.
+func (s ServerSpec) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, len(s.ExtraFields)+5)
+	for k, v := range s.ExtraFields {
+		out[k] = v
+	}
+	if s.Command != "" {
+		out["command"] = s.Command
+	}
+	if len(s.Args) > 0 {
+		out["args"] = s.Args
+	}
+	if len(s.Env) > 0 {
+		out["env"] = s.Env
+	}
+	if s.ServerURL != "" {
+		out["serverUrl"] = s.ServerURL
+	}
+	if s.URL != "" {
+		out["url"] = s.URL
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON parses typed server fields while retaining unknown sibling keys in ExtraFields.
+func (s *ServerSpec) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	type plainSpec struct {
+		Command   string            `json:"command"`
+		Args      []string          `json:"args"`
+		Env       map[string]string `json:"env"`
+		ServerURL string            `json:"serverUrl"`
+		URL       string            `json:"url"`
+	}
+	var p plainSpec
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	s.Command = p.Command
+	s.Args = p.Args
+	s.Env = p.Env
+	s.ServerURL = p.ServerURL
+	s.URL = p.URL
+
+	delete(raw, "command")
+	delete(raw, "args")
+	delete(raw, "env")
+	delete(raw, "serverUrl")
+	delete(raw, "url")
+	if len(raw) > 0 {
+		s.ExtraFields = raw
+	} else {
+		s.ExtraFields = nil
+	}
+	return nil
 }
 
 // ConfigFile is the top-level shape of both Cursor and Windsurf MCP config files:
-// a JSON object with an "mcpServers" map of server name -> ServerSpec.
+// a JSON object with an "mcpServers" map of server name -> ServerSpec, plus any preserved top-level sibling fields.
 type ConfigFile struct {
-	MCPServers map[string]ServerSpec `json:"mcpServers"`
+	MCPServers  map[string]ServerSpec `json:"mcpServers"`
+	ExtraFields map[string]any        `json:"-"`
+}
+
+// MarshalJSON serializes mcpServers while preserving unknown top-level sibling fields.
+func (c ConfigFile) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, len(c.ExtraFields)+1)
+	for k, v := range c.ExtraFields {
+		out[k] = v
+	}
+	if c.MCPServers == nil {
+		out["mcpServers"] = map[string]ServerSpec{}
+	} else {
+		out["mcpServers"] = c.MCPServers
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON parses mcpServers while preserving unknown top-level sibling fields via map[string]any.
+func (c *ConfigFile) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	var wrapper struct {
+		MCPServers map[string]ServerSpec `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return err
+	}
+	c.MCPServers = wrapper.MCPServers
+	delete(raw, "mcpServers")
+	if len(raw) > 0 {
+		c.ExtraFields = raw
+	} else {
+		c.ExtraFields = nil
+	}
+	return nil
 }
 
 // Options controls preset generation.
@@ -103,7 +202,7 @@ type Options struct {
 	ConfigPath string
 }
 
-// DefaultOptions returns Options targeting Cursor with a plain stdio proxy entry.
+// DefaultOptions returns Options targeting the client with a plain stdio proxy entry.
 func DefaultOptions(client Client) Options {
 	return Options{
 		Client:     client,
@@ -120,14 +219,15 @@ func (o Options) serverSpec() ServerSpec {
 		args = append(args, "--config", o.ConfigPath)
 	}
 	spec := ServerSpec{
-		Args:      args,
 		Env:       o.Env,
 		ServerURL: o.ServerURL,
 	}
 	if o.ServerURL == "" {
 		spec.Command = o.Command
-		if len(spec.Args) == 0 {
+		if len(args) == 0 {
 			spec.Args = []string{"proxy"}
+		} else {
+			spec.Args = args
 		}
 	}
 	return spec
@@ -177,9 +277,10 @@ func GenerateFromConfig(cfg *config.Config, client Client, configPath string) (*
 	return Generate(o)
 }
 
-// MergeInto reads an existing client config file (if present) and returns a new
-// ConfigFile with the ToolPrune server entry added or replaced, preserving all
-// other servers. A missing file yields a fresh ConfigFile.
+// MergeInto reads an existing client config file (if present) via map[string]any
+// and returns a new ConfigFile with the ToolPrune server entry added or replaced,
+// preserving all other servers as well as unknown top-level and per-server sibling fields.
+// A missing file yields a fresh ConfigFile.
 func MergeInto(existingPath string, o Options) (*ConfigFile, error) {
 	cfg, err := Generate(o)
 	if err != nil {
@@ -192,10 +293,11 @@ func MergeInto(existingPath string, o Options) (*ConfigFile, error) {
 		}
 		return nil, fmt.Errorf("failed to read existing config %q: %w", existingPath, err)
 	}
-	var existing ConfigFile
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return cfg, nil
 	}
+
+	var existing ConfigFile
 	if err := json.Unmarshal(data, &existing); err != nil {
 		return nil, fmt.Errorf("existing config %q is not valid JSON: %w", existingPath, err)
 	}
@@ -206,7 +308,18 @@ func MergeInto(existingPath string, o Options) (*ConfigFile, error) {
 	if strings.TrimSpace(name) == "" {
 		name = "toolprune"
 	}
-	existing.MCPServers[name] = cfg.MCPServers[name]
+	newSpec := cfg.MCPServers[name]
+	if prevSpec, hasPrev := existing.MCPServers[name]; hasPrev && len(prevSpec.ExtraFields) > 0 {
+		preserved := make(map[string]any, len(prevSpec.ExtraFields))
+		for k, v := range prevSpec.ExtraFields {
+			preserved[k] = v
+		}
+		for k, v := range newSpec.ExtraFields {
+			preserved[k] = v
+		}
+		newSpec.ExtraFields = preserved
+	}
+	existing.MCPServers[name] = newSpec
 	return &existing, nil
 }
 
@@ -235,7 +348,7 @@ func WriteFile(path string, o Options) error {
 
 // Validate checks that raw JSON bytes conform to the client MCP config schema:
 // a JSON object whose "mcpServers" value is an object mapping names to server
-// entries that carry either a "command" (stdio) or a "serverUrl" (remote).
+// entries that carry either a "command" (stdio), "serverUrl" (remote), or "url" (remote).
 func Validate(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -266,9 +379,10 @@ func Validate(data []byte) error {
 			return fmt.Errorf("server %q must be an object: %w", name, err)
 		}
 		_, hasCommand := spec["command"]
-		_, hasURL := spec["serverUrl"]
-		if !hasCommand && !hasURL {
-			return fmt.Errorf("server %q must define either \"command\" (stdio) or \"serverUrl\" (remote)", name)
+		_, hasServerURL := spec["serverUrl"]
+		_, hasURL := spec["url"]
+		if !hasCommand && !hasServerURL && !hasURL {
+			return fmt.Errorf("server %q must define \"command\" (stdio), \"serverUrl\" (remote), or \"url\" (remote)", name)
 		}
 		if hasCommand {
 			var cmd string
@@ -276,10 +390,16 @@ func Validate(data []byte) error {
 				return fmt.Errorf("server %q has an invalid or empty \"command\"", name)
 			}
 		}
-		if hasURL {
+		if hasServerURL {
 			var u string
 			if err := json.Unmarshal(spec["serverUrl"], &u); err != nil || strings.TrimSpace(u) == "" {
 				return fmt.Errorf("server %q has an invalid or empty \"serverUrl\"", name)
+			}
+		}
+		if hasURL {
+			var u string
+			if err := json.Unmarshal(spec["url"], &u); err != nil || strings.TrimSpace(u) == "" {
+				return fmt.Errorf("server %q has an invalid or empty \"url\"", name)
 			}
 		}
 		if argsRaw, ok := spec["args"]; ok {

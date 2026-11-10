@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	presetcmd "github.com/aloneangel45/toolprune/cmd/preset"
 )
@@ -55,4 +56,29 @@ func init() {
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(presetcmd.NewCommand())
 	rootCmd.AddCommand(versionCmd)
+}
+
+// resetCommandFlags resets local and persistent flag values & Changed bits after command execution
+// so repeated in-process rootCmd.Execute() invocations do not leak flag state across runs.
+func resetCommandFlags(cmd *cobra.Command) {
+	if cmd == nil {
+		return
+	}
+	resetSet := func(fs *pflag.FlagSet) {
+		if fs == nil {
+			return
+		}
+		fs.VisitAll(func(f *pflag.Flag) {
+			if f.Changed {
+				if sv, ok := f.Value.(pflag.SliceValue); ok {
+					_ = sv.Replace(nil)
+				} else {
+					_ = f.Value.Set(f.DefValue)
+				}
+				f.Changed = false
+			}
+		})
+	}
+	resetSet(cmd.LocalFlags())
+	resetSet(rootCmd.PersistentFlags())
 }

@@ -100,10 +100,59 @@ func TestAdversarial_SilenceErrorsAudit(t *testing.T) {
 }
 
 func TestAdversarial_RoutesFlagsIgnoredAudit(t *testing.T) {
-	// Audit finding: routesCmd defines --profile and --filter flags, but runRoutes never uses them
-	if routesCmd.Flags().Lookup("profile") != nil && routesCmd.Flags().Lookup("filter") != nil {
-		t.Logf("CONFIRMED: routesCmd exposes --profile and --filter, but inspect runRoutes() reveals neither rFlags.profile nor rFlags.filter is evaluated.")
+	configPath := "../../toolprune.yaml"
+	if _, err := exec.LookPath("go"); err == nil {
+		// Resolve config relative to package test directory
 	}
+
+	t.Run("evaluates --profile and rejects unknown profile", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		rootCmd.SetOut(buf)
+		rootCmd.SetErr(buf)
+		rootCmd.SetArgs([]string{"routes", "--config", configPath, "--profile", "nonexistent_profile_404"})
+		err := rootCmd.Execute()
+		if err == nil {
+			t.Fatal("expected error for unknown --profile on routes command, got nil")
+		}
+		if !strings.Contains(err.Error(), "nonexistent_profile_404") {
+			t.Errorf("expected error mentioning invalid profile, got: %v", err)
+		}
+	})
+
+	t.Run("evaluates --profile read_only and --filter", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		rootCmd.SetOut(buf)
+		rootCmd.SetErr(buf)
+		rootCmd.SetArgs([]string{"routes", "--config", configPath, "--profile", "read_only", "--filter", "sqlite"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("routes --profile read_only --filter sqlite failed: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, "sqlite") {
+			t.Errorf("expected sqlite upstream in filtered output, got:\n%s", out)
+		}
+		if strings.Contains(out, "remote_agent") {
+			t.Errorf("expected remote_agent to be excluded by --filter sqlite, got:\n%s", out)
+		}
+		if !strings.Contains(out, "read-only") {
+			t.Errorf("expected read-only profile access evaluation in output, got:\n%s", out)
+		}
+	})
+
+	t.Run("custom profile filters out blocked upstreams", func(t *testing.T) {
+		buf := new(bytes.Buffer)
+		rootCmd.SetOut(buf)
+		rootCmd.SetErr(buf)
+		// In toolprune.yaml, 'coding' profile includes github__*, git_*, filesystem__*, *search*, *read*
+		rootCmd.SetArgs([]string{"routes", "--config", configPath, "--profile", "minimal", "--json"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("routes --profile minimal --json failed: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, `"activeProfile": "minimal"`) {
+			t.Errorf("expected activeProfile minimal in JSON output, got:\n%s", out)
+		}
+	})
 }
 
 // -----------------------------------------------------------------------------
