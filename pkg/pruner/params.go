@@ -3,6 +3,7 @@ package pruner
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
 )
@@ -40,42 +41,87 @@ func PruneParamsTool(tool mcp.Tool, opts ...any) mcp.Tool {
 func PruneToolParams(tool mcp.Tool, opts ParamsOptions) (mcp.Tool, error) {
 	pruned := tool
 
-	// Ensure root object type invariant
-	if pruned.InputSchema.Type == "" {
-		pruned.InputSchema.Type = "object"
+	prunedSchema, err := PruneInputSchema(&pruned.InputSchema, opts)
+	if err != nil {
+		return pruned, err
 	}
+	pruned.InputSchema = *prunedSchema
 
-	// Prune properties recursively
-	if pruned.InputSchema.Properties != nil {
-		pruned.InputSchema.Properties = prunePropertiesMap(pruned.InputSchema.Properties, opts)
-	}
-
-	// Strip root-level decorative fields if present
-	if opts.StripValidators {
-		if b, ok := pruned.InputSchema.AdditionalProperties.(bool); ok && !b {
-			pruned.InputSchema.AdditionalProperties = nil
-		}
-		pruned.InputSchema.Schema = ""
+	// Optional tier-based docstring compaction inside OutputSchema
+	if len(pruned.OutputSchema) > 0 {
+		pruned.OutputSchema = pruneProperty(pruned.OutputSchema, "output_schema", opts)
 	}
 
 	return pruned, nil
 }
 
-// PruneInputSchema prunes an mcp.InputSchema directly, returning a pruned copy.
+// PruneInputSchema prunes an mcp.InputSchema directly, returning a pruned copy while preserving Draft-07/2020-12 fields.
 func PruneInputSchema(schema *mcp.InputSchema, opts ParamsOptions) (*mcp.InputSchema, error) {
 	if schema == nil {
 		return &mcp.InputSchema{Type: "object"}, nil
 	}
 
-	copySchema := &mcp.InputSchema{
-		Type:       schema.Type,
-		Properties: prunePropertiesMap(schema.Properties, opts),
-		Required:   append([]string(nil), schema.Required...),
-	}
+	copySchema := CloneInputSchema(*schema)
 	if copySchema.Type == "" {
 		copySchema.Type = "object"
 	}
-	return copySchema, nil
+
+	if copySchema.Properties != nil {
+		copySchema.Properties = prunePropertiesMap(copySchema.Properties, opts)
+	}
+	if copySchema.Defs != nil {
+		copySchema.Defs = prunePropertiesMap(copySchema.Defs, opts)
+	}
+	if copySchema.Definitions != nil {
+		copySchema.Definitions = prunePropertiesMap(copySchema.Definitions, opts)
+	}
+	if copySchema.PatternProperties != nil {
+		copySchema.PatternProperties = prunePropertiesMap(copySchema.PatternProperties, opts)
+	}
+	if copySchema.DependentSchemas != nil {
+		copySchema.DependentSchemas = prunePropertiesMap(copySchema.DependentSchemas, opts)
+	}
+	if len(copySchema.AnyOf) > 0 {
+		copySchema.AnyOf = pruneBranchSlice(copySchema.AnyOf, "root_anyOf", opts)
+	}
+	if len(copySchema.OneOf) > 0 {
+		copySchema.OneOf = pruneBranchSlice(copySchema.OneOf, "root_oneOf", opts)
+	}
+	if len(copySchema.AllOf) > 0 {
+		copySchema.AllOf = pruneBranchSlice(copySchema.AllOf, "root_allOf", opts)
+	}
+	if copySchema.Not != nil {
+		copySchema.Not = pruneProperty(copySchema.Not, "root_not", opts)
+	}
+	if addPropsMap, ok := copySchema.AdditionalProperties.(map[string]any); ok {
+		copySchema.AdditionalProperties = pruneProperty(addPropsMap, "additional_props", opts)
+	}
+
+	// Strip root-level decorative fields if configured
+	if opts.StripValidators {
+		if b, ok := copySchema.AdditionalProperties.(bool); ok && !b {
+			copySchema.AdditionalProperties = nil
+		}
+		copySchema.Schema = ""
+		copySchema.ID = ""
+		copySchema.Title = ""
+		copySchema.Comment = ""
+		copySchema.Examples = nil
+	}
+
+	return &copySchema, nil
+}
+
+func pruneBranchSlice(unionList []any, propName string, opts ParamsOptions) []any {
+	cleanedUnion := make([]any, len(unionList))
+	for i, branch := range unionList {
+		if branchMap, ok := branch.(map[string]any); ok {
+			cleanedUnion[i] = pruneProperty(branchMap, propName, opts)
+		} else {
+			cleanedUnion[i] = branch
+		}
+	}
+	return cleanedUnion
 }
 
 // prunePropertiesMap processes a map of propertyName -> propertySchema.
@@ -126,12 +172,20 @@ func pruneProperty(prop map[string]any, propName string, opts ParamsOptions) map
 				cleaned["enum"] = v
 			}
 
-		// INVARIANT 4: Nested properties (for object types)
-		case "properties":
+		// INVARIANT 4: Nested properties and sub-schema maps ($defs, definitions, patternProperties, dependentSchemas)
+		case "properties", "patternProperties", "$defs", "definitions", "dependentSchemas":
 			if nestedProps, ok := v.(map[string]any); ok {
-				cleaned["properties"] = prunePropertiesMap(nestedProps, opts)
+				cleaned[k] = prunePropertiesMap(nestedProps, opts)
 			} else {
-				cleaned["properties"] = v
+				cleaned[k] = v
+			}
+
+		// Conditional / negated sub-schemas: not, if, then, else
+		case "not", "if", "then", "else":
+			if subMap, ok := v.(map[string]any); ok {
+				cleaned[k] = pruneProperty(subMap, propName+"_"+k, opts)
+			} else {
+				cleaned[k] = v
 			}
 
 		// INVARIANT 4: Array items
@@ -286,8 +340,8 @@ func truncateDescription(desc string, maxLen int) string {
 		return ""
 	}
 
-	// 3. Extract up to first grammatical sentence if within reasonable bound
-	if idx := strings.IndexAny(clean, ".!?"); idx != -1 && idx <= maxLen {
+	// 3. Extract up to first grammatical sentence if within reasonable rune bound
+	if idx := strings.IndexAny(clean, ".!?"); idx != -1 && utf8.RuneCountInString(clean[:idx+1]) <= maxLen {
 		clean = clean[:idx+1]
 		return clean
 	}
@@ -296,6 +350,9 @@ func truncateDescription(desc string, maxLen int) string {
 	runes := []rune(clean)
 	if len(runes) <= maxLen {
 		return clean
+	}
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
 	}
 
 	// Find the last space before maxLen-3 to avoid cutting words in half

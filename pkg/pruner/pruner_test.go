@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
@@ -696,5 +697,84 @@ func TestDraft07Compliance_BooleanArrayItems(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected ErrInvalidArrayItems error, got: %v", badRes.Errors)
+	}
+}
+
+func TestModernSchemaAndUTF8SafetyAcrossAllTiers(t *testing.T) {
+	readOnly := true
+	destructive := false
+	minProps := 1
+	rawTool := mcp.Tool{
+		Name:        "pydantic_migration",
+		Title:       "Execute Migration",
+		Description: " Türkçe ğüşiöç 日本語 description with multi-byte runes that must never corrupt UTF-8 boundaries when condensed.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Migration Runner",
+			ReadOnlyHint:    &readOnly,
+			DestructiveHint: &destructive,
+		},
+		Icons: []mcp.ToolIcon{{Src: "https://example.com/icon.svg", MIMEType: "image/svg+xml"}},
+		OutputSchema: map[string]any{
+			"type":        "object",
+			"description": "Verbose output description with [link](https://example.com) and extra sentences. Second sentence here.",
+			"properties": map[string]any{
+				"applied": map[string]any{"type": "boolean", "description": "Whether migration applied cleanly to cluster"},
+			},
+		},
+		InputSchema: mcp.InputSchema{
+			Type:   "object",
+			Schema: "https://json-schema.org/draft/2020-12/schema",
+			Defs: map[string]any{
+				"ColumnSpec": map[string]any{
+					"type":        "object",
+					"description": "Verbose Pydantic $defs node documentation with ```sql\nSELECT 1;\n``` code block.",
+					"properties": map[string]any{
+						"col_type": map[string]any{
+							"type":        "string",
+							"description": "PostgreSQL column type specification",
+						},
+					},
+					"required": []string{"col_type"},
+				},
+			},
+			Properties: map[string]any{
+				"column": map[string]any{
+					"$ref":        "#/$defs/ColumnSpec",
+					"description": " Türkçe ğüşiöç 日本語 parameter description for tiny maxLen test",
+				},
+			},
+			PatternProperties: map[string]any{
+				"^x_": map[string]any{"type": "string", "description": "Extension header metadata attribute"},
+			},
+			DependentRequired: map[string][]string{"column": {"column"}},
+			MinProperties:     &minProps,
+			Required:          []string{"column"},
+		},
+	}
+
+	// Test tiny MaxNonSelfEvidentLen (1, 2, 3) to prevent slice bounds panic
+	for _, tinyLen := range []int{1, 2, 3, 10} {
+		opts := pruner.DefaultOptions(pruner.TierAggressive)
+		opts.Params.MaxNonSelfEvidentLen = tinyLen
+		opts.Condense.MaxToolDescLen = tinyLen
+		opts.Condense.MaxParamDescLen = tinyLen
+		engine := pruner.New(opts)
+		pruned, _, err := engine.PruneTools([]mcp.Tool{rawTool})
+		if err != nil {
+			t.Fatalf("PruneTools failed at tinyLen=%d: %v", tinyLen, err)
+		}
+		pt := pruned[0]
+		if !utf8.ValidString(pt.Description) {
+			t.Fatalf("invalid UTF-8 in tool description at tinyLen=%d: %q", tinyLen, pt.Description)
+		}
+		if pt.Annotations == nil || pt.Annotations.DestructiveHint == nil || *pt.Annotations.DestructiveHint != false {
+			t.Fatalf("annotations lost at tinyLen=%d", tinyLen)
+		}
+		if len(pt.InputSchema.Defs) == 0 {
+			t.Fatalf("$defs destroyed at tinyLen=%d", tinyLen)
+		}
+		if len(pt.InputSchema.PatternProperties) == 0 {
+			t.Fatalf("patternProperties destroyed at tinyLen=%d", tinyLen)
+		}
 	}
 }

@@ -17,6 +17,9 @@ func MinifyTool(tool mcp.Tool, opts ...MinifyOptions) mcp.Tool {
 
 	out := tool
 	out.InputSchema = MinifyInputSchema(tool.InputSchema, opt)
+	if len(out.OutputSchema) > 0 {
+		out.OutputSchema = MinifyNode(out.OutputSchema, opt)
+	}
 	return out
 }
 
@@ -36,13 +39,25 @@ func MinifyToolsList(tools []mcp.Tool, opts ...MinifyOptions) []mcp.Tool {
 	return result
 }
 
-// MinifyInputSchema cleans an mcp.InputSchema struct.
+// MinifyInputSchema cleans an mcp.InputSchema struct while preserving full Draft-07/2020-12 semantics.
 func MinifyInputSchema(s mcp.InputSchema, opts MinifyOptions) mcp.InputSchema {
 	out := s
 
-	// 1. Strip $schema keyword
+	// 1. Strip decorative root metadata keywords
 	if opts.StripSchemaKeyword {
 		out.Schema = ""
+	}
+	if opts.StripTitle {
+		out.Title = ""
+	}
+	if opts.StripID {
+		out.ID = ""
+	}
+	if opts.StripComments {
+		out.Comment = ""
+	}
+	if opts.StripExamples {
+		out.Examples = nil
 	}
 
 	// 2. Strip additionalProperties: false if boolean
@@ -57,11 +72,63 @@ func MinifyInputSchema(s mcp.InputSchema, opts MinifyOptions) mcp.InputSchema {
 		out.Required = nil
 	}
 
-	// 4. Recursively minify properties
+	// 4. Recursively minify properties and sub-schema maps
 	if len(out.Properties) > 0 {
 		out.Properties = MinifySchemaMap(out.Properties, opts)
-	} else if opts.CleanEmptyContainers && out.Properties != nil && len(out.Properties) == 0 {
+	} else if opts.CleanEmptyContainers && out.Properties != nil {
 		out.Properties = nil
+	}
+
+	if len(out.Defs) > 0 {
+		out.Defs = MinifySchemaMap(out.Defs, opts)
+	} else if opts.CleanEmptyContainers && out.Defs != nil {
+		out.Defs = nil
+	}
+
+	if len(out.Definitions) > 0 {
+		out.Definitions = MinifySchemaMap(out.Definitions, opts)
+	} else if opts.CleanEmptyContainers && out.Definitions != nil {
+		out.Definitions = nil
+	}
+
+	if len(out.PatternProperties) > 0 {
+		out.PatternProperties = MinifySchemaMap(out.PatternProperties, opts)
+	} else if opts.CleanEmptyContainers && out.PatternProperties != nil {
+		out.PatternProperties = nil
+	}
+
+	if len(out.DependentSchemas) > 0 {
+		out.DependentSchemas = MinifySchemaMap(out.DependentSchemas, opts)
+	} else if opts.CleanEmptyContainers && out.DependentSchemas != nil {
+		out.DependentSchemas = nil
+	}
+
+	if opts.CleanEmptyContainers && len(out.DependentRequired) == 0 {
+		out.DependentRequired = nil
+	}
+
+	if len(out.AnyOf) > 0 {
+		out.AnyOf = minifyNodeSlice(out.AnyOf, opts)
+	} else if opts.CleanEmptyContainers && out.AnyOf != nil {
+		out.AnyOf = nil
+	}
+
+	if len(out.OneOf) > 0 {
+		out.OneOf = minifyNodeSlice(out.OneOf, opts)
+	} else if opts.CleanEmptyContainers && out.OneOf != nil {
+		out.OneOf = nil
+	}
+
+	if len(out.AllOf) > 0 {
+		out.AllOf = minifyNodeSlice(out.AllOf, opts)
+	} else if opts.CleanEmptyContainers && out.AllOf != nil {
+		out.AllOf = nil
+	}
+
+	if len(out.Not) > 0 {
+		out.Not = MinifyNode(out.Not, opts)
+	} else if opts.CleanEmptyContainers && out.Not != nil {
+		out.Not = nil
 	}
 
 	// 5. If AdditionalProperties is a schema map, recursively minify it

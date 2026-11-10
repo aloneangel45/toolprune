@@ -199,10 +199,155 @@ func EstimateToolsTokens(tools []mcp.Tool) int {
 	return int(math.Round(float64(len(b)) / 4.45))
 }
 
-// DeepCopyTools creates an isolated clone of a tool slice.
+// DeepCopyTools creates an isolated structural clone of a tool slice without JSON reflection overhead.
 func DeepCopyTools(tools []mcp.Tool) []mcp.Tool {
-	b, _ := json.Marshal(tools)
-	var copy []mcp.Tool
-	_ = json.Unmarshal(b, &copy)
-	return copy
+	if tools == nil {
+		return nil
+	}
+	out := make([]mcp.Tool, len(tools))
+	for i := range tools {
+		out[i] = CloneTool(tools[i])
+	}
+	return out
+}
+
+// CloneTool creates an isolated deep copy of a single mcp.Tool.
+func CloneTool(t mcp.Tool) mcp.Tool {
+	out := mcp.Tool{
+		Name:         t.Name,
+		Title:        t.Title,
+		Description:  t.Description,
+		InputSchema:  CloneInputSchema(t.InputSchema),
+		OutputSchema: CloneSchemaMap(t.OutputSchema),
+	}
+	if t.Annotations != nil {
+		ann := &mcp.ToolAnnotations{
+			Title: t.Annotations.Title,
+		}
+		if t.Annotations.ReadOnlyHint != nil {
+			v := *t.Annotations.ReadOnlyHint
+			ann.ReadOnlyHint = &v
+		}
+		if t.Annotations.DestructiveHint != nil {
+			v := *t.Annotations.DestructiveHint
+			ann.DestructiveHint = &v
+		}
+		if t.Annotations.IdempotentHint != nil {
+			v := *t.Annotations.IdempotentHint
+			ann.IdempotentHint = &v
+		}
+		if t.Annotations.OpenWorldHint != nil {
+			v := *t.Annotations.OpenWorldHint
+			ann.OpenWorldHint = &v
+		}
+		out.Annotations = ann
+	}
+	if t.Icons != nil {
+		icons := make([]mcp.ToolIcon, len(t.Icons))
+		for i, ic := range t.Icons {
+			icons[i] = mcp.ToolIcon{
+				Src:      ic.Src,
+				MIMEType: ic.MIMEType,
+				Theme:    ic.Theme,
+			}
+			if ic.Sizes != nil {
+				icons[i].Sizes = append([]string(nil), ic.Sizes...)
+			}
+		}
+		out.Icons = icons
+	}
+	return out
+}
+
+// CloneInputSchema creates an isolated deep copy of an mcp.InputSchema.
+func CloneInputSchema(s mcp.InputSchema) mcp.InputSchema {
+	out := mcp.InputSchema{
+		Type:                 s.Type,
+		Properties:           CloneSchemaMap(s.Properties),
+		AdditionalProperties: CloneSchemaValue(s.AdditionalProperties),
+		Schema:               s.Schema,
+		ID:                   s.ID,
+		Title:                s.Title,
+		Description:          s.Description,
+		Comment:              s.Comment,
+		Examples:             CloneSchemaSlice(s.Examples),
+		Defs:                 CloneSchemaMap(s.Defs),
+		Definitions:          CloneSchemaMap(s.Definitions),
+		AnyOf:                CloneSchemaSlice(s.AnyOf),
+		OneOf:                CloneSchemaSlice(s.OneOf),
+		AllOf:                CloneSchemaSlice(s.AllOf),
+		Not:                  CloneSchemaMap(s.Not),
+		PatternProperties:    CloneSchemaMap(s.PatternProperties),
+		DependentSchemas:     CloneSchemaMap(s.DependentSchemas),
+	}
+	if s.Required != nil {
+		out.Required = append([]string(nil), s.Required...)
+	}
+	if s.DependentRequired != nil {
+		dr := make(map[string][]string, len(s.DependentRequired))
+		for k, v := range s.DependentRequired {
+			if v != nil {
+				dr[k] = append([]string(nil), v...)
+			} else {
+				dr[k] = nil
+			}
+		}
+		out.DependentRequired = dr
+	}
+	if s.MinProperties != nil {
+		v := *s.MinProperties
+		out.MinProperties = &v
+	}
+	if s.MaxProperties != nil {
+		v := *s.MaxProperties
+		out.MaxProperties = &v
+	}
+	return out
+}
+
+// CloneSchemaMap recursively deep-copies a map[string]any schema node.
+func CloneSchemaMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = CloneSchemaValue(v)
+	}
+	return out
+}
+
+// CloneSchemaSlice recursively deep-copies a []any schema slice.
+func CloneSchemaSlice(s []any) []any {
+	if s == nil {
+		return nil
+	}
+	out := make([]any, len(s))
+	for i, v := range s {
+		out[i] = CloneSchemaValue(v)
+	}
+	return out
+}
+
+// CloneSchemaValue deep-copies common JSON Schema Go values.
+func CloneSchemaValue(v any) any {
+	switch val := v.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		return CloneSchemaMap(val)
+	case []any:
+		return CloneSchemaSlice(val)
+	case []string:
+		return append([]string(nil), val...)
+	case map[string]string:
+		cp := make(map[string]string, len(val))
+		for k, s := range val {
+			cp[k] = s
+		}
+		return cp
+	default:
+		// Primitives (string, float64, int, bool, json.Number) are immutable value types in Go.
+		return val
+	}
 }

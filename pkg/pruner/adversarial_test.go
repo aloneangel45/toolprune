@@ -892,13 +892,13 @@ func TestAdversarial_UnicodeAndLargeStrings(t *testing.T) {
 	largeDoc := strings.Repeat("Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", 200) // ~11KB
 	unicodeTool := mcp.Tool{
 		Name:        "unicode_edge_case_tool",
-		Description: "Tool with multibyte unicode: 日本語, 中文, Türkçe (İçindekiler), emojis: 🚀🌟🔥🎉 and large doc:\n" + largeDoc,
+		Description: "Tool with multibyte unicode: 日本語, 中文, Türkçe (İçindekiler), astral: 𝔸𝔹ℂ𝔻 and large doc:\n" + largeDoc,
 		InputSchema: mcp.InputSchema{
 			Type: "object",
 			Properties: map[string]any{
 				"unicode_param": map[string]any{
 					"type": "string",
-					"description": "Param with emoji truncation: 🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟 and Turkish chars: ğüşiöç İĞÜŞÖÇ",
+					"description": "Param with 4-byte UTF-8 truncation: 𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹ℂ𝔻𝔸𝔹 and Turkish chars: ğüşiöç İĞÜŞÖÇ",
 				},
 				"iso_date": map[string]any{
 					"type":        "string",
