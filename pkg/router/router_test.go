@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
+	"github.com/aloneangel45/toolprune/pkg/proxy"
 	"github.com/aloneangel45/toolprune/pkg/pruner"
 	"github.com/aloneangel45/toolprune/pkg/router"
 )
@@ -352,4 +356,256 @@ func TestRouter_UnifiedPipeline(t *testing.T) {
 
 		wg.Wait()
 	})
+}
+
+func TestRouter_MetaToolsEnforceFilterAndInvoke(t *testing.T) {
+	ctx := context.Background()
+	pruneEngine := pruner.New()
+
+	cfg := router.DefaultRouterConfig()
+	cfg.NamespaceMode = router.NamespaceModePrefixAlways
+	cfg.PruneMode = "dynamic"
+	cfg.EnableCatalog = true
+
+	r := router.NewRouter(cfg, pruneEngine, nil)
+	defer func() { _ = r.Close() }()
+
+	filterCfg := router.DefaultFilterConfig()
+	filterCfg.ActiveProfile = router.ProfileReadOnly
+	filter, err := router.NewToolFilter(filterCfg)
+	if err != nil {
+		t.Fatalf("NewToolFilter failed: %v", err)
+	}
+	r.AttachFilter(filter)
+
+	winCfg := router.DefaultWindowConfig()
+	winCfg.MaxActive = 4
+	win, err := router.NewToolWindow(winCfg, r.Multiplexer(), nil)
+	if err != nil {
+		t.Fatalf("NewToolWindow failed: %v", err)
+	}
+	r.AttachWindow(win)
+
+	tr := newChannelTransport()
+	_ = r.Multiplexer().RegisterUpstream(ctx, router.UpstreamConfig{ID: "github", Transport: tr})
+	r.Multiplexer().SyncUpstreamTools(ctx, "github", []mcp.Tool{
+		{
+			Name:        "get_issue",
+			Description: "Fetch a repository issue by number.",
+			InputSchema: mcp.InputSchema{
+				Type:       "object",
+				Properties: map[string]any{"issue_number": map[string]any{"type": "integer"}},
+				Required:   []string{"issue_number"},
+			},
+		},
+		{
+			Name:        "delete_repo",
+			Description: "Permanently delete a repository issue/repo.",
+			InputSchema: mcp.InputSchema{
+				Type:       "object",
+				Properties: map[string]any{"repo": map[string]any{"type": "string"}},
+				Required:   []string{"repo"},
+			},
+		},
+	})
+
+	// 1. toolprune_search_tools must NOT return delete_repo under read_only profile
+	searchPayload, _ := json.Marshal(mcp.CallToolRequestParams{
+		Name:      router.MetaToolSearch,
+		Arguments: json.RawMessage(`{"query":"repo"}`),
+	})
+	searchReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodToolsCall, json.RawMessage(searchPayload))
+	searchResp, handled := r.HandleInternalToolCall(searchReq)
+	if !handled || searchResp == nil {
+		t.Fatal("expected toolprune_search_tools to be handled")
+	}
+	var searchRes mcp.CallToolResult
+	_ = json.Unmarshal(searchResp.Result, &searchRes)
+	if strings.Contains(searchRes.Content[0].Text, "delete_repo") {
+		t.Fatalf("SECURITY VIOLATION: toolprune_search_tools leaked blocked tool delete_repo: %s", searchRes.Content[0].Text)
+	}
+	if !strings.Contains(searchRes.Content[0].Text, "github__get_issue") {
+		t.Fatalf("expected allowed tool github__get_issue in search results, got: %s", searchRes.Content[0].Text)
+	}
+
+	// 2. toolprune_activate_tools must NOT promote delete_repo under read_only profile
+	actPayload, _ := json.Marshal(mcp.CallToolRequestParams{
+		Name:      router.MetaToolActivate,
+		Arguments: json.RawMessage(`{"tools":["github__delete_repo","github__get_issue"]}`),
+	})
+	actReq, _ := mcp.NewRequest(mcp.NewIntID(2), mcp.MethodToolsCall, json.RawMessage(actPayload))
+	_, handled = r.HandleInternalToolCall(actReq)
+	if !handled {
+		t.Fatal("expected toolprune_activate_tools to be handled")
+	}
+	if win.IsActive("github__delete_repo") {
+		t.Fatal("SECURITY VIOLATION: toolprune_activate_tools promoted blocked tool github__delete_repo!")
+	}
+	if !win.IsActive("github__get_issue") {
+		t.Fatal("expected allowed tool github__get_issue to be promoted")
+	}
+
+	// 3. toolprune_get_tool_schema returns schema for allowed tool and blocks delete_repo
+	schemaPayload, _ := json.Marshal(mcp.CallToolRequestParams{
+		Name:      router.MetaToolGetSchema,
+		Arguments: json.RawMessage(`{"tool_names":["github__get_issue","github__delete_repo"]}`),
+	})
+	schemaReq, _ := mcp.NewRequest(mcp.NewIntID(3), mcp.MethodToolsCall, json.RawMessage(schemaPayload))
+	schemaResp, handled := r.HandleInternalToolCall(schemaReq)
+	if !handled || schemaResp == nil {
+		t.Fatal("expected toolprune_get_tool_schema to be handled")
+	}
+	var schemaRes mcp.CallToolResult
+	_ = json.Unmarshal(schemaResp.Result, &schemaRes)
+	if !strings.Contains(schemaRes.Content[0].Text, "issue_number") {
+		t.Fatalf("expected hydrated schema for github__get_issue, got: %s", schemaRes.Content[0].Text)
+	}
+	if !strings.Contains(schemaRes.Content[0].Text, "Blocked by active profile") {
+		t.Fatalf("expected blocked notice for github__delete_repo, got: %s", schemaRes.Content[0].Text)
+	}
+
+	// 4. toolprune_invoke rejects invalid args before upstream, and unwraps valid args cleanly
+	badInvokePayload, _ := json.Marshal(mcp.CallToolRequestParams{
+		Name:      router.MetaToolInvoke,
+		Arguments: json.RawMessage(`{"tool_name":"github__get_issue","arguments":{"issue_number":"not_an_int"}}`),
+	})
+	badInvokeReq, _ := mcp.NewRequest(mcp.NewIntID(4), mcp.MethodToolsCall, json.RawMessage(badInvokePayload))
+	badInvokeResp, handled := r.HandleInternalToolCall(badInvokeReq)
+	if !handled || badInvokeResp == nil {
+		t.Fatal("expected invalid toolprune_invoke call to be rejected before upstream")
+	}
+	var badInvokeRes mcp.CallToolResult
+	_ = json.Unmarshal(badInvokeResp.Result, &badInvokeRes)
+	if !badInvokeRes.IsError {
+		t.Fatal("expected IsError=true on invalid toolprune_invoke arguments")
+	}
+
+	goodInvokePayload, _ := json.Marshal(mcp.CallToolRequestParams{
+		Name:      router.MetaToolInvoke,
+		Arguments: json.RawMessage(`{"tool_name":"github__get_issue","arguments":{"issue_number":42}}`),
+	})
+	goodInvokeReq, _ := mcp.NewRequest(mcp.NewIntID(5), mcp.MethodToolsCall, json.RawMessage(goodInvokePayload))
+	_, handled = r.HandleInternalToolCall(goodInvokeReq)
+	if handled {
+		t.Fatal("expected valid toolprune_invoke to fall through to RouteToolCall")
+	}
+	targetTr, rewritten, err := r.RouteToolCall(goodInvokeReq)
+	if err != nil || targetTr != tr {
+		t.Fatalf("RouteToolCall for toolprune_invoke failed: %v", err)
+	}
+	var unwrapped mcp.CallToolRequestParams
+	_ = json.Unmarshal(rewritten.Params, &unwrapped)
+	if unwrapped.Name != "get_issue" {
+		t.Fatalf("expected unwrapped tool name 'get_issue', got %q", unwrapped.Name)
+	}
+}
+
+func TestRouterGateway_MultiUpstreamStreamableHTTP(t *testing.T) {
+	ctx := context.Background()
+	pruneEngine := pruner.New()
+
+	rCfg := router.DefaultRouterConfig()
+	rCfg.NamespaceMode = router.NamespaceModePrefixAlways
+	rCfg.PruneMode = "dynamic"
+	rCfg.EnableCatalog = true
+
+	r := router.NewRouter(rCfg, pruneEngine, nil)
+	gw := router.NewRouterGateway(r, router.GatewayConfig{
+		RequestTimeout:  5 * time.Second,
+		InjectProxyInfo: true,
+		ServerVersion:   "1.2.0",
+	})
+	defer gw.Shutdown()
+
+	trA := newChannelTransport()
+	trB := newChannelTransport()
+	// Echo responses from both upstreams asynchronously
+	for _, tr := range []*channelTransport{trA, trB} {
+		tRef := tr
+		go func() {
+			for {
+				select {
+				case <-tRef.closec:
+					return
+				case msg, ok := <-tRef.out:
+					if !ok {
+						return
+					}
+					if msg != nil && msg.ID != nil {
+						resp, _ := mcp.NewResponse(*msg.ID, mcp.NewToolTextResult("ok:"+string(msg.Params)))
+						tRef.in <- resp
+					}
+				}
+			}
+		}()
+	}
+
+	_ = r.Multiplexer().RegisterUpstream(ctx, router.UpstreamConfig{ID: "gh", Transport: trA})
+	_ = r.Multiplexer().RegisterUpstream(ctx, router.UpstreamConfig{ID: "db", Transport: trB})
+	r.Multiplexer().SyncUpstreamTools(ctx, "gh", []mcp.Tool{
+		{
+			Name:        "get_pr",
+			Description: "Get pull request details.",
+			InputSchema: mcp.InputSchema{
+				Type:       "object",
+				Properties: map[string]any{"pr": map[string]any{"type": "integer"}},
+				Required:   []string{"pr"},
+			},
+		},
+	})
+	r.Multiplexer().SyncUpstreamTools(ctx, "db", []mcp.Tool{
+		{
+			Name:        "list_tables",
+			Description: "List SQL tables.",
+			InputSchema: mcp.InputSchema{Type: "object"},
+		},
+	})
+
+	if err := gw.Start(); err != nil {
+		t.Fatalf("gw.Start failed: %v", err)
+	}
+
+	sseSrv := proxy.NewSSEServerWithDispatcher(proxy.DefaultSSEServerConfig(), gw)
+	ts := httptest.NewServer(sseSrv.Handler())
+	defer ts.Close()
+
+	// POST /mcp tools/list
+	listResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("POST /mcp tools/list failed: %v", err)
+	}
+	defer listResp.Body.Close()
+	sessionID := listResp.Header.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("expected Mcp-Session-Id header")
+	}
+
+	var rpcList mcp.Message
+	if err := json.NewDecoder(listResp.Body).Decode(&rpcList); err != nil {
+		t.Fatalf("decode tools/list response failed: %v", err)
+	}
+	var listRes mcp.ListToolsResult
+	_ = json.Unmarshal(rpcList.Result, &listRes)
+	if len(listRes.Tools) < 6 { // 2 compact tools + 4 meta-tools
+		t.Fatalf("expected 2 compact tools + 4 meta-tools, got %d", len(listRes.Tools))
+	}
+
+	// POST /mcp tools/call across gh upstream
+	callReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"gh__get_pr","arguments":{"pr":10}}}`))
+	callReq.Header.Set("Content-Type", "application/json")
+	callReq.Header.Set("Mcp-Session-Id", sessionID)
+	callResp, err := http.DefaultClient.Do(callReq)
+	if err != nil {
+		t.Fatalf("POST /mcp tools/call failed: %v", err)
+	}
+	defer callResp.Body.Close()
+
+	var rpcCall mcp.Message
+	_ = json.NewDecoder(callResp.Body).Decode(&rpcCall)
+	if rpcCall.Error != nil {
+		t.Fatalf("unexpected RPC error: %+v", rpcCall.Error)
+	}
+	if !strings.Contains(string(rpcCall.Result), "get_pr") {
+		t.Fatalf("expected upstream response containing rewritten 'get_pr', got %s", string(rpcCall.Result))
+	}
 }

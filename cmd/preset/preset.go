@@ -3,6 +3,7 @@ package presetcmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -23,47 +24,50 @@ type presetFlags struct {
 	stdout    bool
 }
 
-var prFlags presetFlags
+// NewCommand builds a fresh 'preset' cobra command hierarchy with isolated flag state.
+func NewCommand() *cobra.Command {
+	flags := &presetFlags{}
 
-var presetCmd = &cobra.Command{
-	Use:   "preset",
-	Short: "Generate MCP client config presets (Cursor, Windsurf)",
-	Long: `Generate out-of-the-box MCP client configuration presets that wire AI clients
+	cmd := &cobra.Command{
+		Use:   "preset",
+		Short: "Generate MCP client config presets (Cursor, Windsurf)",
+		Long: `Generate out-of-the-box MCP client configuration presets that wire AI clients
 to a ToolPrune proxy instance.
 
 Targets:
   cursor    .cursor/mcp.json (project-level)
   windsurf  ~/.codeium/windsurf/mcp_config.json (global)`,
-}
+	}
 
-var presetGenerateCmd = &cobra.Command{
-	Use:   "generate --client <cursor|windsurf> [flags]",
-	Short: "Generate a client MCP config preset for ToolPrune",
-	RunE:  runPresetGenerate,
-}
+	genCmd := &cobra.Command{
+		Use:   "generate --client <cursor|windsurf> [flags]",
+		Short: "Generate a client MCP config preset for ToolPrune",
+		RunE: func(c *cobra.Command, args []string) error {
+			return runPresetGenerate(c, flags)
+		},
+	}
 
-var presetValidateCmd = &cobra.Command{
-	Use:   "validate <file>",
-	Short: "Validate a client MCP config file against the expected schema",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runPresetValidate,
-}
+	valCmd := &cobra.Command{
+		Use:   "validate <file>",
+		Short: "Validate a client MCP config file against the expected schema",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runPresetValidate,
+	}
 
-func NewCommand() *cobra.Command {
-	presetGenerateCmd.Flags().StringVar(&prFlags.client, "client", "cursor", "Target client (cursor, windsurf)")
-	presetGenerateCmd.Flags().StringVarP(&prFlags.output, "output", "o", "", "Output file path (default: client's conventional path; use '-' for stdout)")
-	presetGenerateCmd.Flags().StringVar(&prFlags.name, "name", "toolprune", "Server name under mcpServers")
-	presetGenerateCmd.Flags().StringVar(&prFlags.command, "command", "toolprune", "Executable used to launch the ToolPrune proxy")
-	presetGenerateCmd.Flags().StringSliceVar(&prFlags.args, "args", []string{"proxy"}, "Arguments passed to the proxy command")
-	presetGenerateCmd.Flags().StringSliceVar(&prFlags.env, "env", nil, "Extra environment variables as KEY=VALUE (repeatable)")
-	presetGenerateCmd.Flags().StringVar(&prFlags.serverURL, "server-url", "", "Emit a remote {serverUrl} entry instead of a stdio command (e.g. http://127.0.0.1:8080/sse)")
-	presetGenerateCmd.Flags().StringVarP(&prFlags.config, "config", "c", "", "toolprune.yaml path to pass to the proxy as --config")
-	presetGenerateCmd.Flags().BoolVar(&prFlags.merge, "merge", false, "Merge into an existing config file at --output, preserving other servers")
-	presetGenerateCmd.Flags().BoolVar(&prFlags.stdout, "stdout", false, "Print the generated config to stdout instead of writing a file")
+	genCmd.Flags().StringVar(&flags.client, "client", "cursor", "Target client (cursor, windsurf)")
+	genCmd.Flags().StringVarP(&flags.output, "output", "o", "", "Output file path (default: client's conventional path; use '-' for stdout)")
+	genCmd.Flags().StringVar(&flags.name, "name", "toolprune", "Server name under mcpServers")
+	genCmd.Flags().StringVar(&flags.command, "command", "toolprune", "Executable used to launch the ToolPrune proxy")
+	genCmd.Flags().StringSliceVar(&flags.args, "args", []string{"proxy"}, "Arguments passed to the proxy command")
+	genCmd.Flags().StringSliceVar(&flags.env, "env", nil, "Extra environment variables as KEY=VALUE (repeatable)")
+	genCmd.Flags().StringVar(&flags.serverURL, "server-url", "", "Emit a remote {serverUrl} entry instead of a stdio command (e.g. http://127.0.0.1:8080/sse)")
+	genCmd.Flags().StringVarP(&flags.config, "config", "c", "", "toolprune.yaml path to pass to the proxy as --config")
+	genCmd.Flags().BoolVar(&flags.merge, "merge", false, "Merge into an existing config file at --output, preserving other servers")
+	genCmd.Flags().BoolVar(&flags.stdout, "stdout", false, "Print the generated config to stdout instead of writing a file")
 
-	presetCmd.AddCommand(presetGenerateCmd)
-	presetCmd.AddCommand(presetValidateCmd)
-	return presetCmd
+	cmd.AddCommand(genCmd)
+	cmd.AddCommand(valCmd)
+	return cmd
 }
 
 func parseEnvPairs(pairs []string) (map[string]string, error) {
@@ -90,7 +94,7 @@ func splitKeyValue(s string) (string, string, bool) {
 	return "", "", false
 }
 
-func runPresetGenerate(cmd *cobra.Command, args []string) error {
+func runPresetGenerate(cmd *cobra.Command, prFlags *presetFlags) error {
 	client, err := preset.ParseClient(prFlags.client)
 	if err != nil {
 		return err
@@ -110,7 +114,6 @@ func runPresetGenerate(cmd *cobra.Command, args []string) error {
 		ConfigPath: prFlags.config,
 	}
 
-	// If a toolprune config was supplied, derive args from it for standalone mode.
 	if prFlags.config != "" {
 		if _, err := config.Load(prFlags.config); err != nil {
 			return fmt.Errorf("cannot use --config: %w", err)
@@ -143,6 +146,11 @@ func runPresetGenerate(cmd *cobra.Command, args []string) error {
 		data, err := preset.GenerateJSON(opts)
 		if err != nil {
 			return err
+		}
+		if dir := filepath.Dir(out); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("failed to create directory %q: %w", dir, err)
+			}
 		}
 		if err := os.WriteFile(out, data, 0644); err != nil {
 			return fmt.Errorf("failed to write %q: %w", out, err)

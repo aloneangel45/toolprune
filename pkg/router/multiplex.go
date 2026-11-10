@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,14 +80,15 @@ type ToolRoute struct {
 
 // UpstreamTarget represents an active upstream MCP server managed by the multiplexer.
 type UpstreamTarget struct {
-	mu        sync.RWMutex
-	id        string
-	prefix    string
-	transport UpstreamTransport
-	info      *mcp.InitializeResult
-	tools     map[string]mcp.Tool // originalName -> Tool
-	closed    atomic.Bool
-	lastSync  time.Time
+	mu          sync.RWMutex
+	id          string
+	prefix      string
+	transport   UpstreamTransport
+	info        *mcp.InitializeResult
+	tools       map[string]mcp.Tool // originalName -> Tool
+	closed      atomic.Bool
+	loopStarted atomic.Bool
+	lastSync    time.Time
 }
 
 // ID returns the upstream identifier.
@@ -145,8 +147,11 @@ func (m *Multiplexer) SetMessageHandler(handler UpstreamMessageHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.handler = handler
+	if handler == nil {
+		return
+	}
 	for _, target := range m.upstreams {
-		if target.transport != nil && !target.closed.Load() {
+		if target.transport != nil && !target.closed.Load() && target.loopStarted.CompareAndSwap(false, true) {
 			m.wg.Add(1)
 			go m.runUpstreamLoop(target)
 		}
@@ -184,7 +189,7 @@ func (m *Multiplexer) RegisterUpstream(ctx context.Context, cfg UpstreamConfig) 
 	m.upstreams[cfg.ID] = target
 
 	// If transport is active and handler is registered, launch dedicated background reader loop
-	if target.transport != nil && m.handler != nil {
+	if target.transport != nil && m.handler != nil && target.loopStarted.CompareAndSwap(false, true) {
 		m.wg.Add(1)
 		go m.runUpstreamLoop(target)
 	}
@@ -331,7 +336,7 @@ func (m *Multiplexer) ResolveRoute(exposedName string) (ToolRoute, bool) {
 	return ToolRoute{}, false
 }
 
-// ListAllTools returns all active tools with their exposed names.
+// ListAllTools returns all active tools with their exposed names in deterministic sorted order.
 func (m *Multiplexer) ListAllTools() []mcp.Tool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -340,6 +345,9 @@ func (m *Multiplexer) ListAllTools() []mcp.Tool {
 	for _, route := range m.routes {
 		tools = append(tools, route.Tool)
 	}
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
 	return tools
 }
 

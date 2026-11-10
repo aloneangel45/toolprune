@@ -86,8 +86,9 @@ func DefaultFilterConfig() FilterConfig {
 				Description: "Standard software development tools (git, devtools, filesystem, context)",
 				Include: []string{
 					"github/*", "filesystem/*", "chrome-devtools/*", "context7/*",
-					"github__*", "devtools__*", "context7__*",
-					"git_*", "file_*", "code_*", "search_*", "read_*", "list_*", "get_*",
+					"github__*", "filesystem__*", "devtools__*", "chrome-devtools__*", "context7__*",
+					"git_*", "file_*", "code_*", "search_*", "read_*", "list_*", "get_*", "fetch_*",
+					"*__git_*", "*__file_*", "*__code_*", "*__search_*", "*__read_*", "*__list_*", "*__get_*", "*__fetch_*",
 				},
 				Exclude: []string{
 					"cloudflare/delete_*", "supabase/delete_*", "*_drop_*", "*_purge_*",
@@ -97,6 +98,8 @@ func DefaultFilterConfig() FilterConfig {
 				Name:        ProfileMinimal,
 				Description: "Query and discovery tools only",
 				Include: []string{
+					"get_*", "read_*", "list_*", "search_*", "query_*", "fetch_*",
+					"*__get_*", "*__list_*", "*__read_*", "*__search_*", "*__fetch_*", "*__query_*",
 					"*get*", "*read*", "*list*", "*search*", "*query*", "*fetch*",
 				},
 				Exclude: []string{

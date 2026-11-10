@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
@@ -22,6 +23,12 @@ type BenchmarkOptions struct {
 
 	// CatalogConfig configures Tier 4 catalog generation.
 	CatalogConfig router.CatalogConfig `json:"catalogConfig"`
+
+	// MaxSchemaTokens evaluates RFC #1 progressive token-budget compaction when > 0.
+	MaxSchemaTokens int `json:"maxSchemaTokens,omitempty"`
+
+	// IncludeParamBreakdown computes per-parameter token counts for --verbose mode.
+	IncludeParamBreakdown bool `json:"includeParamBreakdown,omitempty"`
 }
 
 // DefaultBenchmarkOptions returns production defaults for benchmarking.
@@ -46,15 +53,24 @@ type TierReport struct {
 	ValidationErrors []string         `json:"validationErrors,omitempty"`
 }
 
+// ParamTokenStat holds per-parameter token metrics when --verbose is enabled.
+type ParamTokenStat struct {
+	Name        string `json:"name"`
+	Required    bool   `json:"required"`
+	RawTokens   int    `json:"rawTokens"`
+	Tier3Tokens int    `json:"tier3Tokens"`
+}
+
 // ToolReport holds a per-tool breakdown of token counts across all pruning tiers.
 type ToolReport struct {
-	ToolName          string  `json:"toolName"`
-	RawTokens         int     `json:"rawTokens"`
-	Tier1Tokens       int     `json:"tier1Tokens"`
-	Tier2Tokens       int     `json:"tier2Tokens"`
-	Tier3Tokens       int     `json:"tier3Tokens"`
-	Tier4Tokens       int     `json:"tier4Tokens"`
-	MaxSavingsPercent float64 `json:"maxSavingsPercent"`
+	ToolName          string           `json:"toolName"`
+	RawTokens         int              `json:"rawTokens"`
+	Tier1Tokens       int              `json:"tier1Tokens"`
+	Tier2Tokens       int              `json:"tier2Tokens"`
+	Tier3Tokens       int              `json:"tier3Tokens"`
+	Tier4Tokens       int              `json:"tier4Tokens"`
+	MaxSavingsPercent float64          `json:"maxSavingsPercent"`
+	Parameters        []ParamTokenStat `json:"parameters,omitempty"`
 }
 
 // BenchmarkSummary highlights top-level outcomes and target qualification.
@@ -67,14 +83,15 @@ type BenchmarkSummary struct {
 
 // Report encapsulates the complete benchmark results across tiers and tools.
 type Report struct {
-	Timestamp time.Time        `json:"timestamp"`
-	ToolCount int              `json:"toolCount"`
-	Tokenizer string           `json:"tokenizer"`
-	RawTokens int              `json:"rawTokens"`
-	RawBytes  int              `json:"rawBytes"`
-	Tiers     []TierReport     `json:"tiers"`
-	Tools     []ToolReport     `json:"tools"`
-	Summary   BenchmarkSummary `json:"summary"`
+	Timestamp  time.Time        `json:"timestamp"`
+	ToolCount  int              `json:"toolCount"`
+	Tokenizer  string           `json:"tokenizer"`
+	RawTokens  int              `json:"rawTokens"`
+	RawBytes   int              `json:"rawBytes"`
+	Tiers      []TierReport     `json:"tiers"`
+	BudgetTier *TierReport      `json:"budgetTier,omitempty"`
+	Tools      []ToolReport     `json:"tools"`
+	Summary    BenchmarkSummary `json:"summary"`
 }
 
 // RunBenchmark runs the standard benchmark suite on a tool slice using default options.
@@ -236,9 +253,38 @@ func RunBenchmarkWithOptions(tools []mcp.Tool, opts BenchmarkOptions) (*Report, 
 	})
 
 	// ------------------------------------------------------------------------
-	// Per-Tool Breakdown
+	// Optional RFC #1 Token Budget Evaluation
 	// ------------------------------------------------------------------------
-	for _, tool := range tools {
+	if opts.MaxSchemaTokens > 0 {
+		bOpts := pruner.DefaultOptions(pruner.TierAggressive)
+		bOpts.MaxSchemaTokens = opts.MaxSchemaTokens
+		bEngine := pruner.New(bOpts)
+		bTools, _, bErr := bEngine.PruneToolsWithTier(tools, pruner.TierAggressive)
+		if bErr != nil {
+			return nil, fmt.Errorf("token budget pruning failed: %w", bErr)
+		}
+		bBytes, _ := json.Marshal(bTools)
+		bTokens := tokenCounter(bTools)
+		bSaved := rawTokens - bTokens
+		bPct := calculateSavings(rawTokens, bTokens)
+		bValid, bErrs := validateTools(bTools, opts.ValidateSchemas)
+		report.BudgetTier = &TierReport{
+			Tier:             pruner.PruneTier("budget"),
+			Name:             fmt.Sprintf("Budget (<=%d tok)", opts.MaxSchemaTokens),
+			Tokens:           bTokens,
+			Bytes:            len(bBytes),
+			TokensSaved:      bSaved,
+			SavingsPercent:   bPct,
+			TokensPerTool:    float64(bTokens) / float64(len(tools)),
+			ValidDraft07:     bValid,
+			ValidationErrors: bErrs,
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// Per-Tool Breakdown (+ Optional Verbose Per-Parameter Breakdown)
+	// ------------------------------------------------------------------------
+	for idx, tool := range tools {
 		single := []mcp.Tool{tool}
 		rawSingle := tokenCounter(single)
 
@@ -256,6 +302,41 @@ func RunBenchmarkWithOptions(tools []mcp.Tool, opts BenchmarkOptions) (*Report, 
 
 		maxSave := calculateSavings(rawSingle, t4SingleTok)
 
+		var paramStats []ParamTokenStat
+		if opts.IncludeParamBreakdown && len(tool.InputSchema.Properties) > 0 {
+			reqSet := make(map[string]bool, len(tool.InputSchema.Required))
+			for _, reqName := range tool.InputSchema.Required {
+				reqSet[reqName] = true
+			}
+			names := make([]string, 0, len(tool.InputSchema.Properties))
+			for pName := range tool.InputSchema.Properties {
+				names = append(names, pName)
+			}
+			sort.Strings(names)
+
+			var prunedProps map[string]any
+			if idx < len(t3Tools) {
+				prunedProps = t3Tools[idx].InputSchema.Properties
+			}
+
+			paramStats = make([]ParamTokenStat, 0, len(names))
+			for _, pName := range names {
+				rawProp := map[string]any{pName: tool.InputSchema.Properties[pName]}
+				var t3PropTok int
+				if prunedProps != nil {
+					if pv, exists := prunedProps[pName]; exists {
+						t3PropTok = tokenCounter(map[string]any{pName: pv})
+					}
+				}
+				paramStats = append(paramStats, ParamTokenStat{
+					Name:        pName,
+					Required:    reqSet[pName],
+					RawTokens:   tokenCounter(rawProp),
+					Tier3Tokens: t3PropTok,
+				})
+			}
+		}
+
 		report.Tools = append(report.Tools, ToolReport{
 			ToolName:          tool.Name,
 			RawTokens:         rawSingle,
@@ -264,6 +345,7 @@ func RunBenchmarkWithOptions(tools []mcp.Tool, opts BenchmarkOptions) (*Report, 
 			Tier3Tokens:       t3SingleTok,
 			Tier4Tokens:       t4SingleTok,
 			MaxSavingsPercent: maxSave,
+			Parameters:        paramStats,
 		})
 	}
 
@@ -317,7 +399,6 @@ func LoadFixtures(customPath ...string) ([]mcp.Tool, error) {
 			"test/fixtures/schemas.json",
 			filepath.Join("..", "..", "test", "fixtures", "schemas.json"),
 			filepath.Join("test", "fixtures", "schemas.json"),
-			`C:\Users\Arda\Desktop\open_source_hunter\test\fixtures\schemas.json`,
 		}
 	}
 

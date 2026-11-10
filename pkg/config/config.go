@@ -12,8 +12,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/aloneangel45/toolprune/pkg/pruner"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
+	"github.com/aloneangel45/toolprune/pkg/pruner"
 	"github.com/aloneangel45/toolprune/pkg/router"
 )
 
@@ -100,17 +100,18 @@ type UpstreamConfig struct {
 	Description string            `json:"description,omitempty" yaml:"description,omitempty"`
 }
 
-// PruningConfig specifies schema optimization parameters for Tiers 0-4.
+// PruningConfig specifies schema optimization parameters for Tiers 0-4 and RFC #1 token budgeting.
 type PruningConfig struct {
-	Tier                 string `json:"tier" yaml:"tier"`                                   // "none"|"lossless"|"compact"|"aggressive"|"dynamic"
-	MaxDescriptionLength int    `json:"maxDescriptionLength" yaml:"max_description_length"` // Top-level tool description rune limit (default: 120)
-	MaxParamDescLength   int    `json:"maxParamDescLength" yaml:"max_param_desc_length"`     // Parameter description rune limit (default: 80)
-	StripRegex           bool   `json:"stripRegex" yaml:"strip_regex"`                       // Strip verbose regex patterns (default: true)
-	MaxRegexLength       int    `json:"maxRegexLength" yaml:"max_regex_length"`             // Regex length threshold before compression (default: 25)
-	StripSelfEvident     bool   `json:"stripSelfEvident" yaml:"strip_self_evident"`         // Strip self-evident parameter descriptions (default: true)
-	StrictDraft07        bool   `json:"strictDraft07" yaml:"strict_draft07"`                 // Enforce valid Draft-07 JSON Schema (default: true)
-	StripCodeBlocks      bool   `json:"stripCodeBlocks" yaml:"strip_code_blocks"`           // Strip markdown code blocks (default: true)
-	StripHTMLTags        bool   `json:"stripHtmlTags" yaml:"strip_html_tags"`               // Strip HTML tags (default: true)
+	Tier                 string `json:"tier" yaml:"tier"`                                             // "none"|"lossless"|"compact"|"aggressive"|"dynamic"
+	MaxSchemaTokens      int    `json:"maxSchemaTokens,omitempty" yaml:"max_schema_tokens,omitempty"` // RFC #1 maximum token budget for tools/list (0 = unlimited)
+	MaxDescriptionLength int    `json:"maxDescriptionLength" yaml:"max_description_length"`           // Top-level tool description rune limit (default: 120)
+	MaxParamDescLength   int    `json:"maxParamDescLength" yaml:"max_param_desc_length"`              // Parameter description rune limit (default: 80)
+	StripRegex           bool   `json:"stripRegex" yaml:"strip_regex"`                                // Strip verbose regex patterns (default: true)
+	MaxRegexLength       int    `json:"maxRegexLength" yaml:"max_regex_length"`                       // Regex length threshold before compression (default: 25)
+	StripSelfEvident     bool   `json:"stripSelfEvident" yaml:"strip_self_evident"`                   // Strip self-evident parameter descriptions (default: true)
+	StrictDraft07        bool   `json:"strictDraft07" yaml:"strict_draft07"`                          // Enforce valid Draft-07 JSON Schema (default: true)
+	StripCodeBlocks      bool   `json:"stripCodeBlocks" yaml:"strip_code_blocks"`                     // Strip markdown code blocks (default: true)
+	StripHTMLTags        bool   `json:"stripHtmlTags" yaml:"strip_html_tags"`                         // Strip HTML tags (default: true)
 }
 
 // ProfileConfig defines tool inclusion and exclusion globs for a named profile.
@@ -123,13 +124,13 @@ type ProfileConfig struct {
 
 // RoutingConfig holds settings for tool profiles, namespacing, and active windowing.
 type RoutingConfig struct {
-	DefaultProfile   string                   `json:"defaultProfile" yaml:"default_profile"`     // Active profile on startup (default: "full")
-	NamespaceMode    string                   `json:"namespaceMode" yaml:"namespace_mode"`       // "auto"|"always"|"on_collision"|"none" (default: "auto")
+	DefaultProfile   string                   `json:"defaultProfile" yaml:"default_profile"`      // Active profile on startup (default: "full")
+	NamespaceMode    string                   `json:"namespaceMode" yaml:"namespace_mode"`        // "auto"|"always"|"on_collision"|"none" (default: "auto")
 	ActiveWindowSize int                      `json:"activeWindowSize" yaml:"active_window_size"` // Active sliding window capacity (default: 15)
-	AutoPromote      bool                     `json:"autoPromote" yaml:"auto_promote"`           // Auto-promote tool to window on call (default: true)
-	PinnedTools      []string                 `json:"pinnedTools" yaml:"pinned_tools"`           // Tools immune to LRU eviction
-	GlobalExclude    []string                 `json:"globalExclude" yaml:"global_exclude"`       // Patterns excluded globally
-	CaseInsensitive  bool                     `json:"caseInsensitive" yaml:"case_insensitive"`   // Case-insensitive filtering (default: true)
+	AutoPromote      bool                     `json:"autoPromote" yaml:"auto_promote"`            // Auto-promote tool to window on call (default: true)
+	PinnedTools      []string                 `json:"pinnedTools" yaml:"pinned_tools"`            // Tools immune to LRU eviction
+	GlobalExclude    []string                 `json:"globalExclude" yaml:"global_exclude"`        // Patterns excluded globally
+	CaseInsensitive  bool                     `json:"caseInsensitive" yaml:"case_insensitive"`    // Case-insensitive filtering (default: true)
 	Profiles         map[string]ProfileConfig `json:"profiles" yaml:"profiles"`                   // Named profile configurations
 }
 
@@ -333,6 +334,9 @@ func (c *Config) Validate() error {
 	if c.Pruning.MaxRegexLength < 0 {
 		errs = append(errs, "pruning.max_regex_length cannot be negative")
 	}
+	if c.Pruning.MaxSchemaTokens < 0 {
+		errs = append(errs, "pruning.max_schema_tokens cannot be negative")
+	}
 
 	// 3. Routing validation
 	validModes := map[string]bool{
@@ -446,6 +450,8 @@ func Validate(cfg *Config) error {
 func (c *Config) ToProxyConfig() proxy.ProxyConfig {
 	return proxy.ProxyConfig{
 		PruneMode:              c.Pruning.Tier,
+		MaxSchemaTokens:        c.Pruning.MaxSchemaTokens,
+		PinnedTools:            append([]string(nil), c.Routing.PinnedTools...),
 		RequestTimeout:         time.Duration(c.Server.Timeout),
 		TimeoutSweeperInterval: 0, // Automatically dynamically calibrated
 		InjectProxyInfo:        c.Server.InjectProxyInfo,
@@ -467,11 +473,13 @@ func (c *Config) ToSSEServerConfig() proxy.SSEServerConfig {
 // ToRouterConfig converts configuration to a router.RouterConfig instance.
 func (c *Config) ToRouterConfig() router.RouterConfig {
 	return router.RouterConfig{
-		NamespaceMode:  router.NamespaceMode(c.Routing.NamespaceMode),
-		PruneMode:      c.Pruning.Tier,
-		ActiveProfile:  c.Routing.DefaultProfile,
-		MaxActiveTools: c.Routing.ActiveWindowSize,
-		EnableCatalog:  c.Pruning.Tier == "dynamic",
+		NamespaceMode:   router.NamespaceMode(c.Routing.NamespaceMode),
+		PruneMode:       c.Pruning.Tier,
+		MaxSchemaTokens: c.Pruning.MaxSchemaTokens,
+		ActiveProfile:   c.Routing.DefaultProfile,
+		MaxActiveTools:  c.Routing.ActiveWindowSize,
+		PinnedTools:     append([]string(nil), c.Routing.PinnedTools...),
+		EnableCatalog:   c.Pruning.Tier == "dynamic",
 	}
 }
 
@@ -512,6 +520,9 @@ func (c *Config) ToWindowConfig() router.WindowConfig {
 // ToPrunerOptions converts configuration to a pruner.PruneOptions instance.
 func (c *Config) ToPrunerOptions() pruner.PruneOptions {
 	opts := pruner.DefaultPruneOptions(pruner.PruneTier(c.Pruning.Tier))
+	if c.Pruning.MaxSchemaTokens > 0 {
+		opts.MaxSchemaTokens = c.Pruning.MaxSchemaTokens
+	}
 	if c.Pruning.MaxDescriptionLength > 0 {
 		opts.MaxToolDescLength = c.Pruning.MaxDescriptionLength
 		opts.Condense.MaxToolDescLen = c.Pruning.MaxDescriptionLength

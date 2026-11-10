@@ -1,11 +1,16 @@
 # syntax=docker/dockerfile:1
 
 FROM golang:1.23-alpine AS builder
+ARG VERSION=1.2.0
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/toolprune ./cmd/toolprune
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+    -o /out/toolprune ./cmd/toolprune
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates

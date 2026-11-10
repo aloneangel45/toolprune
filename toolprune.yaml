@@ -47,6 +47,10 @@ pruning:
   # - "dynamic": Compact catalog indexing with on-demand hydration (>80% savings)
   tier: "aggressive"
 
+  # RFC #1 maximum token budget for serialized tools/list schemas (0 = unlimited)
+  # Can also be overridden via --max-schema-tokens or TOOLPRUNE_MAX_SCHEMA_TOKENS
+  max_schema_tokens: 0
+
   # Maximum character limit for top-level tool descriptions before truncation
   max_description_length: 120
 

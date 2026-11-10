@@ -5,41 +5,41 @@
 </p>
 
 <p align="center">
-  <strong>High-utility, zero-bloat Model Context Protocol (MCP) tool router and token squeezer in Go.</strong><br>
-  Compress verbose JSON schemas, dynamically route tool catalogs, and cut context token overhead by up to <strong>91.4%</strong> without breaking tool usability.
+  <strong>High-utility, zero-bloat Model Context Protocol (MCP) tool router and schema compactor in Go.</strong><br>
+  Compress verbose JSON schemas, enforce deterministic token budgets, dynamically route multi-server catalogs, and cut context token overhead by up to <strong>96.5%</strong> without breaking tool execution.
 </p>
 
 <p align="center">
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat-square&logo=go" alt="Go Version"/></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License: MIT"/></a>
   <a href="https://github.com/aloneangel45/toolprune/actions/workflows/ci.yml"><img src="https://github.com/aloneangel45/toolprune/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
-  <a href="#"><img src="https://img.shields.io/badge/Token%20Reduction-91.4%25-success?style=flat-square" alt="Token Savings"/></a>
-  <a href="#"><img src="https://img.shields.io/badge/Schema-Draft--07%20Compliant-orange?style=flat-square" alt="Draft-07 Compliant"/></a>
-  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-JSON--RPC%202.0%20%7C%20SSE-blueviolet?style=flat-square" alt="MCP Protocol"/></a>
+  <a href="#"><img src="https://img.shields.io/badge/Token%20Reduction-96.5%25-success?style=flat-square" alt="Token Savings"/></a>
+  <a href="#"><img src="https://img.shields.io/badge/Schema-Draft--07%20%7C%202020--12-orange?style=flat-square" alt="Schema Compliant"/></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-Stdio%20%7C%20SSE%20%7C%20Streamable%20HTTP-blueviolet?style=flat-square" alt="MCP Protocol"/></a>
   <a href="https://github.com/aloneangel45/toolprune/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/toolprune?style=flat-square&color=blue" alt="Latest Release"/></a>
 </p>
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 🚀 toolprune proxy --preset balanced                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ [MCP Gateway]  Intercepted 6 upstream MCP servers (42 tools loaded)         │
-│ [Context Tax]  Raw JSON Schema payload:               46,210 tokens         │
-│ [AST Optimizer]Pruned docstrings & optional bloat:     3,890 tokens         │
-│ [Prompt Cache] Claude 3.7 stable prefix:              STABILIZED (Cached)   │
-│ ─────────────────────────────────────────────────────────────────────────── │
-│ ⚡ Token Squeezed:  -91.6%   │   Turn Latency:  11.8s ➔ 0.9s                │
-│ 💰 Saved / Session: 42,320 tokens/turn (~$4.50/hr on Claude 3.7 Sonnet)     │
-└─────────────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------------+
+| $ toolprune proxy --preset balanced --max-schema-tokens 1500                |
++-----------------------------------------------------------------------------+
+| [MCP Gateway]   Intercepted 6 upstream MCP servers (42 tools loaded)        |
+| [Context Tax]   Raw JSON Schema payload:              46,210 tokens         |
+| [AST Compactor] 5-pass token budget + active window:   1,420 tokens         |
+| [Stream Filter] FNV-1a cache: 0.004ms hit | Pre-bind check: 0.011ms         |
+| --------------------------------------------------------------------------- |
+| Token Reduction: -96.9%   |   Cold Compaction Pass: < 0.40ms                |
+| Saved / Session: 44,790 tokens/turn                                         |
++-----------------------------------------------------------------------------+
 ```
 
-### ⚡ One-Line Install
+### One-Line Install
 
 ```bash
-# macOS / Linux
+# macOS / Linux (SHA-256 verified)
 curl -fsSL https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.sh | bash
 
-# Windows (PowerShell)
+# Windows PowerShell (SHA-256 verified)
 irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | iex
 ```
 
@@ -57,7 +57,8 @@ irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
   - [1. Zero-Config Wrapper Mode](#1-zero-config-wrapper-mode)
-  - [2. Multi-Upstream Gateway Mode](#2-multi-upstream-gateway-mode)
+  - [2. Deterministic Token Budget Mode (RFC #1)](#2-deterministic-token-budget-mode-rfc-1)
+  - [3. Multi-Upstream Gateway Mode](#3-multi-upstream-gateway-mode)
 - [Client Integration Guides](#client-integration-guides)
   - [Claude Desktop](#claude-desktop)
   - [Cursor IDE](#cursor-ide)
@@ -76,77 +77,87 @@ irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | 
 
 ## The Problem: The MCP Context Tax
 
-The **Model Context Protocol (MCP)** has revolutionized agentic software engineering by standardizing how frontier LLMs connect to external data sources and developer tools. However, modern MCP ecosystems suffer from a severe, unaddressed architectural penalty: **The MCP Context Tax**.
+The **Model Context Protocol (MCP)** standardizes how frontier LLMs connect to databases, filesystems, cloud APIs, and developer tools. However, multi-server MCP deployments incur a severe structural cost: **The MCP Context Tax**.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        THE MCP CONTEXT TAX                             │
-├────────────────────────────────────────────────────────────────────────┤
-│ 4-6 Upstream Servers (GitHub, SQLite, Cloudflare, Filesystem, Slack)   │
-│                                  ▼                                     │
-│                20,000 to 45,000 Schema Tokens                          │
-│               Injected on EVERY SINGLE Message Turn                    │
-│                                  ▼                                     │
-│ 💸 Ballooning API Inference Invoices ($100s/developer/month)           │
-│ 🐢 Sluggish Time-To-First-Token (TTFT) and Request Latency             │
-│  Attention Drift and Schema Hallucination on Long Prompts            │
-│ ❌ Context Window Starvation (Less room for code and file history)     │
-└────────────────────────────────────────────────────────────────────────┘
+```text
++------------------------------------------------------------------------+
+|                        THE MCP CONTEXT TAX                             |
++------------------------------------------------------------------------+
+| 4-6 Upstream Servers (GitHub, PostgreSQL, Cloudflare, Filesystem)      |
+|                                  |                                     |
+|                                  v                                     |
+|                20,000 to 45,000 Schema Tokens                          |
+|               Injected on EVERY SINGLE Message Turn                    |
+|                                  |                                     |
+|                                  v                                     |
+| [COST]    Compounding API inference consumption across 30+ turn loops  |
+| [LATENCY] Degraded Time-To-First-Token (TTFT) on uncached prefixes     |
+| [DRIFT]   Attention dilution and parameter hallucination               |
+| [BUDGET]  Context window starvation for source files and diffs         |
++------------------------------------------------------------------------+
 ```
 
-1. **Massive Redundant Schemas**: An average MCP server tool schema includes verbose markdown explanations, decorative parameter titles, internal `$schema` URIs, redundant type constraints, and multi-line formatting.
-2. **Exponential Turn Multiplication**: The full tools list is injected into the context window on **every single user turn**. In a typical 30-turn agent session, an unpruned 25,000-token toolset forces the model to re-ingest **750,000 redundant tokens**.
-3. **Severe Attention Dilution**: Massive system prompts lead to "lost in the middle" phenomena, where models lose track of active coding instructions or invoke incorrect tools due to sprawling descriptions.
+1. **Redundant Schema Prose**: Typical MCP tool definitions embed multi-paragraph Markdown tutorials, decorative titles, `$schema` URIs, unreferenced `$defs`, and sprawling regular expressions.
+2. **Turn Multiplication**: Full `tools/list` schemas are injected into the prompt on every turn. In a 30-turn coding session, a 25,000-token tool catalog forces 750,000 tokens of repeated schema overhead.
+3. **Attention Dilution**: Oversized tool catalogs degrade instruction adherence and tool selection accuracy.
 
 ---
 
 ## How ToolPrune Solves It
 
-**ToolPrune** acts as an ultra-lightweight, zero-overhead intermediary between AI clients (Claude Desktop, Cursor, Zed) and your upstream MCP servers. Written in pure Go with zero runtime dependencies, it transparently compresses schemas and routes requests using a multi-tier optimization engine:
+**ToolPrune** is a single-binary, low-latency MCP proxy and multi-upstream router written in Go. It sits transparently between MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, Zed) and upstream servers:
 
-- **Tier 1 (Lossless Minify)**: Strips `$schema` declarations, internal comments, decorative titles, and redundant formatting without modifying a single character of documentation or parameter typing.
-- **Tier 2 (Description Condensation)**: Condenses verbose markdown prose, cleans embedded HTML, simplifies sprawling regex expressions, and truncates documentation to high-density semantic summaries.
-- **Tier 3 (Parameter Schema Pruning)**: Strips decorative descriptions on self-evident parameters (such as `id`, `path`, `query`, `repo`, `branch`) while strictly preserving types, enums, required constraints, and default values.
-- **Tier 4 (Dynamic Catalog & On-Demand Hydration)**: Exposes ultra-compact tool definition cards to the model prompt. Tools are managed in an active LRU sliding window. When the model invokes a dormant tool, ToolPrune automatically hydrates the full schema on the fly and dispatches the execution seamlessly.
-- **Draft-07 Guaranteed Compliance**: Every output schema is verified against the official JSON Schema Draft-07 specification before transmission, ensuring 100% compatibility with Claude 3.7 Sonnet, Claude 3.5 Sonnet, GPT-4o, and Gemini models.
+- **Tier 1 (`lossless` / `--preset fast`)**: Strips `$schema` declarations, `$comment`, `examples`, decorative titles, and redundant formatting without altering parameter types or documentation semantics.
+- **Tier 2 (`compact` / `--preset balanced`)**: Condenses verbose Markdown prose, strips embedded HTML/code blocks, simplifies overly long regex patterns, and truncates descriptions on word boundaries.
+- **Tier 3 (`aggressive` / `--preset strict`)**: Strips redundant docstrings on self-evident parameters (`id`, `path`, `query`, `repo`, `branch`) while preserving `type`, `properties`, `required`, `enum`, `const`, `$ref`, `$defs`/`definitions`, `anyOf`/`oneOf`/`allOf`, `not`, bounds, and MCP `annotations`.
+- **Tier 4 (`dynamic` / `--preset dynamic`)**: Exposes compact tool cards managed by an LRU active sliding window plus four built-in discovery/invocation meta-tools (`toolprune_search_tools`, `toolprune_get_tool_schema`, `toolprune_activate_tools`, `toolprune_invoke`). Dormant tools auto-hydrate on demand.
+- **RFC #1 Adaptive Token-Budget Compactor (`--max-schema-tokens=N`)**: Enforces a hard upper bound on `tools/list` tokens in `<0.5ms` using a 5-pass structural AST compactor weighted by live `tools/call` recency and domain affinity, paired with `<0.1ms` pre-binding argument validation that returns self-correcting `CallToolResult{IsError: true}` diagnostics before invalid calls reach upstream servers.
 
 ---
 
 ## Empirical Benchmark Results
 
-Measured against real-world production MCP tools (including Cloudflare, GitHub, Supabase, and Browser Automation tools) using the OpenAI `cl100k_base` BPE tokenizer (`tiktoken`):
+Measured using exact OpenAI `cl100k_base` BPE tokenization (`tiktoken-go`) and Go `testing.B` microbenchmarks (`AMD Ryzen 9 8945HX`, Go 1.23, `CGO_ENABLED=0`):
 
-### Optimization Summary Across Pruning Tiers
+### 1. Realistic Enterprise MCP Suite (PostgreSQL DDL + Filesystem Diff + GitHub AST)
+
+| Configuration | `cl100k_base` Tokens | Savings (%) | Tokens / Tool | Schema Validity |
+|:---|---:|---:|---:|:---:|
+| **Raw Unpruned Baseline** | 3,596 | *Baseline* | 599.3 | PASS |
+| **Tier 3 (`--preset strict`)** | 2,167 | **-39.7%** | 361.2 | PASS |
+| **RFC #1 (`--max-schema-tokens 350`)** | **282** | **-92.2%** | **47.0** | PASS |
+| **Tier 4 (`--preset dynamic`)** | **127** | **-96.5%** | **21.2** | PASS |
+
+### 2. Bundled Production Schema Suite (`test/fixtures/schemas.json`)
 
 | Tier | Pruning Strategy | Tokens | Bytes | Savings (%) | Tokens / Tool | Draft-07 Status |
 |:---:|:---|---:|---:|---:|---:|:---:|
-| **0** | **Tier 0: Raw Unpruned** | 1,827 | 6,983 | *Baseline* | 456.8 | ✅ PASS |
-| **1** | **Tier 1: Lossless Minify** | 1,761 | 6,706 | **-3.6%** | 440.2 | ✅ PASS |
-| **2** | **Tier 2: Description Condensation** | 885 | 3,882 | **-51.6%** | 221.2 | ✅ PASS |
-| **3** | **Tier 3: Parameter Prune** | 682 | 2,923 | **-62.7%** | 170.5 | ✅ PASS |
-| **4** | **Tier 4: Dynamic Catalog** | **158** | **663** | **-91.4%** | **39.5** | ✅ PASS |
+| **0** | **Tier 0: Raw Unpruned** | 1,827 | 6,983 | *Baseline* | 456.8 | PASS |
+| **1** | **Tier 1: Lossless Minify** | 1,761 | 6,706 | **-3.6%** | 440.2 | PASS |
+| **2** | **Tier 2: Description Condensation** | 884 | 3,882 | **-51.6%** | 221.0 | PASS |
+| **3** | **Tier 3: Parameter Prune** | 682 | 2,923 | **-62.7%** | 170.5 | PASS |
+| **4** | **Tier 4: Dynamic Catalog** | **158** | **663** | **-91.4%** | **39.5** | PASS |
 
-> **Result**: ToolPrune **exceeds the 80% token reduction target**, achieving up to **91.4% context token savings** (158 tokens vs 1,827 tokens) while preserving 100% parameter accuracy and execution reliability.
+### 3. Hot-Path Stream Latency (`go test -bench=. -benchmem ./pkg/benchmark/...`)
 
-### Per-Tool Savings Breakdown
-
-| Tool Name | Upstream Domain | Raw Tokens | Tier 2 | Tier 3 | Tier 4 (Catalog) | Net Savings |
-|:---|:---|---:|---:|---:|---:|---:|
-| `create_or_update_file` | GitHub / Git Ops | 170 | 151 | 90 | **44** | **-74.1%** |
-| `query_logs` | Supabase / Database | 759 | 164 | 123 | **41** | **-94.6%** |
-| `create_dns_record` | Cloudflare / Network | 311 | 245 | 176 | **48** | **-84.6%** |
-| `emulate` | Chrome DevTools | 593 | 334 | 302 | **31** | **-94.8%** |
+| Operation | Latency (`ns/op`) | Wall Time | Memory (`B/op`) | Allocs |
+|:---|---:|---:|---:|---:|
+| `StreamFilter` Fingerprinted Cache Hit (`tools/list`) | ~3,690 ns | **0.004 ms** | 256 B | 2 |
+| `StreamFilter` Pre-Binding Schema Validation (`tools/call`) | ~11,300 ns | **0.011 ms** | 4,408 B | 74 |
+| `EnforceTokenBudget` 5-Pass Compactor (6 Enterprise Tools) | ~224,000 ns | **0.224 ms** | 93,208 B | 730 |
+| `StreamFilter` Cold Pass + Fingerprint Registration | ~360,000 ns | **0.360 ms** | 158,000 B | 790 |
 
 ### Reproduce Benchmarks Locally
-
-Run the built-in benchmark runner directly on your machine:
 
 ```bash
 # Evaluate the bundled schema test suite
 toolprune bench --file test/fixtures/schemas.json --format table
 
+# Evaluate the realistic enterprise suite with an explicit token budget and CSV output
+toolprune bench --file test/fixtures/mcp_suite_realistic.json --max-schema-tokens 350 --format csv
+
 # Benchmark against a live upstream MCP server command
-toolprune bench -- npx -y @modelcontextprotocol/server-github
+toolprune bench --verbose -- npx -y @modelcontextprotocol/server-github
 ```
 
 ---
@@ -155,79 +166,84 @@ toolprune bench -- npx -y @modelcontextprotocol/server-github
 
 ### System Architecture
 
-```
-                  ┌─────────────────────────────────────────┐
-                  │    AI Client (Claude Desktop / Cursor)   │
-                  └────────────────────┬────────────────────┘
-                                       │
-                      Inbound Transport (Stdio / SSE)
-                                       ▼
- ┌────────────────────────────────────────────────────────────────────────┐
- │                         TOOLPRUNE CORE PROXY                           │
- │                                                                        │
- │  ┌──────────────────────────────────────────────────────────────────┐  │
- │  │               Framing & 10MB Safe Scanner Buffer                 │  │
- │  └──────────────────────────────────┬───────────────────────────────┘  │
- │                                     ▼                                  │
- │  ┌──────────────────────────────────────────────────────────────────┐  │
- │  │      Dynamic Router, Multiplexer & LRU Active Tool Window        │  │
- │  │   (Profile filtering, prefix namespacing, on-demand hydration)   │  │
- │  └──────────────────────────────────┬───────────────────────────────┘  │
- │                                     ▼                                  │
- │  ┌──────────────────────────────────────────────────────────────────┐  │
- │  │             Schema Pruner & Token Squeezer Pipeline              │  │
- │  │    (Minify ➔ Condense ➔ Parameter Prune ➔ Draft-07 Guardrail)    │  │
- │  └──────────────────────────────────┬───────────────────────────────┘  │
- │                                     ▼                                  │
- │  ┌──────────────────────────────────────────────────────────────────┐  │
- │  │  Process Supervisor (Windows Job Objects & POSIX Signal Engine)   │  │
- │  │     - Safe orphan process cleanup                                │  │
- │  │     - Asynchronous stderr background drain                       │  │
- │  └──────────────────────────────────┬───────────────────────────────┘  │
- └─────────────────────────────────────┼──────────────────────────────────┘
-                                       │
+```text
+                  +-----------------------------------------+
+                  |   AI Client (Claude / Cursor / Windsurf)|
+                  +--------------------+--------------------+
+                                       |
+             Inbound Transport (Stdio | SSE /sse | Streamable HTTP /mcp)
+                                       |
+                                       v
+ +------------------------------------------------------------------------+
+ |                         TOOLPRUNE CORE PROXY                           |
+ |                                                                        |
+ |  +------------------------------------------------------------------+  |
+ |  |         Bounded Framing Reader (64 KiB init / 10 MiB cap)        |  |
+ |  +----------------------------------+-------------------------------+  |
+ |                                     |                                  |
+ |                                     v                                  |
+ |  +------------------------------------------------------------------+  |
+ |  |     Dynamic Router, Multiplexer & Adaptive StreamFilter          |  |
+ |  |  (Profiles, namespacing, LRU window, pre-binding call check)     |  |
+ |  +----------------------------------+-------------------------------+  |
+ |                                     |                                  |
+ |                                     v                                  |
+ |  +------------------------------------------------------------------+  |
+ |  |           Schema Pruner & 5-Pass Token Budget Engine             |  |
+ |  |   (Minify -> Condense -> Param Prune -> Budget -> Draft-07)      |  |
+ |  +----------------------------------+-------------------------------+  |
+ |                                     |                                  |
+ |                                     v                                  |
+ |  +------------------------------------------------------------------+  |
+ |  |  Process Supervisor (Windows Job Objects / POSIX Process Groups) |  |
+ |  |  & Outbound SSE / Streamable HTTP Client Transport               |  |
+ |  +----------------------------------+-------------------------------+  |
+ +-------------------------------------+----------------------------------+
+                                       |
                  Outbound Bidirectional JSON-RPC 2.0
-                                       ▼
-  ┌───────────────────────┬─────────────────────────┬───────────────────┐
-  │  Upstream Server 1    │   Upstream Server 2     │ Upstream Server 3 │
-  │  (e.g., GitHub MCP)   │   (e.g., SQLite MCP)    │ (e.g., Cloudflare)│
-  └───────────────────────┴─────────────────────────┴───────────────────┘
+                                       |
+                                       v
+  +-----------------------+-------------------------+-------------------+
+  |  Upstream Server 1    |   Upstream Server 2     | Upstream Server 3 |
+  |  (GitHub MCP - stdio) |  (Postgres MCP - stdio) | (Remote MCP - SSE)|
+  +-----------------------+-------------------------+-------------------+
 ```
 
 ```mermaid
 graph TD
-    Client["AI Client<br><b>(Claude Desktop / Cursor)</b>"] -->|Stdio JSON-RPC 2.0 / SSE| TP["<b>ToolPrune Proxy Gateway</b>"]
-    
+    Client["AI Client (Claude / Cursor / Windsurf)"] -->|Stdio / SSE / Streamable HTTP| TP["ToolPrune Proxy Gateway"]
+
     subgraph TP_Engine ["ToolPrune Core Engine"]
-        Buffer["10MB Safe Buffer & Framing"] --> Router["Dynamic Router & Multiplexer"]
-        Router --> Window["LRU Active Tool Window"]
-        Window --> Pruner["Schema Pruning Pipeline (Tiers 1-4)"]
-        Pruner --> Guardrail["JSON Schema Draft-07 Validator"]
-        Guardrail --> Sup["Process Supervisor (Job Objects / Signals)"]
+        Buffer["Bounded Framing (64KiB-10MiB)"] --> Router["Dynamic Router & Multiplexer"]
+        Router --> Filter["Adaptive StreamFilter & Pre-Bind Validator"]
+        Filter --> Window["LRU Active Tool Window & Meta-Tools"]
+        Window --> Pruner["Schema Pruner & 5-Pass Budget Engine"]
+        Pruner --> Sup["Supervisor & Outbound SSE/HTTP Client"]
     end
-    
+
     TP --> Buffer
     Sup -->|Supervised Subprocess| UP1["Upstream: GitHub (@mcp/server-github)"]
     Sup -->|Supervised Subprocess| UP2["Upstream: SQLite (mcp-server-sqlite)"]
-    Sup -->|HTTP / SSE Stream| UP3["Upstream: Remote SSE Agent"]
+    Sup -->|HTTP / SSE Stream| UP3["Upstream: Remote MCP Server"]
 ```
 
 ### Schema Pruning Pipeline
 
 ```mermaid
 flowchart LR
-    T0["<b>Tier 0</b><br>Raw Unpruned<br><i>(1,827 tok)</i>"] -->|Strip $schema, whitespace| T1["<b>Tier 1</b><br>Lossless Minify<br><i>(1,761 tok)</i>"]
-    T1 -->|Condense prose & regex| T2["<b>Tier 2</b><br>Condensation<br><i>(885 tok)</i>"]
-    T2 -->|Strip self-evident params| T3["<b>Tier 3</b><br>Param Prune<br><i>(682 tok)</i>"]
-    T3 -->|Catalog + JIT hydration| T4["<b>Tier 4</b><br>Dynamic Catalog<br><i>(158 tok, -91.4%)</i>"]
+    T0["Tier 0: Raw Unpruned (3,596 tok)"] -->|Strip $schema, unused $defs| T1["Tier 1: Lossless"]
+    T1 -->|Condense prose & regex| T2["Tier 2: Compact"]
+    T2 -->|Strip self-evident params| T3["Tier 3: Aggressive (2,167 tok)"]
+    T3 -->|5-pass budget compactor| TB["RFC #1 Budget (282 tok, -92.2%)"]
+    TB -->|Catalog + JIT hydration| T4["Tier 4: Dynamic (127 tok, -96.5%)"]
 ```
 
 ### Technical Highlights
 
-- **Windows Job Object Child Protection**: When Claude Desktop or Cursor terminates, standard child processes spawned by Node.js or Python often remain running as zombie processes, hogging CPU and open ports. ToolPrune places all upstream subprocesses inside a Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, guaranteeing immediate, 100% clean termination across Windows, macOS, and Linux.
-- **Asynchronous Stderr Draining**: Many MCP servers write diagnostic logs and startup messages to standard error (`stderr`). If unread, OS pipe buffers fill up (typically 4KB–64KB) and deadlock the server. ToolPrune drains upstream `stderr` asynchronously in dedicated goroutines, routing output directly to ToolPrune's stderr while leaving `stdout` completely clean for JSON-RPC 2.0 framing.
-- **10MB Safe Buffer Scanner**: Standard Go `bufio.Scanner` fails with `token too long` when an upstream tool returns large file contents or detailed git logs (>64KB). ToolPrune utilizes a custom buffered line reader scaling up to 10MB per JSON frame.
-- **Dual-Engine Tokenizer**: Token metrics in `toolprune bench` utilize exact OpenAI `cl100k_base` BPE tokenization via `tiktoken-go`, paired with an instant calibrated runtime estimator (`round(len(compactJSON)/4.45)`) that operates deterministically in air-gapped environments.
+- **Full JSON Schema & Modern MCP Fidelity**: Preserves `$defs`, `definitions`, `$ref`, `anyOf`, `oneOf`, `allOf`, `not`, `patternProperties`, `dependentSchemas`, `dependentRequired`, `minProperties`/`maxProperties`, and MCP `title`, `outputSchema`, `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`), and `icons` so Pydantic and Zod schemas never break.
+- **Windows Job Object & POSIX Group Supervision**: Places upstream subprocesses inside a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) or POSIX process group and drains `stdout`/`stderr` pipes completely prior to `Wait()`, preventing zombie leaks and pipe deadlocks.
+- **Bounded Memory Framing**: Uses chunked line framing starting at `64 KiB` with a strict `10 MiB` pre-allocation ceiling, defeating unbounded line OOM attacks while keeping idle per-upstream memory minimal.
+- **Localhost HTTP Hardening**: Validates `Host` and `Origin` headers on local SSE and Streamable HTTP (`/mcp`) listeners to block DNS-rebinding and cross-origin browser attacks.
 
 ---
 
@@ -235,7 +251,7 @@ flowchart LR
 
 ### 1. Automated One-Line Install (Recommended)
 
-Automatically detects your operating system and CPU architecture, downloads the verified binary release from GitHub, and sets up your PATH:
+Downloads the platform binary release and verifies its SHA-256 digest against `checksums.txt`:
 
 **macOS & Linux (Bash / Zsh):**
 ```bash
@@ -247,27 +263,19 @@ curl -fsSL https://raw.githubusercontent.com/aloneangel45/toolprune/main/install
 irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | iex
 ```
 
----
-
 ### 2. Docker Container
 
-Run directly without installing Go or native dependencies:
-
 ```bash
-docker run -it --rm ghcr.io/aloneangel45/toolprune:latest proxy --preset balanced
+docker run -i --rm ghcr.io/aloneangel45/toolprune:latest proxy --preset balanced
 ```
-
----
 
 ### 3. Via `go install`
 
-Requires Go 1.22+:
+Requires Go 1.23+:
 
 ```bash
 go install github.com/aloneangel45/toolprune/cmd/toolprune@latest
 ```
-
----
 
 ### 4. Build from Source
 
@@ -275,11 +283,6 @@ go install github.com/aloneangel45/toolprune/cmd/toolprune@latest
 git clone https://github.com/aloneangel45/toolprune.git
 cd toolprune
 go build -o toolprune ./cmd/toolprune
-```
-
-Verify your installation:
-
-```bash
 toolprune version
 ```
 
@@ -289,32 +292,41 @@ toolprune version
 
 ### 1. Zero-Config Wrapper Mode
 
-The simplest way to use ToolPrune is as a transparent drop-in wrapper around any existing MCP server command. You don't need any configuration file. Simply prepend `toolprune proxy -- ` to your existing command:
+Prepend `toolprune proxy -- ` to any existing MCP server command without creating a config file:
 
 ```bash
-# Wrap GitHub MCP server with aggressive parameter pruning (Tier 3)
-toolprune proxy --mode=aggressive -- npx -y @modelcontextprotocol/server-github
+# Wrap GitHub MCP server with balanced condensation
+toolprune proxy --preset=balanced -- npx -y @modelcontextprotocol/server-github
 
 # Wrap SQLite MCP server with dynamic catalog windowing (Tier 4)
-toolprune proxy --mode=dynamic -- uvx mcp-server-sqlite --db-path ./test.db
+toolprune proxy --preset=dynamic -- uvx mcp-server-sqlite --db-path ./test.db
 ```
 
-### 2. Multi-Upstream Gateway Mode
+### 2. Deterministic Token Budget Mode (RFC #1)
 
-Combine dozens of MCP servers into a single, unified, namespaced gateway:
+Cap total serialized `tools/list` schema tokens across any upstream server while getting automatic pre-binding argument self-correction:
 
 ```bash
-# 1. Initialize a production-ready configuration file
+toolprune proxy --max-schema-tokens=800 -- npx -y @modelcontextprotocol/server-github
+```
+
+### 3. Multi-Upstream Gateway Mode
+
+Combine multiple stdio and remote HTTP/SSE MCP servers behind a single namespaced gateway:
+
+```bash
+# 1. Initialize toolprune.yaml
 toolprune config init
 
-# 2. Validate your configuration and upstream commands
+# 2. Validate configuration syntax and upstream definitions
 toolprune config validate
 
-# 3. Inspect registered upstream servers and routes
-toolprune routes
+# 3. Inspect active routes under a security profile
+toolprune routes --profile read_only
 
-# 4. Launch the multi-server gateway
+# 4. Launch over stdio or local SSE + Streamable HTTP (/sse and /mcp)
 toolprune proxy --config toolprune.yaml
+toolprune proxy --config toolprune.yaml --transport sse --port 8080
 ```
 
 ---
@@ -323,15 +335,20 @@ toolprune proxy --config toolprune.yaml
 
 ### Claude Desktop
 
-Claude Desktop connects to MCP servers over standard input/output (`stdio`).
+Automatically wrap existing servers in `claude_desktop_config.json` (creates a `.bak` backup first):
 
-#### Configuration File Path:
+```bash
+# Preview changes without modifying disk
+toolprune config patch-claude --dry-run
+
+# Apply wrapper preset to Claude Desktop config
+toolprune config patch-claude --preset strict
+```
+
+Or configure manually:
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
-
-#### Option A: Zero-Config Wrapper (Wrap Individual Servers)
-Wrap your existing MCP servers with ToolPrune to prune their schemas automatically:
 
 ```json
 {
@@ -340,7 +357,8 @@ Wrap your existing MCP servers with ToolPrune to prune their schemas automatical
       "command": "toolprune",
       "args": [
         "proxy",
-        "--mode=aggressive",
+        "--preset=strict",
+        "--max-schema-tokens=1200",
         "--",
         "npx",
         "-y",
@@ -349,342 +367,191 @@ Wrap your existing MCP servers with ToolPrune to prune their schemas automatical
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_yourTokenHere"
       }
-    },
-    "sqlite": {
-      "command": "toolprune",
-      "args": [
-        "proxy",
-        "--mode=aggressive",
-        "--",
-        "uvx",
-        "mcp-server-sqlite",
-        "--db-path",
-        "/path/to/database.db"
-      ]
     }
   }
 }
 ```
-
-#### Option B: Unified ToolPrune Gateway (Single Managed Entrypoint)
-Consolidate all servers into a single gateway entrypoint governed by `toolprune.yaml`:
-
-```json
-{
-  "mcpServers": {
-    "toolprune_gateway": {
-      "command": "toolprune",
-      "args": [
-        "proxy",
-        "--config",
-        "/Users/username/toolprune.yaml"
-      ]
-    }
-  }
-}
-```
-
----
 
 ### Cursor IDE
 
-Cursor supports MCP servers configured via workspace or global settings.
-
-#### Configuration File Path:
-- **Project Root**: `.cursor/mcp.json`
-
-#### Stdio Transport:
-```json
-{
-  "mcpServers": {
-    "toolprune": {
-      "command": "toolprune",
-      "args": [
-        "proxy",
-        "--mode=aggressive",
-        "--",
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-github"
-      ],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_TOKEN}"
-      }
-    }
-  }
-}
-```
-
-#### HTTP / Server-Sent Events (SSE) Transport:
-You can also run ToolPrune as a shared local daemon serving SSE to multiple IDEs:
+Generate `.cursor/mcp.json` directly:
 
 ```bash
-# Start ToolPrune SSE server on port 8080
+toolprune preset generate --client cursor --output .cursor/mcp.json
+```
+
+Or connect Cursor to a shared local SSE / Streamable HTTP daemon:
+
+```bash
 toolprune proxy --transport=sse --port=8080 --config=toolprune.yaml
 ```
 
-Configure `.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
-    "toolprune_sse": {
-      "url": "http://127.0.0.1:8080/sse"
+    "toolprune_http": {
+      "url": "http://127.0.0.1:8080/mcp"
     }
   }
 }
 ```
 
----
-
 ### Windsurf & Other MCP Clients
 
-ToolPrune is fully compliant with the official Model Context Protocol JSON-RPC 2.0 specification. Simply configure ToolPrune's executable path as the command and provide your upstream arguments after `--`.
+```bash
+toolprune preset generate --client windsurf --output ~/.codeium/windsurf/mcp_config.json
+toolprune preset validate --client windsurf --input ~/.codeium/windsurf/mcp_config.json
+```
 
 ---
 
 ## CLI Reference
 
 ### `toolprune proxy`
-Starts the ToolPrune proxy in either zero-config wrapper mode or multi-upstream gateway mode.
+Starts the ToolPrune proxy in zero-config wrapper mode or multi-upstream gateway mode.
 
-```
+```text
 Usage:
   toolprune proxy [flags] [-- <upstream_cmd> [args...]]
 
 Flags:
-  -c, --config string      Path to toolprune.yaml configuration file
-  -m, --mode string        Pruning tier: none, lossless, compact, aggressive, dynamic (default "aggressive")
-  -t, --transport string   Client transport protocol: stdio, sse (default "stdio")
-      --host string        Listen host address for SSE transport (default "127.0.0.1")
-  -p, --port int           Listen port for SSE transport (default 8080)
-      --profile string     Active routing profile: full, read_only, dev, minimal (default "full")
-      --namespace string   Namespacing strategy: auto, always, on_collision, none (default "auto")
-      --timeout duration   Request timeout duration (default 1m0s)
-      --stats              Print token savings statistics on shutdown (default true)
-      --log-level string   Log level: debug, info, warn, error (default "info")
+  -c, --config string           Path to toolprune.yaml configuration file
+  -m, --mode string             Pruning tier: none, lossless, compact, aggressive, dynamic (default "aggressive")
+      --preset string           Preset alias: fast (lossless), balanced (compact), strict (aggressive), dynamic
+      --max-schema-tokens int   Hard token budget for tools/list schemas (0 = disabled; env TOOLPRUNE_MAX_SCHEMA_TOKENS)
+  -t, --transport string        Inbound transport protocol: stdio, sse (serves /sse, /messages, and /mcp) (default "stdio")
+      --host string             Listen host address for SSE/HTTP transport (default "127.0.0.1")
+  -p, --port int                Listen port for SSE/HTTP transport (default 8080)
+      --profile string          Active routing profile: full, read_only, dev, minimal (default "full")
+      --namespace string        Namespacing strategy: auto, always, on_collision, none (default "auto")
+      --timeout duration        Request timeout duration (default 1m0s)
+      --stats                   Print session token savings summary to stderr on exit (default true)
+      --log-level string        Log level: debug, info, warn, error (default "info")
 ```
 
 ### `toolprune bench`
-Evaluates exact token metrics and reduction percentages across Tiers 0 to 4.
+Evaluates exact token metrics and reduction percentages across Tiers 0-4 and optional token budgets.
 
-```
+```text
 Usage:
   toolprune bench [flags] [-- <upstream_cmd> [args...]]
 
 Flags:
-  -f, --file string     Path to JSON schema fixtures file (e.g. test/fixtures/schemas.json)
-      --format string   Output format: table, markdown, json, csv (default "table")
-      --model string    Tokenizer engine: cl100k_base, calibrated (default "cl100k_base")
-  -v, --verbose         Display per-parameter token breakdown
+  -f, --file string             Path to JSON schema fixtures file
+      --format string           Output format: table, markdown, json, csv (default "table")
+      --model string            Tokenizer engine: cl100k_base, calibrated (default "cl100k_base")
+      --max-schema-tokens int   Evaluate an additional RFC #1 token budget pass
+  -v, --verbose                 Display per-parameter token breakdown
 ```
 
 ### `toolprune routes`
-Inspects upstream servers, namespaced tools, active filters, and routing tables.
+Inspects upstream servers, namespaced tools, active profile rules, and filter matches.
 
-```
+```text
 Usage:
   toolprune routes [flags]
 
 Flags:
-      --filter string    Filter tool names matching substring or regex
-      --profile string   Evaluate routing table under specific profile (e.g. read_only)
+      --filter string    Filter upstream/tool names matching substring or regex
+      --profile string   Evaluate routing table under specific profile (e.g. read_only, minimal)
       --json             Output routing table in machine-readable JSON
 ```
 
 ### `toolprune config`
-Configuration management and validation utilities.
+Configuration initialization, validation, and client patching utilities.
 
-```
+```text
 Usage:
   toolprune config [command]
 
 Available Commands:
   init          Initialize a new toolprune.yaml configuration file with defaults
   validate      Validate toolprune.yaml syntax, schema rules, and upstream definitions
-  patch-claude  Inspect and wrap existing Claude Desktop MCP server configurations
+  patch-claude  Wrap existing Claude Desktop MCP servers with ToolPrune (--dry-run, --preset, --mode, --path)
 ```
 
 ### `toolprune preset`
-Generates and validates out-of-the-box MCP client configuration presets for **Cursor** (`.cursor/mcp.json`) and **Windsurf** (`~/.codeium/windsurf/mcp_config.json`).
+Generates and validates MCP client presets for Cursor and Windsurf while preserving existing sibling keys.
 
-```
+```text
 Usage:
   toolprune preset [command]
 
 Available Commands:
-  generate    Generate a client MCP config preset for ToolPrune
-  validate    Validate a client MCP config file against the expected schema
+  generate    Generate or merge a client MCP config preset for ToolPrune
+  validate    Validate a client MCP config file (supports command stdio and url SSE/HTTP servers)
 ```
 
 ### `toolprune version`
-Displays version information, Git commit, build timestamp, and runtime telemetry.
-
-```
-Usage:
-  toolprune version [flags]
-
-Flags:
-      --short   Print version string only
-      --json    Output full telemetry in JSON format
-```
+Displays version, Git commit, build timestamp, and Go runtime details.
 
 ---
 
 ## Configuration Reference (`toolprune.yaml`)
 
-ToolPrune is configured using a declarative YAML file. Environment variables (e.g. `${GITHUB_TOKEN}` or `${DB_PATH:-./default.db}`) are expanded automatically on load.
+Environment variables (`${GITHUB_TOKEN}` or `${DB_PATH:-./default.db}`) expand automatically on load.
 
 ```yaml
 version: "1"
 
-# ------------------------------------------------------------------------------
-# 1. Inbound Server Configuration
-# ------------------------------------------------------------------------------
 server:
-  # Inbound transport protocol: "stdio" (for desktop clients) or "sse" (HTTP daemon)
-  transport: "stdio"
+  transport: "stdio" # "stdio" or "sse" (serves /sse, /messages, and Streamable HTTP /mcp)
   host: "127.0.0.1"
   port: 8080
   base_path: ""
-  cors_origins:
-    - "*"
+  cors_origins: []
   timeout: "60s"
   inject_proxy_info: true
 
-# ------------------------------------------------------------------------------
-# 2. Pruning & Token Squeezer Settings
-# ------------------------------------------------------------------------------
 pruning:
-  # Optimization tier: "none", "lossless", "compact", "aggressive", or "dynamic"
-  tier: "aggressive"
-
-  # Maximum length of top-level tool descriptions before condensation
+  tier: "aggressive"          # none | lossless | compact | aggressive | dynamic
+  max_schema_tokens: 0        # RFC #1 token cap (0 = disabled; env TOOLPRUNE_MAX_SCHEMA_TOKENS)
   max_description_length: 120
-
-  # Maximum length of parameter descriptions before pruning
   max_param_desc_length: 80
-
-  # Strip verbose regex expressions exceeding max_regex_length
   strip_regex: true
   max_regex_length: 25
-
-  # Strip descriptions on self-evident parameter names (e.g., id, query, repo)
   strip_self_evident: true
-
-  # Enforce strict JSON Schema Draft-07 compliance on all output schemas
   strict_draft07: true
-
-  # Strip decorative markdown formatting & HTML tags from descriptions
   strip_code_blocks: true
   strip_html_tags: true
 
-# ------------------------------------------------------------------------------
-# 3. Dynamic Router, Windowing & Security Profiles
-# ------------------------------------------------------------------------------
 routing:
-  # Active security and tool visibility profile
-  default_profile: "full"
-
-  # Namespacing strategy: "auto", "always", "on_collision", or "none"
-  namespace_mode: "auto"
-
-  # Number of active tools kept in the sliding LRU window (Tier 4)
+  default_profile: "full"     # full | read_only | dev | minimal | custom
+  namespace_mode: "auto"      # auto | always | on_collision | none
   active_window_size: 15
-
-  # Automatically promote dormant tools when called by the AI model
   auto_promote: true
-
-  # Meta-tools immune to LRU window eviction
   pinned_tools:
     - "toolprune_search_tools"
     - "toolprune_activate_tools"
     - "toolprune_get_tool_schema"
-
-  # Global exclusion patterns dropped across all profiles
+    - "toolprune_invoke"
   global_exclude:
     - "*_internal_*"
 
-  # Custom profile definitions
-  profiles:
-    custom_safe:
-      name: "custom_safe"
-      description: "Read-only profile protecting cloud environments"
-      include:
-        - "*"
-      exclude:
-        - "*_delete_*"
-        - "*_drop_*"
-        - "*_destroy_*"
-        - "*_purge_*"
-        - "*_kill_*"
-
-    coding:
-      name: "coding"
-      description: "Development tools for coding, file operations, and git management"
-      include:
-        - "github__*"
-        - "git_*"
-        - "filesystem__*"
-        - "*search*"
-        - "*read*"
-      exclude:
-        - "*deploy*"
-        - "*admin*"
-
-# ------------------------------------------------------------------------------
-# 4. Upstream MCP Server Definitions
-# ------------------------------------------------------------------------------
 upstreams:
-  # Upstream 1: GitHub MCP server (supervised stdio subprocess)
   - id: "github"
     prefix: "gh"
     transport: "stdio"
     command: "npx"
-    args:
-      - "-y"
-      - "@modelcontextprotocol/server-github"
+    args: ["-y", "@modelcontextprotocol/server-github"]
     env:
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
-    disabled: false
-    description: "Official GitHub MCP server"
 
-  # Upstream 2: SQLite database server
-  - id: "sqlite"
-    prefix: "sqlite"
-    transport: "stdio"
-    command: "uvx"
-    args:
-      - "mcp-server-sqlite"
-      - "--db-path"
-      - "${SQLITE_DB_PATH:-./local.db}"
-    disabled: false
-
-  # Upstream 3: Remote agent over HTTP/SSE
   - id: "remote_agent"
+    prefix: "remote"
     transport: "sse"
-    url: "http://${REMOTE_HOST:-127.0.0.1}:${REMOTE_PORT:-9000}/sse"
+    url: "http://${REMOTE_HOST:-127.0.0.1}:${REMOTE_PORT:-9000}/mcp"
     timeout: "30s"
-    disabled: false
 ```
 
 ---
 
 ## Contributing & License
 
-Contributions are welcome! Please submit an issue or pull request on GitHub.
-
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Verify tests pass (`go test -race ./...`)
-5. Push to the branch (`git push origin feature/amazing-feature`)
-6. Open a Pull Request
+2. Create a feature branch (`git checkout -b feat/your-feature`)
+3. Commit with Conventional Commits (`git commit -m 'feat(scope): summary'`)
+4. Run static analysis, tests, and benchmarks (`go vet ./... && go test -v ./...`)
+5. Open a Pull Request
 
 Distributed under the **MIT License**. See `LICENSE` for details.
-
----
-
-<p align="center">
-  Crafted with care for the open-source AI developer ecosystem.<br>
-  <strong>ToolPrune</strong> — Squeeze your tokens, accelerate your agent.
-</p>

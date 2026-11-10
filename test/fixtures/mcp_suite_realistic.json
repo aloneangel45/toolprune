@@ -1,0 +1,632 @@
+[
+  {
+    "name": "postgres__apply_ddl_migration",
+    "title": "PostgreSQL Transactional DDL Schema Migration Executor",
+    "description": "Executes a transactional multi-step PostgreSQL Data Definition Language (DDL) migration plan with advisory lock coordination, lock_timeout enforcement, concurrent index safety checks, and optional dry-run EXPLAIN/rollback verification.\n\n### Operational Guarantees \u0026 Locking Semantics\nWhen executing schema alterations against high-throughput OLTP tables in PostgreSQL 14+, naive ALTER TABLE statements acquire ACCESS EXCLUSIVE locks that stall active read/write queries if queued behind long-running transactions. This tool wraps every migration batch in an explicit session guard configuring lock_timeout, statement_timeout, and idle_in_transaction_session_timeout prior to acquiring pg_try_advisory_xact_lock.\n\n### Usage Example\n```json\n{\n  \"migration_id\": \"20261110_add_audit_events\",\n  \"database\": \"prod_ledger\",\n  \"lock_timeout_ms\": 2500,\n  \"operations\": [\n    {\n      \"op_type\": \"create_table\",\n      \"table_name\": \"audit_events\",\n      \"schema_name\": \"public\",\n      \"columns\": [\n        {\"name\": \"id\", \"data_type\": \"uuid\", \"nullable\": false, \"primary_key\": true},\n        {\"name\": \"actor_id\", \"data_type\": \"text\", \"nullable\": false}\n      ]\n    }\n  ]\n}\n```",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "database": {
+          "description": "Target logical PostgreSQL database name configured in the upstream connection pool.",
+          "type": "string"
+        },
+        "dry_run": {
+          "description": "Executes all DDL steps inside a savepoint and issues ROLLBACK at completion to validate catalog compatibility without persisting changes.",
+          "type": "boolean"
+        },
+        "lock_timeout_ms": {
+          "description": "Maximum duration in milliseconds to wait for table or row locks before aborting safely without blocking traffic.",
+          "maximum": 30000,
+          "minimum": 50,
+          "type": "integer"
+        },
+        "migration_id": {
+          "description": "Globally unique monotonically ordered migration identifier recorded in schema_migrations ledger.",
+          "type": "string"
+        },
+        "operations": {
+          "description": "Ordered sequence of atomic DDL AST operations executed sequentially within the migration envelope.",
+          "items": {
+            "description": "Single PostgreSQL DDL AST operation node.",
+            "properties": {
+              "columns": {
+                "description": "Column specifications referenced when op_type creates or alters table columns.",
+                "items": {
+                  "$ref": "#/$defs/ColumnSpec"
+                },
+                "type": "array"
+              },
+              "indexes": {
+                "description": "Secondary index specifications created alongside or on top of the target relation.",
+                "items": {
+                  "$ref": "#/$defs/IndexSpec"
+                },
+                "type": "array"
+              },
+              "op_type": {
+                "description": "DDL operation discriminator specifying the catalog transformation.",
+                "enum": [
+                  "create_table",
+                  "alter_table_add_column",
+                  "alter_table_drop_column",
+                  "create_index",
+                  "drop_index"
+                ],
+                "type": "string"
+              },
+              "schema_name": {
+                "description": "PostgreSQL schema namespace containing the target relation (defaults to 'public').",
+                "type": "string"
+              },
+              "table_name": {
+                "description": "Target PostgreSQL relation name for the DDL statement.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op_type",
+              "table_name"
+            ],
+            "type": "object"
+          },
+          "maxItems": 200,
+          "minItems": 1,
+          "type": "array"
+        },
+        "statement_timeout_ms": {
+          "description": "Hard execution ceiling in milliseconds applied to each DDL statement inside the migration transaction.",
+          "maximum": 600000,
+          "minimum": 100,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "migration_id",
+        "database",
+        "operations"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$defs": {
+        "ColumnSpec": {
+          "additionalProperties": false,
+          "description": "Declarative PostgreSQL column specification defining SQL type, nullability, default expression, generated identity rules, and foreign key references.",
+          "properties": {
+            "check_expr": {
+              "description": "Optional boolean SQL predicate enforced as a row-level CHECK constraint on writes.",
+              "type": "string"
+            },
+            "data_type": {
+              "description": "Canonical PostgreSQL column data type expression including optional precision or array bounds.",
+              "enum": [
+                "uuid",
+                "text",
+                "varchar",
+                "integer",
+                "bigint",
+                "numeric",
+                "boolean",
+                "timestamptz",
+                "jsonb",
+                "bytea",
+                "inet",
+                "vector"
+              ],
+              "type": "string"
+            },
+            "default_sql": {
+              "description": "Deterministic SQL expression evaluated for omitted column values (for example 'gen_random_uuid()' or 'now()').",
+              "type": "string"
+            },
+            "name": {
+              "description": "Unquoted PostgreSQL identifier for the target column (must match snake_case convention and avoid reserved SQL keywords).",
+              "type": "string"
+            },
+            "nullable": {
+              "description": "Whether the column permits SQL NULL values. Defaults to true unless primary_key is enabled.",
+              "type": "boolean"
+            },
+            "primary_key": {
+              "description": "Marks this column as part of the table PRIMARY KEY btree index constraint.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "data_type"
+          ],
+          "type": "object"
+        },
+        "IndexSpec": {
+          "additionalProperties": false,
+          "description": "PostgreSQL secondary index definition supporting btree, gin, gist, brin, and hnsw access methods with partial WHERE predicates.",
+          "properties": {
+            "columns": {
+              "description": "Ordered list of key columns or functional index expressions included in the index key.",
+              "items": {
+                "description": "Column name or parenthesized SQL key expression.",
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "index_name": {
+              "description": "Deterministic relation identifier for the index within the target schema namespace.",
+              "type": "string"
+            },
+            "method": {
+              "description": "PostgreSQL index access method controlling storage layout and operator class support.",
+              "enum": [
+                "btree",
+                "gin",
+                "gist",
+                "hash",
+                "brin",
+                "hnsw"
+              ],
+              "type": "string"
+            },
+            "unique": {
+              "description": "Enforces uniqueness across indexed non-null key tuples.",
+              "type": "boolean"
+            },
+            "where_predicate": {
+              "description": "Optional partial index filter predicate reducing index size and write amplification.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "index_name",
+            "columns"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "outputSchema": {
+      "properties": {
+        "applied": {
+          "description": "Indicates whether the migration transaction committed permanently to the catalog.",
+          "type": "boolean"
+        },
+        "elapsed_ms": {
+          "description": "Total wall-clock execution duration of the migration transaction in milliseconds.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "applied",
+        "elapsed_ms"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Apply PostgreSQL DDL Migration",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "postgres__analyze_query_plan",
+    "title": "PostgreSQL EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) Inspector",
+    "description": "Runs PostgreSQL EXPLAIN with configurable instrumentation flags (BUFFERS, WAL, TIMING, SETTINGS, FORMAT JSON) inside a read-only transaction to diagnose sequential scan regressions, nested loop row misestimates, heap fetches, and shared buffer cache misses.\n\n### Diagnostic Output\nReturns structured plan tree nodes annotated with actual vs estimated row cardinalities, shared/local/temp block hits and dirtied pages, sort spill memory usage, and index condition pushdowns.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "database": {
+          "description": "Logical PostgreSQL database target against which the query planner will run.",
+          "type": "string"
+        },
+        "execute_analyze": {
+          "description": "When true, executes the query inside a read-only ROLLBACK wrapper to collect actual runtime row counts and buffer statistics.",
+          "type": "boolean"
+        },
+        "include_buffers": {
+          "description": "Collects shared, local, and temp block read/hit/write counters per plan node.",
+          "type": "boolean"
+        },
+        "max_rows_sampled": {
+          "description": "Optional row limit wrapper applied during sampling to cap result materialization.",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "parameters": {
+          "description": "Positional bind parameter values ($1, $2, ...) substituted safely via prepared statement protocol.",
+          "items": {
+            "anyOf": [
+              {
+                "description": "Textual or UUID bind parameter value.",
+                "type": "string"
+              },
+              {
+                "description": "Numeric scalar bind parameter value.",
+                "type": "number"
+              },
+              {
+                "description": "Boolean predicate bind parameter value.",
+                "type": "boolean"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "sql_query": {
+          "description": "Parameterized SQL SELECT or CTE query string to inspect via EXPLAIN.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "database",
+        "sql_query"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "title": "Analyze PostgreSQL Query Plan",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "filesystem__apply_multi_hunk_diff",
+    "title": "Atomic Multi-File Unified Diff \u0026 AST Patch Engine",
+    "description": "Applies structured multi-file, multi-hunk unified patches atomically across workspace source files with cryptographic SHA-256 pre-image verification, configurable context-line fuzz matching, line-ending preservation (LF vs CRLF), and full rollback if any single hunk fails verification.\n\n### Patch Resolution Rules\n1. Every target file path is canonicalized and verified to reside strictly beneath the workspace root without escaping via symlinks.\n2. Each hunk locates its anchor region using exact line bounds or surrounding context lines before splicing replacement lines.\n3. In dry_run mode, computes unified diff previews and post-patch SHA-256 digests without mutating disk files.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "atomic_rollback": {
+          "description": "Restores all modified files to their exact byte-for-byte original contents if any file patch fails.",
+          "type": "boolean"
+        },
+        "context_lines": {
+          "description": "Number of unchanged surrounding lines rendered in unified diff output summaries.",
+          "maximum": 20,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dry_run": {
+          "description": "Validates hunk anchors and returns unified diff previews without writing changes to disk.",
+          "type": "boolean"
+        },
+        "file_patches": {
+          "description": "Ordered collection of file-level patch specifications applied in a single atomic batch.",
+          "items": {
+            "additionalProperties": false,
+            "description": "Patch specification targeting a single workspace file.",
+            "properties": {
+              "encoding": {
+                "description": "Character encoding used when decoding and re-encoding file bytes.",
+                "enum": [
+                  "utf-8",
+                  "utf-16le",
+                  "latin1"
+                ],
+                "type": "string"
+              },
+              "expected_sha256": {
+                "description": "Optional hex-encoded SHA-256 digest of the file prior to patching for optimistic concurrency control.",
+                "type": "string"
+              },
+              "hunks": {
+                "description": "Non-overlapping hunks applied top-to-bottom within this file.",
+                "items": {
+                  "$ref": "#/$defs/DiffHunk"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "path": {
+                "description": "Workspace-relative path to the source file being modified.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "hunks"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "line_ending_policy": {
+          "description": "Controls how newline sequences are normalized when writing patched files.",
+          "enum": [
+            "preserve",
+            "lf",
+            "crlf"
+          ],
+          "type": "string"
+        },
+        "workspace_root": {
+          "description": "Optional workspace root directory used to resolve relative patch paths.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_patches"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$defs": {
+        "DiffHunk": {
+          "additionalProperties": false,
+          "description": "Contiguous source hunk specifying exact search lines, replacement lines, and optional surrounding context anchors.",
+          "properties": {
+            "context_after": {
+              "description": "Optional immutable lines immediately following old_text to anchor patch placement.",
+              "type": "string"
+            },
+            "context_before": {
+              "description": "Optional immutable lines immediately preceding old_text to anchor patch placement.",
+              "type": "string"
+            },
+            "new_text": {
+              "description": "Replacement source block substituted in place of old_text (empty string deletes the matched lines).",
+              "type": "string"
+            },
+            "old_text": {
+              "description": "Exact contiguous block of existing source text including indentation to locate and replace.",
+              "type": "string"
+            },
+            "start_line": {
+              "description": "1-based starting line hint used to disambiguate identical code blocks appearing multiple times in the same file.",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "old_text",
+            "new_text"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "annotations": {
+      "title": "Apply Multi-Hunk Workspace Patch",
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "filesystem__search_workspace_ast",
+    "title": "Structural Regex \u0026 Symbol Workspace Code Search",
+    "description": "Searches workspace files using compiled RE2 regular expressions, glob include/exclude path filters, binary-file skipping, and surrounding context line extraction for rapid repository navigation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "case_sensitive": {
+          "description": "Forces case-sensitive matching even when query contains only lowercase characters.",
+          "type": "boolean"
+        },
+        "exclude_globs": {
+          "description": "Glob patterns excluding vendor, build artifact, or generated directories from traversal.",
+          "items": {
+            "description": "Exclusion glob pattern string.",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_globs": {
+          "description": "Glob patterns restricting search traversal to matching file paths (for example '**/*.go').",
+          "items": {
+            "description": "Glob pattern string.",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "is_regex": {
+          "description": "Interprets query as a regular expression rather than a literal string.",
+          "type": "boolean"
+        },
+        "max_results": {
+          "description": "Upper bound on matched line records returned before truncating output.",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "description": "Literal substring or RE2 regular expression pattern matched against UTF-8 source lines.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "title": "Search Workspace Files",
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    }
+  },
+  {
+    "name": "github__create_pull_request_review",
+    "title": "GitHub Pull Request Multi-Line Code Review Submitter",
+    "description": "Submits a comprehensive GitHub Pull Request review containing top-level summary markdown, review verdict state (APPROVE, REQUEST_CHANGES, COMMENT), and inline multi-line diff review comments pinned to specific commit SHA blobs and diff sides.\n\n### GitHub REST \u0026 GraphQL Review Constraints\n- Inline review comments must reference file paths present in the pull request diff and line numbers belonging to a diff hunk unless subject_type is 'file'.\n- When submitting multi-line suggestions, start_line must be strictly less than line and both bounds must reside within the same unified diff hunk.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "body": {
+          "description": "Top-level GitHub-flavored Markdown review summary required for REQUEST_CHANGES and COMMENT events.",
+          "type": "string"
+        },
+        "comments": {
+          "description": "Inline diff comments attached atomically to the pull request review.",
+          "items": {
+            "additionalProperties": false,
+            "description": "Single inline diff comment anchored to a repository path and diff line range.",
+            "properties": {
+              "body": {
+                "description": "Markdown comment text supporting fenced suggestion blocks.",
+                "type": "string"
+              },
+              "line": {
+                "description": "End line number in the diff hunk to which the comment applies.",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "path": {
+                "description": "Repository-relative file path being commented on.",
+                "type": "string"
+              },
+              "side": {
+                "description": "Diff side targeted by line ('LEFT' for deletions, 'RIGHT' for additions/context).",
+                "enum": [
+                  "LEFT",
+                  "RIGHT"
+                ],
+                "type": "string"
+              },
+              "start_line": {
+                "description": "First line number of a multi-line comment range within the same diff hunk.",
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "line",
+              "body"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "commit_id": {
+          "description": "Optional 40-character Git commit SHA pinning inline review comments to a specific PR head revision.",
+          "type": "string"
+        },
+        "event": {
+          "description": "Review transition action applied when publishing the review.",
+          "enum": [
+            "APPROVE",
+            "REQUEST_CHANGES",
+            "COMMENT"
+          ],
+          "type": "string"
+        },
+        "owner": {
+          "description": "GitHub organization or user login owning the target repository.",
+          "type": "string"
+        },
+        "pull_number": {
+          "description": "Pull request number within the repository.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repo": {
+          "description": "Repository name without .git suffix.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "repo",
+        "pull_number",
+        "event"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "title": "Submit Pull Request Review",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    }
+  },
+  {
+    "name": "github__commit_multi_file_tree",
+    "title": "GitHub Atomic Multi-File Git Tree \u0026 Commit Creator",
+    "description": "Creates an atomic multi-file Git commit on a remote GitHub branch via the Git Data API (blobs, trees, commits, and ref fast-forward update) without requiring a local repository clone, supporting file additions, updates, executable bit changes, and deletions in a single commit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "base_branch": {
+          "description": "Optional base branch from which to create branch if it does not yet exist remotely.",
+          "type": "string"
+        },
+        "branch": {
+          "description": "Target branch name (for example 'feat/stream-filter') to advance with the new commit.",
+          "type": "string"
+        },
+        "entries": {
+          "description": "Git tree file mutations included atomically in the new commit.",
+          "items": {
+            "additionalProperties": false,
+            "description": "Single Git tree entry mutation.",
+            "properties": {
+              "content": {
+                "description": "UTF-8 file contents to write (omit and set delete=true to remove file from tree).",
+                "type": "string"
+              },
+              "delete": {
+                "description": "When true, deletes path from the resulting Git tree by setting sha to null.",
+                "type": "boolean"
+              },
+              "mode": {
+                "description": "Git tree file mode ('100644' regular file, '100755' executable, '120000' symlink).",
+                "enum": [
+                  "100644",
+                  "100755",
+                  "120000"
+                ],
+                "type": "string"
+              },
+              "path": {
+                "description": "Repository-relative POSIX file path.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "mode"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "expected_head_oid": {
+          "description": "Expected 40-character SHA of the current branch tip to prevent non-fast-forward race overwrites.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Conventional Commit headline and optional body message.",
+          "type": "string"
+        },
+        "owner": {
+          "description": "GitHub organization or user account login.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "Target GitHub repository name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "repo",
+        "branch",
+        "message",
+        "entries"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "annotations": {
+      "title": "Commit Multi-File Git Tree",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    }
+  }
+]

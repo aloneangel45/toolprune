@@ -275,7 +275,7 @@ func TestAdversarial_PreInvocationValidation_BypassAttempts(t *testing.T) {
 			{"exact_float_representation_of_int", `{"str_param":"ok","int_param":42.0}`, false},
 			{"zero_as_float", `{"str_param":"ok","int_param":0.0}`, false},
 			{"scientific_float_fraction", `{"str_param":"ok","int_param":1.5e1}`, false}, // 15
-			{"scientific_fractional", `{"str_param":"ok","int_param":1.55e1}`, true},    // 15.5
+			{"scientific_fractional", `{"str_param":"ok","int_param":1.55e1}`, true},     // 15.5
 			{"string_representation_of_int", `{"str_param":"ok","int_param":"42"}`, true},
 			{"boolean_for_int", `{"str_param":"ok","int_param":true}`, true},
 		}
@@ -479,7 +479,7 @@ func TestAdversarial_ParameterRewritingFidelity(t *testing.T) {
 
 	t.Run("complex_arguments_fidelity", func(t *testing.T) {
 		complexArgs := `{
-			"title": "Bug in unicode parser: 🚀 日本語 \u0000 special chars: <script>alert('xss')</script> \n\r\t\"'\\",
+			"title": "Bug in unicode parser: Ω 日本語 \u0000 special chars: <script>alert('xss')</script> \n\r\t\"'\\",
 			"deep_nesting": {
 				"level1": {
 					"level2": {
@@ -506,8 +506,6 @@ func TestAdversarial_ParameterRewritingFidelity(t *testing.T) {
 			},
 			"large_array": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 		}`
-
-
 
 		callParams := fmt.Sprintf(`{"name":"github__create_issue","arguments":%s}`, complexArgs)
 		reqID := mcp.NewStringID("req-fidelity-999")

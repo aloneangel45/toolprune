@@ -14,14 +14,14 @@ var (
 	reMarkdownLink    = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
 	reMarkdownFormat  = regexp.MustCompile(`(?:\*\*|__|\*|_|~~)`)
 	reMarkdownHeader  = regexp.MustCompile(`(?m)^#{1,6}\s+`)
-	reTutorialBullets = regexp.MustCompile(`(?m)^\s*[-*•]\s+`)
+	reTutorialBullets = regexp.MustCompile(`(?m)^\s*[-*\x{2022}]\s+`)
 	reNumberedSteps   = regexp.MustCompile(`(?m)^\s*\d+[\.)]\s+`)
 	reInstructionMeta = regexp.MustCompile(`(?i)\b(IMPORTANT|NOTE|WARNING|CAUTION|SELECTION PROCESS|RESPONSE FORMAT)\b\s*:`)
 	reMultipleSpaces  = regexp.MustCompile(`[ \t\r\n]+`)
 
 	// Regex format detectors
-	reUUIDPattern = regexp.MustCompile(`(?i)(?:\[[0-9a-fA-F_\\]+\]\{8\}-\[[0-9a-fA-F_\\]+\]\{4\}|\[(?:0-9a-f|a-f0-9)[^\]]*\]\{8\}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4})`)
-	reISODateTime = regexp.MustCompile(`(?i)(?:\\d\{4\}-|\d{4}-|\[0-9\]\{4\}-|-(?:0[1-9]|1[0-2])-|-(?:0\[1-9\]|1\[0-2\])-|T\.\*Z|T\.\*|T\\d\{2\}|T\d{2}:\d{2}|\bUTC\b)`)
+	reUUIDPattern  = regexp.MustCompile(`(?i)(?:\[[0-9a-fA-F_\\]+\]\{8\}-\[[0-9a-fA-F_\\]+\]\{4\}|\[(?:0-9a-f|a-f0-9)[^\]]*\]\{8\}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4})`)
+	reISODateTime  = regexp.MustCompile(`(?i)(?:\\d\{4\}-|\d{4}-|\[0-9\]\{4\}-|-(?:0[1-9]|1[0-2])-|-(?:0\[1-9\]|1\[0-2\])-|T\.\*Z|T\.\*|T\\d\{2\}|T\d{2}:\d{2}|\bUTC\b)`)
 	reEmailPattern = regexp.MustCompile(`(?i)@.*(?:\.\w{2,}|\.com|\.org)`)
 	reURIPattern   = regexp.MustCompile(`(?i)https?://`)
 )
@@ -66,6 +66,11 @@ func CondenseTool(tool mcp.Tool, opts ...any) mcp.Tool {
 	// 2. Condense InputSchema description and properties
 	out.InputSchema = CondenseInputSchema(out.InputSchema, opt)
 
+	// 3. Condense OutputSchema if present
+	if len(out.OutputSchema) > 0 {
+		out.OutputSchema = CondenseNode(out.OutputSchema, opt)
+	}
+
 	return out
 }
 
@@ -79,7 +84,7 @@ func CondenseToolsList(tools []mcp.Tool, opts ...any) []mcp.Tool {
 	return result
 }
 
-// CondenseInputSchema condenses description and properties in an mcp.InputSchema.
+// CondenseInputSchema condenses description and sub-schemas in an mcp.InputSchema.
 func CondenseInputSchema(s mcp.InputSchema, opts CondenseOptions) mcp.InputSchema {
 	out := s
 
@@ -89,6 +94,38 @@ func CondenseInputSchema(s mcp.InputSchema, opts CondenseOptions) mcp.InputSchem
 
 	if len(out.Properties) > 0 {
 		out.Properties = CondensePropertiesMap(out.Properties, opts)
+	}
+
+	if len(out.Defs) > 0 {
+		out.Defs = CondensePropertiesMap(out.Defs, opts)
+	}
+
+	if len(out.Definitions) > 0 {
+		out.Definitions = CondensePropertiesMap(out.Definitions, opts)
+	}
+
+	if len(out.PatternProperties) > 0 {
+		out.PatternProperties = CondensePropertiesMap(out.PatternProperties, opts)
+	}
+
+	if len(out.DependentSchemas) > 0 {
+		out.DependentSchemas = CondensePropertiesMap(out.DependentSchemas, opts)
+	}
+
+	if len(out.AnyOf) > 0 {
+		out.AnyOf = condenseNodeSlice(out.AnyOf, opts)
+	}
+
+	if len(out.OneOf) > 0 {
+		out.OneOf = condenseNodeSlice(out.OneOf, opts)
+	}
+
+	if len(out.AllOf) > 0 {
+		out.AllOf = condenseNodeSlice(out.AllOf, opts)
+	}
+
+	if len(out.Not) > 0 {
+		out.Not = CondenseNode(out.Not, opts)
 	}
 
 	if addPropsMap, ok := out.AdditionalProperties.(map[string]any); ok {
@@ -148,9 +185,15 @@ func CondenseNode(node map[string]any, opts CondenseOptions) map[string]any {
 		}
 	}
 
-	// 3. Recursive traversal for nested object structures
-	if propsVal, ok := out["properties"].(map[string]any); ok {
-		out["properties"] = CondensePropertiesMap(propsVal, opts)
+	// 3. Recursive traversal for nested object structures and schema definitions
+	for _, mapKey := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
+		if subMap, ok := out[mapKey].(map[string]any); ok {
+			out[mapKey] = CondensePropertiesMap(subMap, opts)
+		}
+	}
+
+	if addPropsMap, ok := out["additionalProperties"].(map[string]any); ok {
+		out["additionalProperties"] = CondenseNode(addPropsMap, opts)
 	}
 
 	if itemsVal, ok := out["items"].(map[string]any); ok {
@@ -159,14 +202,16 @@ func CondenseNode(node map[string]any, opts CondenseOptions) map[string]any {
 		out["items"] = condenseNodeSlice(itemsArr, opts)
 	}
 
-	if allOfArr, ok := out["allOf"].([]any); ok {
-		out["allOf"] = condenseNodeSlice(allOfArr, opts)
+	for _, unionKey := range []string{"allOf", "anyOf", "oneOf"} {
+		if unionArr, ok := out[unionKey].([]any); ok {
+			out[unionKey] = condenseNodeSlice(unionArr, opts)
+		}
 	}
-	if anyOfArr, ok := out["anyOf"].([]any); ok {
-		out["anyOf"] = condenseNodeSlice(anyOfArr, opts)
-	}
-	if oneOfArr, ok := out["oneOf"].([]any); ok {
-		out["oneOf"] = condenseNodeSlice(oneOfArr, opts)
+
+	for _, condKey := range []string{"not", "if", "then", "else"} {
+		if condMap, ok := out[condKey].(map[string]any); ok {
+			out[condKey] = CondenseNode(condMap, opts)
+		}
 	}
 
 	return out
@@ -194,36 +239,45 @@ func CondenseDescription(desc string, maxLen int, opts CondenseOptions) string {
 	cleaned := raw
 
 	// Step A: Strip markdown code blocks (```...```)
-	if opts.StripCodeBlocks {
+	if opts.StripCodeBlocks && strings.Contains(cleaned, "```") {
 		cleaned = reCodeBlock.ReplaceAllString(cleaned, "")
 	}
 
 	// Step B: Strip markdown links [Text](url) -> Text
-	cleaned = reMarkdownLink.ReplaceAllString(cleaned, "$1")
+	if strings.IndexByte(cleaned, '[') >= 0 && strings.IndexByte(cleaned, '(') >= 0 {
+		cleaned = reMarkdownLink.ReplaceAllString(cleaned, "$1")
+	}
 
 	// Step C: Strip HTML tags
-	if opts.StripHTMLTags {
+	if opts.StripHTMLTags && strings.IndexByte(cleaned, '<') >= 0 && strings.IndexByte(cleaned, '>') >= 0 {
 		cleaned = reHTMLTag.ReplaceAllString(cleaned, "")
 	}
 
 	// Step D: Strip formatting marks (**bold**, *italic*, headers)
-	cleaned = reMarkdownFormat.ReplaceAllString(cleaned, "")
-	cleaned = reMarkdownHeader.ReplaceAllString(cleaned, "")
+	if strings.IndexAny(cleaned, "*_~") >= 0 {
+		cleaned = reMarkdownFormat.ReplaceAllString(cleaned, "")
+	}
+	if strings.IndexByte(cleaned, '#') >= 0 {
+		cleaned = reMarkdownHeader.ReplaceAllString(cleaned, "")
+	}
 
 	// Step E: Strip tutorial bullet and numbered step markers
 	if opts.StripTutorialLists {
-		cleaned = reTutorialBullets.ReplaceAllString(cleaned, "")
-		cleaned = reNumberedSteps.ReplaceAllString(cleaned, "")
+		if strings.IndexAny(cleaned, "-*\u2022") >= 0 {
+			cleaned = reTutorialBullets.ReplaceAllString(cleaned, "")
+		}
+		if strings.IndexAny(cleaned, "0123456789") >= 0 && strings.IndexAny(cleaned, ".)") >= 0 {
+			cleaned = reNumberedSteps.ReplaceAllString(cleaned, "")
+		}
 	}
 
 	// Step F: Strip meta-phrases (e.g. "IMPORTANT:", "Selection Process:")
-	if opts.StripInstructionMeta {
+	if opts.StripInstructionMeta && strings.IndexByte(cleaned, ':') >= 0 {
 		cleaned = reInstructionMeta.ReplaceAllString(cleaned, "")
 	}
 
-	// Step G: Normalize spaces and newlines
-	cleaned = reMultipleSpaces.ReplaceAllString(cleaned, " ")
-	cleaned = strings.TrimSpace(cleaned)
+	// Step G: Normalize spaces and newlines without regex overhead
+	cleaned = collapseWhitespaceFast(cleaned)
 
 	if cleaned == "" {
 		return truncateWordBoundary(raw, maxLen)
@@ -238,6 +292,40 @@ func CondenseDescription(desc string, maxLen int, opts CondenseOptions) string {
 	return truncateWordBoundary(cleaned, maxLen)
 }
 
+func collapseWhitespaceFast(s string) string {
+	needsCollapse := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\n' || c == '\r' || c == '\t' || (c == ' ' && (i == 0 || i+1 == len(s) || s[i+1] == ' ')) {
+			needsCollapse = true
+			break
+		}
+	}
+	if !needsCollapse {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s))
+	inSpace := true // trims leading whitespace automatically
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if !inSpace {
+				sb.WriteByte(' ')
+				inSpace = true
+			}
+			continue
+		}
+		sb.WriteByte(c)
+		inSpace = false
+	}
+	out := sb.String()
+	if len(out) > 0 && out[len(out)-1] == ' ' {
+		return out[:len(out)-1]
+	}
+	return out
+}
+
 // extractFirstSentence finds the first grammatical sentence avoiding common abbreviation traps.
 func extractFirstSentence(text string) string {
 	runes := []rune(text)
@@ -246,11 +334,15 @@ func extractFirstSentence(text string) string {
 	for i := 0; i < n; i++ {
 		r := runes[i]
 		if r == '.' || r == '!' || r == '?' {
-			// Check if this is an abbreviation
-			prefix := strings.ToLower(string(runes[:i+1]))
+			// Check only the trailing window (max 6 runes) for abbreviations
+			winStart := i - 5
+			if winStart < 0 {
+				winStart = 0
+			}
+			tail := strings.ToLower(string(runes[winStart : i+1]))
 			isAbbrev := false
 			for _, abbrev := range commonAbbreviations {
-				if strings.HasSuffix(prefix, abbrev) {
+				if strings.HasSuffix(tail, abbrev) {
 					isAbbrev = true
 					break
 				}
@@ -270,25 +362,34 @@ func extractFirstSentence(text string) string {
 	return text
 }
 
-// truncateWordBoundary ensures truncation happens cleanly between words with an ellipsis.
+// truncateWordBoundary ensures UTF-8 rune-safe truncation cleanly between words with an ASCII ellipsis.
 func truncateWordBoundary(text string, maxLen int) string {
 	text = strings.TrimSpace(text)
-	if len(text) <= maxLen {
+	if maxLen <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxLen {
 		return text
 	}
-
-	target := maxLen - 1
-	if target <= 0 {
-		return text[:maxLen]
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
 	}
 
-	sub := text[:target]
-	lastSpace := strings.LastIndexFunc(sub, unicode.IsSpace)
-	if lastSpace > target/2 {
-		return strings.TrimRight(sub[:lastSpace], ",;:-.") + "…"
+	cutoff := maxLen - 3
+	lastSpace := -1
+	for i := cutoff; i >= 0; i-- {
+		if unicode.IsSpace(runes[i]) {
+			lastSpace = i
+			break
+		}
 	}
 
-	return strings.TrimRight(sub, ",;:-.") + "…"
+	if lastSpace > cutoff/2 {
+		return strings.TrimRight(string(runes[:lastSpace]), " ,;:-.") + "..."
+	}
+
+	return strings.TrimRight(string(runes[:cutoff]), " ,;:-.") + "..."
 }
 
 // NormalizeRegex evaluates a regex pattern and format, returning the simplified version.

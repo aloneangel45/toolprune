@@ -69,6 +69,12 @@ func ValidateTool(tool mcp.Tool) ValidationResult {
 	}
 
 	// 2. Required Array Referential Integrity & Uniqueness
+	hasCompositeOrDefs := len(tool.InputSchema.AnyOf) > 0 ||
+		len(tool.InputSchema.OneOf) > 0 ||
+		len(tool.InputSchema.AllOf) > 0 ||
+		len(tool.InputSchema.Defs) > 0 ||
+		len(tool.InputSchema.Definitions) > 0
+
 	seenRequired := make(map[string]bool, len(tool.InputSchema.Required))
 	for _, req := range tool.InputSchema.Required {
 		if seenRequired[req] {
@@ -84,15 +90,17 @@ func ValidateTool(tool mcp.Tool) ValidationResult {
 		seenRequired[req] = true
 
 		if tool.InputSchema.Properties == nil {
-			errs = append(errs, ValidationError{
-				Code:     ErrRequiredPropMissing,
-				Tool:     tool.Name,
-				Path:     fmt.Sprintf("/inputSchema/required/%s", req),
-				Expected: "property defined in /properties",
-				Actual:   "properties map is nil",
-				Message:  fmt.Sprintf("Required property %q is missing from properties map", req),
-			})
-		} else if _, exists := tool.InputSchema.Properties[req]; !exists {
+			if !hasCompositeOrDefs {
+				errs = append(errs, ValidationError{
+					Code:     ErrRequiredPropMissing,
+					Tool:     tool.Name,
+					Path:     fmt.Sprintf("/inputSchema/required/%s", req),
+					Expected: "property defined in /properties",
+					Actual:   "properties map is nil",
+					Message:  fmt.Sprintf("Required property %q is missing from properties map", req),
+				})
+			}
+		} else if _, exists := tool.InputSchema.Properties[req]; !exists && !hasCompositeOrDefs {
 			errs = append(errs, ValidationError{
 				Code:     ErrRequiredPropMissing,
 				Tool:     tool.Name,
@@ -104,9 +112,21 @@ func ValidateTool(tool mcp.Tool) ValidationResult {
 		}
 	}
 
-	// 3. Properties validation
+	// 3. Properties and Definitions validation
 	if tool.InputSchema.Properties != nil {
 		validateProperties(tool.Name, "/inputSchema/properties", tool.InputSchema.Properties, &errs)
+	}
+	if tool.InputSchema.Defs != nil {
+		validateProperties(tool.Name, "/inputSchema/$defs", tool.InputSchema.Defs, &errs)
+	}
+	if tool.InputSchema.Definitions != nil {
+		validateProperties(tool.Name, "/inputSchema/definitions", tool.InputSchema.Definitions, &errs)
+	}
+	if tool.InputSchema.PatternProperties != nil {
+		validateProperties(tool.Name, "/inputSchema/patternProperties", tool.InputSchema.PatternProperties, &errs)
+	}
+	if tool.InputSchema.DependentSchemas != nil {
+		validateProperties(tool.Name, "/inputSchema/dependentSchemas", tool.InputSchema.DependentSchemas, &errs)
 	}
 
 	return ValidationResult{

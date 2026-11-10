@@ -412,3 +412,123 @@ func TestFraming_Writer_Concurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestID_FractionalAndInvalidTypes(t *testing.T) {
+	// Fractional JSON-RPC ID must preserve numeric representation
+	var fracID mcp.RequestID
+	if err := json.Unmarshal([]byte("12.5"), &fracID); err != nil {
+		t.Fatalf("unexpected error on fractional ID: %v", err)
+	}
+	if !fracID.IsFloat() || fracID.String() != "12.5" {
+		t.Fatalf("expected float ID 12.5, got kind=%v str=%q", fracID.Kind(), fracID.String())
+	}
+	marshaled, err := json.Marshal(fracID)
+	if err != nil || string(marshaled) != "12.5" {
+		t.Fatalf("expected marshaled 12.5, got %s (err=%v)", string(marshaled), err)
+	}
+
+	// Booleans, arrays, and objects must be rejected
+	for _, invalid := range []string{"true", "false", "[1]", `{"a":1}`} {
+		var badID mcp.RequestID
+		if err := json.Unmarshal([]byte(invalid), &badID); err == nil {
+			t.Fatalf("expected error unmarshaling invalid request ID %s, got %+v", invalid, badID)
+		}
+	}
+}
+
+func TestMessage_ExplicitNullIDNotNotification(t *testing.T) {
+	var msg mcp.Message
+	if err := json.Unmarshal([]byte(`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`), &msg); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if msg.IsNotification() {
+		t.Fatal("message with explicit id:null must NOT be classified as notification")
+	}
+	if !msg.HasExplicitNullID() {
+		t.Fatal("expected HasExplicitNullID to be true")
+	}
+	if err := msg.ValidateEnvelope(); !errors.Is(err, mcp.ErrInvalidRequest) {
+		t.Fatalf("expected ErrInvalidRequest on request with id:null, got %v", err)
+	}
+}
+
+func TestFraming_RecoverAfterOversizedLine(t *testing.T) {
+	oversized := `{"jsonrpc":"2.0","id":1,"method":"big","params":{"x":"` + strings.Repeat("A", 1024) + `"}}` + "\n"
+	validNext := `{"jsonrpc":"2.0","id":2,"method":"ping"}` + "\n"
+
+	r := mcp.NewReaderWithSize(strings.NewReader(oversized+validNext), 256)
+	_, err := r.ReadMessage()
+	if !errors.Is(err, mcp.ErrMessageTooLarge) {
+		t.Fatalf("expected ErrMessageTooLarge on first line, got %v", err)
+	}
+
+	nextMsg, err := r.ReadMessage()
+	if err != nil {
+		t.Fatalf("expected stream recovery on second line, got error: %v", err)
+	}
+	if nextMsg.Method != "ping" || nextMsg.ID.String() != "2" {
+		t.Fatalf("unexpected recovered message: %+v", nextMsg)
+	}
+}
+
+func TestModernMCPToolAndSchemaFieldsPreserved(t *testing.T) {
+	rawToolJSON := `{
+		"name": "pydantic_query",
+		"title": "Pydantic Database Query",
+		"description": "Execute typed SQL query",
+		"annotations": {
+			"title": "Read-Only SQL",
+			"readOnlyHint": true,
+			"destructiveHint": false,
+			"idempotentHint": true,
+			"openWorldHint": false
+		},
+		"icons": [{"src": "https://example.com/db.png", "mimeType": "image/png", "sizes": ["32x32"]}],
+		"outputSchema": {
+			"type": "object",
+			"properties": {"rows": {"type": "array", "items": {"type": "object"}}}
+		},
+		"inputSchema": {
+			"type": "object",
+			"$defs": {
+				"Filter": {
+					"type": "object",
+					"properties": {"col": {"type": "string"}, "val": {"type": "string"}},
+					"required": ["col"]
+				}
+			},
+			"properties": {
+				"filter": {"$ref": "#/$defs/Filter"}
+			},
+			"anyOf": [{"required": ["filter"]}],
+			"minProperties": 1,
+			"maxProperties": 5
+		}
+	}`
+
+	var tool mcp.Tool
+	if err := json.Unmarshal([]byte(rawToolJSON), &tool); err != nil {
+		t.Fatalf("unmarshal modern tool failed: %v", err)
+	}
+	if tool.Title != "Pydantic Database Query" {
+		t.Fatalf("title lost: %q", tool.Title)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint != false {
+		t.Fatalf("annotations destructiveHint=false lost: %+v", tool.Annotations)
+	}
+	if len(tool.Icons) != 1 || tool.Icons[0].Src != "https://example.com/db.png" {
+		t.Fatalf("icons lost: %+v", tool.Icons)
+	}
+	if len(tool.OutputSchema) == 0 {
+		t.Fatal("outputSchema lost")
+	}
+	if len(tool.InputSchema.Defs) == 0 {
+		t.Fatal("root $defs lost")
+	}
+	if len(tool.InputSchema.AnyOf) != 1 {
+		t.Fatal("root anyOf lost")
+	}
+	if tool.InputSchema.MinProperties == nil || *tool.InputSchema.MinProperties != 1 {
+		t.Fatal("minProperties lost")
+	}
+}

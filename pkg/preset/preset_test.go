@@ -157,6 +157,7 @@ func TestValidateSchema(t *testing.T) {
 	}{
 		{"valid stdio", `{"mcpServers":{"a":{"command":"toolprune","args":["proxy"]}}}`, false},
 		{"valid remote", `{"mcpServers":{"a":{"serverUrl":"http://127.0.0.1:8080/sse"}}}`, false},
+		{"valid remote cursor url", `{"mcpServers":{"a":{"url":"http://127.0.0.1:8080/mcp"}}}`, false},
 		{"valid with env", `{"mcpServers":{"a":{"command":"x","env":{"K":"V"}}}}`, false},
 		{"missing mcpServers", `{}`, true},
 		{"empty mcpServers", `{"mcpServers":{}}`, true},

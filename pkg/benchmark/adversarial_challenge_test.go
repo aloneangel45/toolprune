@@ -51,7 +51,7 @@ func TestAdversarialSpecialTokens(t *testing.T) {
 }
 
 // TestAdversarialCalibratedEstimatorDrift tests calibrated estimator accuracy and drift
-// across various payload sizes and structures (ASCII, Unicode, Emojis, repetitive strings).
+// across various payload sizes and structures (ASCII, Unicode, 4-byte UTF-8, repetitive strings).
 func TestAdversarialCalibratedEstimatorDrift(t *testing.T) {
 	testCases := []struct {
 		name    string
@@ -67,7 +67,7 @@ func TestAdversarialCalibratedEstimatorDrift(t *testing.T) {
 		{"unicode_japanese", strings.Repeat("これはMCPツールのベンチマークテスト用の日本語テキストです。", 100)},
 		{"unicode_cyrillic", strings.Repeat("Это тестовая строка для проверки токенизатора ToolPrune.", 100)},
 		{"unicode_arabic", strings.Repeat("هذا نص اختبار لبروتوكول سياق النموذج وأداة تشذيب المخطط.", 100)},
-		{"emojis", strings.Repeat("🚀✨🔥🎉🤖📦🛡️💻⚡📈", 200)},
+		{"astral_4byte_utf8", strings.Repeat("\U0001D538\U0001D539\U0001D53A\U0001D53B\U00010300\U00010301\U0001D400\U0001D401", 200)},
 		{"deeply_escaped_json", strings.Repeat(`{\"nested\": \"value with \\\"quotes\\\" and \\n newlines\"}`, 200)},
 		{"huge_ascii_1mb", strings.Repeat("abcdefghijklmnopqrstuvwxyz0123456789 \n", 28000)},
 	}
@@ -383,7 +383,6 @@ func TestAdversarialEncoderSequentialReset(t *testing.T) {
 		t.Errorf("token count mismatch after reset: %d vs %d", toks1, toks2)
 	}
 }
-
 
 // TestAdversarialTableFormatterRobustness verifies table and markdown generation on extreme values.
 func TestAdversarialTableFormatterRobustness(t *testing.T) {

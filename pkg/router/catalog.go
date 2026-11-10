@@ -65,8 +65,9 @@ func ProjectCompactTool(tool mcp.Tool, cfg CatalogConfig) mcp.Tool {
 	// Optionally append required parameter hints: "Required: p1, p2."
 	if cfg.IncludeRequiredInSummary && len(tool.InputSchema.Required) > 0 {
 		reqList := strings.Join(tool.InputSchema.Required, ", ")
-		if len(reqList) > 40 {
-			reqList = reqList[:37] + "..."
+		reqRunes := []rune(reqList)
+		if len(reqRunes) > 40 {
+			reqList = string(reqRunes[:37]) + "..."
 		}
 		if desc != "" && !strings.HasSuffix(desc, ".") {
 			desc += "."
