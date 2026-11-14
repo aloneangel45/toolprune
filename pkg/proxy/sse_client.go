@@ -42,7 +42,9 @@ type SSEClientTransport struct {
 	sessionID   string
 	sseRespBody io.ReadCloser
 
+	recvMu    sync.RWMutex
 	recvCh    chan *mcp.Message
+	doneCh    chan struct{}
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closed    atomic.Bool
@@ -57,8 +59,11 @@ func NewSSEClientTransport(cfg SSEClientConfig) (*SSEClientTransport, error) {
 		return nil, errors.New("SSE upstream URL cannot be empty")
 	}
 	parsed, err := url.Parse(rawURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return nil, fmt.Errorf("invalid SSE upstream URL %q: %w", rawURL, err)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
+		if err != nil {
+			return nil, fmt.Errorf("invalid SSE upstream URL %q: %w", rawURL, err)
+		}
+		return nil, fmt.Errorf("invalid SSE upstream URL %q: must include http/https scheme and host", rawURL)
 	}
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 15 * time.Second
@@ -87,6 +92,7 @@ func NewSSEClientTransport(cfg SSEClientConfig) (*SSEClientTransport, error) {
 		},
 		logger: logger,
 		recvCh: make(chan *mcp.Message, 256),
+		doneCh: make(chan struct{}),
 		ctx:    ctx,
 		cancel: cancel,
 	}, nil
@@ -98,25 +104,26 @@ func ExtractHTTPHeadersFromEnv(env map[string]string) map[string]string {
 	if len(env) == 0 {
 		return nil
 	}
+	const customPrefix = "HTTP_HEADER_"
 	headers := make(map[string]string)
 	for k, v := range env {
 		if strings.TrimSpace(v) == "" {
 			continue
 		}
-		upper := strings.ToUpper(strings.TrimSpace(k))
+		trimmedKey := strings.TrimSpace(k)
 		switch {
-		case upper == "AUTHORIZATION":
+		case strings.EqualFold(trimmedKey, "AUTHORIZATION"):
 			headers["Authorization"] = v
-		case upper == "BEARER_TOKEN":
+		case strings.EqualFold(trimmedKey, "BEARER_TOKEN"):
 			if strings.HasPrefix(strings.ToLower(v), "bearer ") {
 				headers["Authorization"] = v
 			} else {
 				headers["Authorization"] = "Bearer " + v
 			}
-		case upper == "X_API_KEY" || upper == "API_KEY":
+		case strings.EqualFold(trimmedKey, "X_API_KEY") || strings.EqualFold(trimmedKey, "API_KEY"):
 			headers["X-API-Key"] = v
-		case strings.HasPrefix(upper, "HTTP_HEADER_"):
-			rawName := strings.TrimPrefix(k, k[:len("HTTP_HEADER_")])
+		case len(trimmedKey) > len(customPrefix) && strings.EqualFold(trimmedKey[:len(customPrefix)], customPrefix):
+			rawName := strings.TrimSpace(trimmedKey[len(customPrefix):])
 			headerName := strings.ReplaceAll(rawName, "_", "-")
 			if headerName != "" {
 				headers[headerName] = v
@@ -129,15 +136,12 @@ func ExtractHTTPHeadersFromEnv(env map[string]string) map[string]string {
 // Start establishes the SSE event stream if supported by the remote endpoint, or falls back
 // cleanly to stateless/session Streamable HTTP POST mode if GET returns 405 Method Not Allowed.
 func (t *SSEClientTransport) Start(parentCtx context.Context) error {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	reqCtx, cancel := context.WithCancel(t.ctx)
-	go func() {
-		select {
-		case <-parentCtx.Done():
-			cancel()
-		case <-t.ctx.Done():
-			cancel()
-		}
-	}()
+	stopWatch := context.AfterFunc(parentCtx, cancel)
+	defer stopWatch()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, t.baseURL.String(), nil)
 	if err != nil {
@@ -307,16 +311,25 @@ func (t *SSEClientTransport) enqueueMessage(msg *mcp.Message) {
 	if msg == nil || t.closed.Load() {
 		return
 	}
+	t.recvMu.RLock()
+	defer t.recvMu.RUnlock()
+	if t.closed.Load() {
+		return
+	}
 	select {
 	case t.recvCh <- msg:
 	case <-t.ctx.Done():
+	case <-t.doneCh:
 	}
 }
 
 func (t *SSEClientTransport) closeRecvChannel() {
 	t.closeOnce.Do(func() {
 		t.closed.Store(true)
+		close(t.doneCh)
+		t.recvMu.Lock()
 		close(t.recvCh)
+		t.recvMu.Unlock()
 	})
 }
 
@@ -501,7 +514,7 @@ func (t *SSEClientTransport) Receive() (*mcp.Message, error) {
 	return msg, nil
 }
 
-// Close terminates the remote SSE connection and releases background goroutines.
+// Close terminates the remote SSE connection and releases background goroutines and pooled HTTP sockets.
 func (t *SSEClientTransport) Close() error {
 	t.cancel()
 	t.mu.Lock()
@@ -513,5 +526,11 @@ func (t *SSEClientTransport) Close() error {
 	}
 	t.closeRecvChannel()
 	t.wg.Wait()
+	if t.sseClient != nil {
+		t.sseClient.CloseIdleConnections()
+	}
+	if t.client != nil {
+		t.client.CloseIdleConnections()
+	}
 	return nil
 }

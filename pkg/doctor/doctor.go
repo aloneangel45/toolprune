@@ -458,13 +458,14 @@ func inspectSingleClientConfig(t clientTarget) ClientConfigCheck {
 		res.Warning = fmt.Sprintf("unable to read file: %v", err)
 		return res
 	}
-	if len(strings.TrimSpace(string(data))) == 0 {
+	clean := preset.NormalizeJSONC(data)
+	if len(strings.TrimSpace(string(clean))) == 0 {
 		res.Status = "ok"
 		return res
 	}
 
 	var top map[string]any
-	if err := json.Unmarshal(data, &top); err != nil || top == nil {
+	if err := json.Unmarshal(clean, &top); err != nil || top == nil {
 		res.Status = "warn"
 		res.Warning = "file is not valid JSON"
 		return res

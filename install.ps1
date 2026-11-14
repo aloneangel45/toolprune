@@ -21,7 +21,7 @@ Write-Host ">>> [INFO] Detected architecture: Windows/$Arch" -ForegroundColor Gr
 
 # 2. Resolve Latest Release
 Write-Host ">>> [INFO] Resolving latest release version from GitHub..." -ForegroundColor Gray
-$Tag = "v1.3.0"
+$Tag = "v1.3.1"
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $ReleaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 10
@@ -81,18 +81,32 @@ try {
         exit 1
     }
 
-    $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $FileStream = [System.IO.File]::OpenRead($ZipPath)
+        try {
+            $HashBytes = $Sha256.ComputeHash($FileStream)
+        } finally {
+            $FileStream.Dispose()
+        }
+    } finally {
+        $Sha256.Dispose()
+    }
+    $ActualHash = [System.BitConverter]::ToString($HashBytes).Replace("-", "").ToLowerInvariant()
     if ($ActualHash -ne $ExpectedHash) {
         Write-Error "SHA-256 checksum mismatch for $ArchiveName (expected $ExpectedHash, got $ActualHash)"
         exit 1
     }
     Write-Host ">>> [INFO] SHA-256 checksum verified: $ActualHash" -ForegroundColor Green
 
-    # 5. Extract and Install
+    # 5. Extract and Install (using built-in .NET ZipFile for restricted PSModulePath sessions)
     Write-Host ">>> [INFO] Extracting archive..." -ForegroundColor Gray
-    Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $ExtractDir = Join-Path $TempDir "extracted"
+    New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractDir)
 
-    $ExtractedBinary = Get-ChildItem -Path $TempDir -Filter "*.exe" -Recurse | Select-Object -First 1
+    $ExtractedBinary = Get-ChildItem -Path $ExtractDir -Filter "*.exe" -Recurse | Select-Object -First 1
     if (-not $ExtractedBinary) {
         Write-Error "Extraction failed: Executable not found in archive."
         exit 1
@@ -111,9 +125,25 @@ try {
 
 # 7. Ensure PATH is updated in User Environment
 $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($UserPath -notlike "*$InstallDir*") {
+$NormalizedInstallDir = $InstallDir.TrimEnd('\', '/')
+$PathEntries = @()
+if ($UserPath) {
+    $PathEntries = $UserPath -split ';' | Where-Object { $_ -and $_.Trim() -ne "" }
+}
+$AlreadyInPath = $false
+foreach ($Entry in $PathEntries) {
+    if ($Entry.Trim().TrimEnd('\', '/').Equals($NormalizedInstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $AlreadyInPath = $true
+        break
+    }
+}
+if (-not $AlreadyInPath) {
     Write-Host ">>> [INFO] Adding $InstallDir to User PATH..." -ForegroundColor Cyan
-    $NewPath = "$InstallDir;$UserPath"
+    if ($PathEntries.Count -gt 0) {
+        $NewPath = "$InstallDir;$UserPath"
+    } else {
+        $NewPath = $InstallDir
+    }
     [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
     $env:PATH = "$InstallDir;$env:PATH"
 }

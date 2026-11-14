@@ -271,6 +271,9 @@ func (p *Proxy) Stats() SessionStatsSnapshot {
 
 // RegisterClient adds an active client session.
 func (p *Proxy) RegisterClient(session ClientSession) {
+	if session == nil {
+		return
+	}
 	p.clientsMu.Lock()
 	defer p.clientsMu.Unlock()
 	p.clients[session.ID()] = session
@@ -435,6 +438,9 @@ func (p *Proxy) handleClientRequest(session ClientSession, msg *mcp.Message) err
 
 // handleClientNotification forwards notifications to upstream.
 func (p *Proxy) handleClientNotification(session ClientSession, msg *mcp.Message) error {
+	if p.upstream == nil {
+		return errors.New("upstream transport is nil")
+	}
 	switch msg.Method {
 	case "notifications/cancelled":
 		slog.Info("client requested request cancellation", "params", string(msg.Params))
@@ -449,12 +455,18 @@ func (p *Proxy) handleClientNotification(session ClientSession, msg *mcp.Message
 
 // handleClientResponse forwards client responses (e.g. sampling responses) to upstream.
 func (p *Proxy) handleClientResponse(session ClientSession, msg *mcp.Message) error {
+	if p.upstream == nil {
+		return errors.New("upstream transport is nil")
+	}
 	return p.upstream.Send(msg)
 }
 
 // runUpstreamLoop continuously reads responses and notifications from upstream.
 func (p *Proxy) runUpstreamLoop() {
 	defer p.wg.Done()
+	if p.upstream == nil {
+		return
+	}
 
 	for {
 		select {
@@ -556,7 +568,7 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 				if p.streamFilter != nil {
 					p.streamFilter.RegisterRawTools(tools, true, nil)
 					if p.config.MaxSchemaTokens > 0 && prunerEngine != nil {
-						if budgeted, bMetrics, bErr := p.streamFilter.FilterToolsList(projected, prunerEngine); bErr == nil {
+						if budgeted, bMetrics, bErr := p.streamFilter.FilterProjectedToolsList(projected, prunerEngine); bErr == nil {
 							projected = budgeted
 							p.rawTokensTotal.Add(uint64(bMetrics.RawTokens))
 							p.prunedTokensTotal.Add(uint64(bMetrics.PrunedTokens))

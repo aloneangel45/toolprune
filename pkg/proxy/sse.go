@@ -646,9 +646,9 @@ func (s *SSEServer) Start() error {
 
 // Shutdown gracefully terminates all active SSE streams and stops the server.
 func (s *SSEServer) Shutdown(ctx context.Context) error {
+	s.cancel()
+	s.sessions.CloseAll()
 	if s.running.CompareAndSwap(true, false) {
-		s.cancel()
-		s.sessions.CloseAll()
 		if s.httpSrv != nil {
 			return s.httpSrv.Shutdown(ctx)
 		}

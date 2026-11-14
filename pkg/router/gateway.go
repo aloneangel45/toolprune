@@ -57,7 +57,7 @@ func NewRouterGateway(r *Router, cfg GatewayConfig) *RouterGateway {
 		cfg.RequestTimeout = 60 * time.Second
 	}
 	if cfg.ServerVersion == "" {
-		cfg.ServerVersion = "1.3.0"
+		cfg.ServerVersion = "1.3.1"
 	}
 	if cfg.DebounceInterval <= 0 {
 		cfg.DebounceInterval = 50 * time.Millisecond
@@ -111,6 +111,9 @@ func (g *RouterGateway) Shutdown() {
 
 // RegisterClient satisfies proxy.MessageDispatcher.
 func (g *RouterGateway) RegisterClient(session proxy.ClientSession) {
+	if session == nil {
+		return
+	}
 	g.clientsMu.Lock()
 	defer g.clientsMu.Unlock()
 	g.clients[session.ID()] = session

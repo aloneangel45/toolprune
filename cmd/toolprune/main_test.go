@@ -261,3 +261,109 @@ func TestResolvePresetTierMapping(t *testing.T) {
 		t.Errorf("expected error for invalid preset")
 	}
 }
+
+func TestConfigPatchClaude_CrossPlatformAndModeValidationAndJSONC(t *testing.T) {
+	dir := t.TempDir()
+	claudeCfgPath := dir + "/claude_desktop_config.json"
+
+	// Include UTF-8 BOM, JSONC comments, trailing commas, and both Windows & POSIX toolprune paths
+	initial := "\xef\xbb\xbf" + `{
+  // Claude Desktop config with comments
+  "mcpServers": {
+    "win_wrapped": {
+      "command": "C:\\Users\\alice\\.local\\bin\\toolprune.exe",
+      "args": ["proxy", "--", "npx", "server-a"],
+    },
+    "posix_wrapped": {
+      "command": "/usr/local/bin/toolprune",
+      "args": ["proxy", "--", "uvx", "server-b"],
+    },
+    "unwrapped_git": {
+      "command": "uvx",
+      "args": ["mcp-server-git",],
+    },
+  },
+}`
+	if err := os.WriteFile(claudeCfgPath, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Invalid --mode must fail before modifying disk
+	badBuf := new(bytes.Buffer)
+	rootCmd.SetOut(badBuf)
+	rootCmd.SetErr(badBuf)
+	rootCmd.SetArgs([]string{"config", "patch-claude", "--path", claudeCfgPath, "--mode", "bogus_mode"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected error for invalid --mode bogus_mode, got nil")
+	}
+
+	// 2. Valid patch skips both Windows and POSIX toolprune paths and wraps only unwrapped_git
+	okBuf := new(bytes.Buffer)
+	rootCmd.SetOut(okBuf)
+	rootCmd.SetErr(okBuf)
+	rootCmd.SetArgs([]string{"config", "patch-claude", "--path", claudeCfgPath, "--mode", "compact"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("patch-claude failed on JSONC config: %v", err)
+	}
+	if !strings.Contains(okBuf.String(), "(1 wrapped, 2 unchanged)") {
+		t.Errorf("expected 1 wrapped and 2 unchanged, got: %s", okBuf.String())
+	}
+}
+
+func TestCommandFlagIsolationAcrossExecutions(t *testing.T) {
+	// 1. Run version --json, then plain version without manual flag reset
+	buf1 := new(bytes.Buffer)
+	rootCmd.SetOut(buf1)
+	rootCmd.SetErr(buf1)
+	rootCmd.SetArgs([]string{"version", "--json"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("version --json failed: %v", err)
+	}
+	if !strings.Contains(buf1.String(), `"version":`) {
+		t.Fatalf("expected JSON output, got %q", buf1.String())
+	}
+
+	buf2 := new(bytes.Buffer)
+	rootCmd.SetOut(buf2)
+	rootCmd.SetErr(buf2)
+	rootCmd.SetArgs([]string{"version"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("plain version failed: %v", err)
+	}
+	if strings.Contains(buf2.String(), `"version":`) || !strings.Contains(buf2.String(), "ToolPrune v") {
+		t.Errorf("--json flag leaked across version command executions; got:\n%s", buf2.String())
+	}
+
+	// 2. Verify TOOLPRUNE_CONFIG env fallback does not leak globalConfig into subsequent executions
+	configPath := "../../toolprune.yaml"
+	if _, err := os.Stat(configPath); err != nil {
+		configPath = "toolprune.yaml"
+	}
+	t.Setenv("TOOLPRUNE_CONFIG", configPath)
+	buf3 := new(bytes.Buffer)
+	rootCmd.SetOut(buf3)
+	rootCmd.SetErr(buf3)
+	rootCmd.SetArgs([]string{"config", "validate"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("config validate with TOOLPRUNE_CONFIG failed: %v", err)
+	}
+
+	t.Setenv("TOOLPRUNE_CONFIG", "")
+	if globalConfig != "" {
+		t.Errorf("globalConfig leaked after command completion: got %q, want empty", globalConfig)
+	}
+}
+
+func TestSanitizeWrapperUpstreamID(t *testing.T) {
+	cases := map[string]string{
+		`C:\Program Files\Tools\my__mcp.exe`: "my_mcp.exe",
+		`/usr/local/bin/github__server`:      "github_server",
+		`npx`:                                "npx",
+		`   `:                                "upstream",
+	}
+	for in, want := range cases {
+		if got := sanitizeWrapperUpstreamID(in); got != want {
+			t.Errorf("sanitizeWrapperUpstreamID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -4,9 +4,11 @@
 package preset
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -369,9 +371,11 @@ func (c ConfigFile) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON parses the client-appropriate server map while preserving all other top-level keys in ExtraFields.
+// Accepts both strict JSON and JSONC (line/block comments, trailing commas, UTF-8 BOM).
 func (c *ConfigFile) UnmarshalJSON(data []byte) error {
+	clean := NormalizeJSONC(data)
 	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(clean, &raw); err != nil {
 		return err
 	}
 	if raw == nil {
@@ -384,7 +388,7 @@ func (c *ConfigFile) UnmarshalJSON(data []byte) error {
 			var wrapper struct {
 				Servers map[string]ServerSpec `json:"servers"`
 			}
-			if err := json.Unmarshal(data, &wrapper); err != nil {
+			if err := json.Unmarshal(clean, &wrapper); err != nil {
 				return err
 			}
 			c.Servers = wrapper.Servers
@@ -395,7 +399,7 @@ func (c *ConfigFile) UnmarshalJSON(data []byte) error {
 			var wrapper struct {
 				ContextServers map[string]ZedServerSpec `json:"context_servers"`
 			}
-			if err := json.Unmarshal(data, &wrapper); err != nil {
+			if err := json.Unmarshal(clean, &wrapper); err != nil {
 				return err
 			}
 			c.ContextServers = wrapper.ContextServers
@@ -406,7 +410,7 @@ func (c *ConfigFile) UnmarshalJSON(data []byte) error {
 			var wrapper struct {
 				MCPServers map[string]ServerSpec `json:"mcpServers"`
 			}
-			if err := json.Unmarshal(data, &wrapper); err != nil {
+			if err := json.Unmarshal(clean, &wrapper); err != nil {
 				return err
 			}
 			c.MCPServers = wrapper.MCPServers
@@ -417,7 +421,7 @@ func (c *ConfigFile) UnmarshalJSON(data []byte) error {
 			var wrapper struct {
 				MCPServers map[string]ServerSpec `json:"mcpServers"`
 			}
-			if err := json.Unmarshal(data, &wrapper); err != nil {
+			if err := json.Unmarshal(clean, &wrapper); err != nil {
 				return err
 			}
 			c.MCPServers = wrapper.MCPServers
@@ -426,7 +430,7 @@ func (c *ConfigFile) UnmarshalJSON(data []byte) error {
 			var wrapper struct {
 				Servers map[string]ServerSpec `json:"servers"`
 			}
-			if err := json.Unmarshal(data, &wrapper); err != nil {
+			if err := json.Unmarshal(clean, &wrapper); err != nil {
 				return err
 			}
 			c.Servers = wrapper.Servers
@@ -436,7 +440,7 @@ func (c *ConfigFile) UnmarshalJSON(data []byte) error {
 			var wrapper struct {
 				ContextServers map[string]ZedServerSpec `json:"context_servers"`
 			}
-			if err := json.Unmarshal(data, &wrapper); err != nil {
+			if err := json.Unmarshal(clean, &wrapper); err != nil {
 				return err
 			}
 			c.ContextServers = wrapper.ContextServers
@@ -634,12 +638,13 @@ func MergeInto(existingPath string, o Options) (*ConfigFile, error) {
 		}
 		return nil, fmt.Errorf("failed to read existing config %q: %w", existingPath, err)
 	}
-	if len(strings.TrimSpace(string(data))) == 0 {
+	clean := NormalizeJSONC(data)
+	if len(bytes.TrimSpace(clean)) == 0 {
 		return cfg, nil
 	}
 
 	existing := ConfigFile{Client: cfg.Client}
-	if err := json.Unmarshal(data, &existing); err != nil {
+	if err := json.Unmarshal(clean, &existing); err != nil {
 		return nil, fmt.Errorf("existing config %q is not valid JSON: %w", existingPath, err)
 	}
 
@@ -698,14 +703,54 @@ func WriteFile(path string, o Options) error {
 		return fmt.Errorf("failed to marshal %s preset: %w", o.Client, err)
 	}
 	data = append(data, '\n')
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %q: %w", dir, err)
 		}
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := atomicWritePresetFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write %s config %q: %w", o.Client, path, err)
 	}
+	return nil
+}
+
+func atomicWritePresetFile(path string, data []byte, defaultPerm os.FileMode) error {
+	perm := defaultPerm
+	if fi, err := os.Stat(path); err == nil {
+		perm = fi.Mode().Perm()
+	}
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, ".toolprune-preset-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
 	return nil
 }
 
@@ -779,10 +824,14 @@ func ValidateFile(path string, client ...Client) error {
 	return Validate(data)
 }
 
-func inferClientFromPath(path string) (Client, bool) {
-	clean := filepath.Clean(path)
-	base := filepath.Base(clean)
-	parent := filepath.Base(filepath.Dir(clean))
+func inferClientFromPath(p string) (Client, bool) {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return "", false
+	}
+	slashPath := pathpkg.Clean(strings.ReplaceAll(trimmed, `\`, `/`))
+	base := pathpkg.Base(slashPath)
+	parent := pathpkg.Base(pathpkg.Dir(slashPath))
 
 	switch {
 	case parent == ".vscode" && base == "mcp.json":
@@ -801,8 +850,9 @@ func inferClientFromPath(path string) (Client, bool) {
 }
 
 func unmarshalTopLevelObject(data []byte) (map[string]json.RawMessage, error) {
+	clean := NormalizeJSONC(data)
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(clean, &raw); err != nil {
 		return nil, fmt.Errorf("config is not a valid JSON object: %w", err)
 	}
 	if raw == nil {

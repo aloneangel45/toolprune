@@ -71,7 +71,7 @@ Targets:
 	genCmd.Flags().StringVar(&flags.name, "name", "toolprune", "Server name under the client's MCP servers map")
 	genCmd.Flags().StringVar(&flags.command, "command", "toolprune", "Executable used to launch the ToolPrune proxy")
 	genCmd.Flags().StringSliceVar(&flags.args, "args", []string{"proxy"}, "Arguments passed to the proxy command")
-	genCmd.Flags().StringSliceVar(&flags.env, "env", nil, "Extra environment variables as KEY=VALUE (repeatable)")
+	genCmd.Flags().StringArrayVar(&flags.env, "env", nil, "Extra environment variables as KEY=VALUE (repeatable)")
 	genCmd.Flags().StringVar(&flags.serverURL, "server-url", "", "Emit a remote server entry instead of a stdio command (e.g. http://127.0.0.1:8080/sse)")
 	genCmd.Flags().StringVarP(&flags.config, "config", "c", "", "toolprune.yaml path to pass to the proxy as --config")
 	genCmd.Flags().BoolVar(&flags.merge, "merge", false, "Merge into an existing config file at --output, preserving other servers and keys")
@@ -103,7 +103,11 @@ func parseEnvPairs(pairs []string) (map[string]string, error) {
 func splitKeyValue(s string) (string, string, bool) {
 	for i := 0; i < len(s); i++ {
 		if s[i] == '=' {
-			return s[:i], s[i+1:], true
+			k := strings.TrimSpace(s[:i])
+			if k == "" {
+				return "", "", false
+			}
+			return k, s[i+1:], true
 		}
 	}
 	return "", "", false

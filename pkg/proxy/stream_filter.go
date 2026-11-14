@@ -62,6 +62,7 @@ type filterCacheEntry struct {
 	key        uint64
 	tools      []mcp.Tool
 	metrics    BudgetPruneMetrics
+	compacted  bool
 	stubbedMap map[string]bool
 }
 
@@ -170,9 +171,26 @@ func (sf *StreamFilter) RegisterRawTools(rawTools []mcp.Tool, compacted bool, st
 	sf.regMu.Lock()
 	for _, rt := range rawTools {
 		sf.rawRegistry[rt.Name] = rawToolRecord{
-			rawTool:   rt,
+			rawTool:   cloneMCPTool(rt),
 			compacted: compacted || stubbedSet[rt.Name],
 			stubbed:   stubbedSet[rt.Name],
+		}
+	}
+	sf.regMu.Unlock()
+}
+
+func (sf *StreamFilter) markCompactedTools(forceAll bool, stubbedSet map[string]bool) {
+	if !forceAll && len(stubbedSet) == 0 {
+		return
+	}
+	sf.regMu.Lock()
+	for name, rec := range sf.rawRegistry {
+		if forceAll || stubbedSet[name] {
+			rec.compacted = true
+			if stubbedSet[name] {
+				rec.stubbed = true
+			}
+			sf.rawRegistry[name] = rec
 		}
 	}
 	sf.regMu.Unlock()
@@ -227,10 +245,22 @@ func (sf *StreamFilter) ComputeBoostScores(tools []mcp.Tool) (map[string]float64
 	return scores, h.Sum64()
 }
 
-// FilterToolsList applies tier pruning + RFC #1 progressive token-budget compaction with FNV-1a fast-path caching.
+// FilterToolsList applies tier pruning + RFC #1 progressive token-budget compaction with FNV-1a fast-path caching,
+// and registers rawTools in the pre-binding validation registry.
 func (sf *StreamFilter) FilterToolsList(rawTools []mcp.Tool, engine PruneEngine) ([]mcp.Tool, BudgetPruneMetrics, error) {
+	return sf.filterToolsListCore(rawTools, engine, true)
+}
+
+// FilterProjectedToolsList enforces RFC #1 progressive token-budget compaction on an already-projected
+// or pre-pruned tool slice (such as Tier 4 dynamic catalog stubs + meta-tools) WITHOUT overwriting
+// the unpruned raw schemas previously registered via RegisterRawTools.
+func (sf *StreamFilter) FilterProjectedToolsList(projectedTools []mcp.Tool, engine PruneEngine) ([]mcp.Tool, BudgetPruneMetrics, error) {
+	return sf.filterToolsListCore(projectedTools, engine, false)
+}
+
+func (sf *StreamFilter) filterToolsListCore(inputTools []mcp.Tool, engine PruneEngine, registerRaw bool) ([]mcp.Tool, BudgetPruneMetrics, error) {
 	if engine == nil {
-		return rawTools, BudgetPruneMetrics{}, nil
+		return cloneToolsSlice(inputTools), BudgetPruneMetrics{}, nil
 	}
 
 	sf.cfgMu.RLock()
@@ -239,14 +269,16 @@ func (sf *StreamFilter) FilterToolsList(rawTools []mcp.Tool, engine PruneEngine)
 	sf.cfgMu.RUnlock()
 
 	if cfg.PruneMode == "none" && cfg.MaxSchemaTokens <= 0 {
-		sf.RegisterRawTools(rawTools, false, nil)
-		return rawTools, BudgetPruneMetrics{}, nil
+		if registerRaw {
+			sf.RegisterRawTools(inputTools, false, nil)
+		}
+		return cloneToolsSlice(inputTools), BudgetPruneMetrics{}, nil
 	}
 
 	var boostScores map[string]float64
 	var ctxSig uint64
 	if cfg.MaxSchemaTokens > 0 {
-		boostScores, ctxSig = sf.ComputeBoostScores(rawTools)
+		boostScores, ctxSig = sf.ComputeBoostScores(inputTools)
 	}
 
 	var engineFp uint64
@@ -254,7 +286,7 @@ func (sf *StreamFilter) FilterToolsList(rawTools []mcp.Tool, engine PruneEngine)
 		engineFp = fpEngine.ConfigFingerprint()
 	}
 
-	cacheKey := fingerprintToolsRequest(rawTools, cfg.PruneMode, cfg.MaxSchemaTokens, ctxSig, engineFp)
+	cacheKey := fingerprintToolsRequest(inputTools, cfg.PruneMode, cfg.MaxSchemaTokens, pinned, ctxSig, engineFp)
 
 	// Fast-path FNV-1a cache lookup (<0.05ms)
 	sf.cacheMu.RLock()
@@ -262,9 +294,14 @@ func (sf *StreamFilter) FilterToolsList(rawTools []mcp.Tool, engine PruneEngine)
 		if sf.cache[i].key == cacheKey {
 			hit := sf.cache[i]
 			sf.cacheMu.RUnlock()
+			if registerRaw {
+				sf.RegisterRawTools(inputTools, hit.compacted, hit.stubbedMap)
+			} else {
+				sf.markCompactedTools(hit.compacted, hit.stubbedMap)
+			}
 			outMetrics := hit.metrics
 			outMetrics.CacheHit = true
-			return hit.tools, outMetrics, nil
+			return cloneToolsSlice(hit.tools), outMetrics, nil
 		}
 	}
 	sf.cacheMu.RUnlock()
@@ -274,14 +311,14 @@ func (sf *StreamFilter) FilterToolsList(rawTools []mcp.Tool, engine PruneEngine)
 	var err error
 
 	if ctxEngine, ok := engine.(ContextBudgetEngine); ok && cfg.MaxSchemaTokens > 0 {
-		pruned, bMetrics, err = ctxEngine.PruneToolsWithContext(rawTools, BudgetContext{
+		pruned, bMetrics, err = ctxEngine.PruneToolsWithContext(inputTools, BudgetContext{
 			MaxSchemaTokens:   cfg.MaxSchemaTokens,
 			PinnedTools:       pinned,
 			ContextBoostTools: boostScores,
 		})
 	} else {
 		var pMetrics PruneMetrics
-		pruned, pMetrics, err = engine.PruneTools(rawTools)
+		pruned, pMetrics, err = engine.PruneTools(inputTools)
 		bMetrics = BudgetPruneMetrics{PruneMetrics: pMetrics}
 	}
 	if err != nil {
@@ -293,29 +330,32 @@ func (sf *StreamFilter) FilterToolsList(rawTools []mcp.Tool, engine PruneEngine)
 		stubbedSet[name] = true
 	}
 	compactedForValidation := cfg.MaxSchemaTokens > 0 || cfg.PruneMode == "dynamic" || len(stubbedSet) > 0
-	sf.RegisterRawTools(rawTools, compactedForValidation, stubbedSet)
+	if registerRaw {
+		sf.RegisterRawTools(inputTools, compactedForValidation, stubbedSet)
+	} else {
+		sf.markCompactedTools(compactedForValidation, stubbedSet)
+	}
+
+	cachedTools := cloneToolsSlice(pruned)
 
 	// Store in bounded cache
 	sf.cacheMu.Lock()
+	entry := filterCacheEntry{
+		key:        cacheKey,
+		tools:      cachedTools,
+		metrics:    bMetrics,
+		compacted:  compactedForValidation,
+		stubbedMap: stubbedSet,
+	}
 	if len(sf.cache) >= maxFilterCacheEntries {
 		copy(sf.cache, sf.cache[1:])
-		sf.cache[len(sf.cache)-1] = filterCacheEntry{
-			key:        cacheKey,
-			tools:      pruned,
-			metrics:    bMetrics,
-			stubbedMap: stubbedSet,
-		}
+		sf.cache[len(sf.cache)-1] = entry
 	} else {
-		sf.cache = append(sf.cache, filterCacheEntry{
-			key:        cacheKey,
-			tools:      pruned,
-			metrics:    bMetrics,
-			stubbedMap: stubbedSet,
-		})
+		sf.cache = append(sf.cache, entry)
 	}
 	sf.cacheMu.Unlock()
 
-	return pruned, bMetrics, nil
+	return cloneToolsSlice(pruned), bMetrics, nil
 }
 
 // InterceptToolCall records call context and performs fast (<0.1ms) recursive pre-binding validation
@@ -367,16 +407,31 @@ func extractToolDomain(name string) string {
 	return ""
 }
 
-func fingerprintToolsRequest(tools []mcp.Tool, mode string, maxTokens int, ctxSig uint64, engineFp uint64) uint64 {
+func fingerprintToolsRequest(tools []mcp.Tool, mode string, maxTokens int, pinned map[string]struct{}, ctxSig uint64, engineFp uint64) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(mode))
-	var buf [16]byte
+	_, _ = h.Write([]byte{0})
+	var buf [24]byte
 	b := strconv.AppendInt(buf[:0], int64(maxTokens), 10)
 	_, _ = h.Write(b)
+	_, _ = h.Write([]byte{0})
 	b = strconv.AppendUint(buf[:0], ctxSig, 16)
 	_, _ = h.Write(b)
+	_, _ = h.Write([]byte{0})
 	b = strconv.AppendUint(buf[:0], engineFp, 16)
 	_, _ = h.Write(b)
+
+	if len(pinned) > 0 {
+		pinKeys := make([]string, 0, len(pinned))
+		for k := range pinned {
+			pinKeys = append(pinKeys, k)
+		}
+		sort.Strings(pinKeys)
+		for _, k := range pinKeys {
+			_, _ = h.Write([]byte{0x1d})
+			_, _ = h.Write([]byte(k))
+		}
+	}
 
 	for i := range tools {
 		t := &tools[i]
@@ -384,14 +439,238 @@ func fingerprintToolsRequest(tools []mcp.Tool, mode string, maxTokens int, ctxSi
 		_, _ = h.Write([]byte(t.Name))
 		_, _ = h.Write([]byte{0})
 		_, _ = h.Write([]byte(t.Description))
-		b = strconv.AppendInt(buf[:0], int64(len(t.InputSchema.Properties)), 10)
-		_, _ = h.Write(b)
-		b = strconv.AppendInt(buf[:0], int64(len(t.InputSchema.Required)), 10)
-		_, _ = h.Write(b)
-		b = strconv.AppendInt(buf[:0], int64(len(t.InputSchema.Defs)+len(t.InputSchema.Definitions)), 10)
-		_, _ = h.Write(b)
+		_, _ = h.Write([]byte{0})
+		hashInputSchemaDeterministic(h, &t.InputSchema)
 	}
 	return h.Sum64()
+}
+
+func hashInputSchemaDeterministic(h interface{ Write([]byte) (int, error) }, s *mcp.InputSchema) {
+	if s == nil {
+		return
+	}
+	_, _ = h.Write([]byte(s.Type))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(s.Description))
+	_, _ = h.Write([]byte{0})
+	for _, r := range s.Required {
+		_, _ = h.Write([]byte(r))
+		_, _ = h.Write([]byte{0x1f})
+	}
+	_, _ = h.Write([]byte{0})
+	hashAnyDeterministic(h, s.AdditionalProperties)
+	hashMapDeterministic(h, s.Properties)
+	hashMapDeterministic(h, s.Defs)
+	hashMapDeterministic(h, s.Definitions)
+	hashSliceDeterministic(h, s.AllOf)
+	hashSliceDeterministic(h, s.AnyOf)
+	hashSliceDeterministic(h, s.OneOf)
+	hashMapDeterministic(h, s.Not)
+	hashMapDeterministic(h, s.PatternProperties)
+	hashMapDeterministic(h, s.DependentSchemas)
+	if len(s.DependentRequired) > 0 {
+		depKeys := make([]string, 0, len(s.DependentRequired))
+		for k := range s.DependentRequired {
+			depKeys = append(depKeys, k)
+		}
+		sort.Strings(depKeys)
+		for _, k := range depKeys {
+			_, _ = h.Write([]byte(k))
+			hashAnyDeterministic(h, s.DependentRequired[k])
+		}
+	}
+	if s.MinProperties != nil {
+		hashAnyDeterministic(h, *s.MinProperties)
+	}
+	if s.MaxProperties != nil {
+		hashAnyDeterministic(h, *s.MaxProperties)
+	}
+}
+
+func hashMapDeterministic(h interface{ Write([]byte) (int, error) }, m map[string]any) {
+	if len(m) == 0 {
+		_, _ = h.Write([]byte{0})
+		return
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	_, _ = h.Write([]byte{'{'})
+	for _, k := range keys {
+		_, _ = h.Write([]byte(k))
+		_, _ = h.Write([]byte{':'})
+		hashAnyDeterministic(h, m[k])
+		_, _ = h.Write([]byte{','})
+	}
+	_, _ = h.Write([]byte{'}'})
+}
+
+func hashSliceDeterministic(h interface{ Write([]byte) (int, error) }, s []any) {
+	if len(s) == 0 {
+		_, _ = h.Write([]byte{0})
+		return
+	}
+	_, _ = h.Write([]byte{'['})
+	for _, elem := range s {
+		hashAnyDeterministic(h, elem)
+		_, _ = h.Write([]byte{','})
+	}
+	_, _ = h.Write([]byte{']'})
+}
+
+func hashAnyDeterministic(h interface{ Write([]byte) (int, error) }, v any) {
+	switch val := v.(type) {
+	case nil:
+		_, _ = h.Write([]byte{'N'})
+	case bool:
+		if val {
+			_, _ = h.Write([]byte{'T'})
+		} else {
+			_, _ = h.Write([]byte{'F'})
+		}
+	case string:
+		_, _ = h.Write([]byte{'S'})
+		_, _ = h.Write([]byte(val))
+		_, _ = h.Write([]byte{0})
+	case float64:
+		var buf [24]byte
+		_, _ = h.Write([]byte{'D'})
+		_, _ = h.Write(strconv.AppendFloat(buf[:0], val, 'g', -1, 64))
+		_, _ = h.Write([]byte{0})
+	case int:
+		var buf [24]byte
+		_, _ = h.Write([]byte{'I'})
+		_, _ = h.Write(strconv.AppendInt(buf[:0], int64(val), 10))
+		_, _ = h.Write([]byte{0})
+	case json.Number:
+		_, _ = h.Write([]byte{'J'})
+		_, _ = h.Write([]byte(val.String()))
+		_, _ = h.Write([]byte{0})
+	case []string:
+		_, _ = h.Write([]byte{'['})
+		for _, item := range val {
+			_, _ = h.Write([]byte(item))
+			_, _ = h.Write([]byte{0x1f})
+		}
+		_, _ = h.Write([]byte{']'})
+	case []any:
+		hashSliceDeterministic(h, val)
+	case map[string]any:
+		hashMapDeterministic(h, val)
+	default:
+		_, _ = fmt.Fprintf(interfaceWriter{h}, "%T:%v;", val, val)
+	}
+}
+
+type interfaceWriter struct {
+	w interface{ Write([]byte) (int, error) }
+}
+
+func (iw interfaceWriter) Write(p []byte) (int, error) {
+	return iw.w.Write(p)
+}
+
+func cloneToolsSlice(tools []mcp.Tool) []mcp.Tool {
+	if tools == nil {
+		return nil
+	}
+	out := make([]mcp.Tool, len(tools))
+	for i := range tools {
+		out[i] = cloneMCPTool(tools[i])
+	}
+	return out
+}
+
+func cloneMCPTool(t mcp.Tool) mcp.Tool {
+	cp := t
+	cp.OutputSchema = cloneAnyMap(t.OutputSchema)
+	if t.Icons != nil {
+		cp.Icons = make([]mcp.ToolIcon, len(t.Icons))
+		for i, ic := range t.Icons {
+			cp.Icons[i] = ic
+			if ic.Sizes != nil {
+				cp.Icons[i].Sizes = append([]string(nil), ic.Sizes...)
+			}
+		}
+	}
+	if t.Annotations != nil {
+		ann := *t.Annotations
+		cp.Annotations = &ann
+	}
+	cp.InputSchema = mcp.InputSchema{
+		Type:                 t.InputSchema.Type,
+		Properties:           cloneAnyMap(t.InputSchema.Properties),
+		AdditionalProperties: cloneAnyValue(t.InputSchema.AdditionalProperties),
+		Schema:               t.InputSchema.Schema,
+		ID:                   t.InputSchema.ID,
+		Title:                t.InputSchema.Title,
+		Description:          t.InputSchema.Description,
+		Comment:              t.InputSchema.Comment,
+		Examples:             cloneAnySlice(t.InputSchema.Examples),
+		Defs:                 cloneAnyMap(t.InputSchema.Defs),
+		Definitions:          cloneAnyMap(t.InputSchema.Definitions),
+		AnyOf:                cloneAnySlice(t.InputSchema.AnyOf),
+		OneOf:                cloneAnySlice(t.InputSchema.OneOf),
+		AllOf:                cloneAnySlice(t.InputSchema.AllOf),
+		Not:                  cloneAnyMap(t.InputSchema.Not),
+		PatternProperties:    cloneAnyMap(t.InputSchema.PatternProperties),
+		DependentSchemas:     cloneAnyMap(t.InputSchema.DependentSchemas),
+	}
+	if t.InputSchema.Required != nil {
+		cp.InputSchema.Required = append([]string(nil), t.InputSchema.Required...)
+	}
+	if t.InputSchema.DependentRequired != nil {
+		cp.InputSchema.DependentRequired = make(map[string][]string, len(t.InputSchema.DependentRequired))
+		for k, v := range t.InputSchema.DependentRequired {
+			cp.InputSchema.DependentRequired[k] = append([]string(nil), v...)
+		}
+	}
+	if t.InputSchema.MinProperties != nil {
+		v := *t.InputSchema.MinProperties
+		cp.InputSchema.MinProperties = &v
+	}
+	if t.InputSchema.MaxProperties != nil {
+		v := *t.InputSchema.MaxProperties
+		cp.InputSchema.MaxProperties = &v
+	}
+	return cp
+}
+
+func cloneAnyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = cloneAnyValue(v)
+	}
+	return out
+}
+
+func cloneAnySlice(s []any) []any {
+	if s == nil {
+		return nil
+	}
+	out := make([]any, len(s))
+	for i := range s {
+		out[i] = cloneAnyValue(s[i])
+	}
+	return out
+}
+
+func cloneAnyValue(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		return cloneAnyMap(typed)
+	case []any:
+		return cloneAnySlice(typed)
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return v
+	}
 }
 
 // =============================================================================
@@ -609,6 +888,14 @@ func validateNodeValue(vctx *validationCtx, val any, node map[string]any, path s
 			})
 			return
 		}
+		if matches > 1 {
+			vctx.violations = append(vctx.violations, PreBindViolation{
+				Path:      path,
+				Reason:    fmt.Sprintf("value matched %d branches in oneOf; must match exactly 1", matches),
+				SubSchema: map[string]any{"oneOf": oneOf},
+			})
+			return
+		}
 	}
 	if notSchema, ok := node["not"].(map[string]any); ok && len(notSchema) > 0 {
 		probe := &validationCtx{defs: vctx.defs, legacyDefs: vctx.legacyDefs}
@@ -733,21 +1020,24 @@ func validateObjectValue(vctx *validationCtx, obj map[string]any, node map[strin
 	props, _ := node["properties"].(map[string]any)
 	reqNames := extractStringList(node["required"])
 	for _, req := range reqNames {
-		if v, exists := obj[req]; !exists || v == nil {
-			var propSchema map[string]any
-			if props != nil {
-				if pm, ok := props[req].(map[string]any); ok {
-					if refStr, hasRef := pm["$ref"].(string); hasRef {
-						if resolved := resolveLocalRef(refStr, vctx.defs, vctx.legacyDefs); resolved != nil {
-							propSchema = resolved
-						} else {
-							propSchema = pm
-						}
+		var rawPropSchema map[string]any
+		var propSchema map[string]any
+		if props != nil {
+			if pm, ok := props[req].(map[string]any); ok {
+				rawPropSchema = pm
+				if refStr, hasRef := pm["$ref"].(string); hasRef {
+					if resolved := resolveLocalRef(refStr, vctx.defs, vctx.legacyDefs); resolved != nil {
+						propSchema = resolved
 					} else {
 						propSchema = pm
 					}
+				} else {
+					propSchema = pm
 				}
 			}
+		}
+		v, exists := obj[req]
+		if !exists || (v == nil && !schemaExplicitlyAllowsNull(vctx, rawPropSchema, depth+1)) {
 			if propSchema == nil {
 				propSchema = node
 			}
@@ -863,22 +1153,53 @@ func countMatchingBranches(vctx *validationCtx, val any, branches []any, depth i
 	return matched
 }
 
+func schemaExplicitlyAllowsNull(vctx *validationCtx, propSchema map[string]any, depth int) bool {
+	if len(propSchema) == 0 || depth > 32 {
+		return false
+	}
+	target := propSchema
+	if refStr, ok := propSchema["$ref"].(string); ok && refStr != "" {
+		if resolved := resolveLocalRef(refStr, vctx.defs, vctx.legacyDefs); resolved != nil {
+			target = resolved
+		}
+	}
+	_, hasType := target["type"]
+	_, hasAnyOf := target["anyOf"]
+	_, hasOneOf := target["oneOf"]
+	_, hasEnum := target["enum"]
+	_, hasConst := target["const"]
+	if !hasType && !hasAnyOf && !hasOneOf && !hasEnum && !hasConst {
+		return false
+	}
+	probe := &validationCtx{defs: vctx.defs, legacyDefs: vctx.legacyDefs}
+	validateNodeValue(probe, nil, propSchema, "$", depth)
+	return len(probe.violations) == 0
+}
+
 func resolveLocalRef(ref string, defs, legacyDefs map[string]any) map[string]any {
 	const defsPrefix = "#/$defs/"
 	const legacyPrefix = "#/definitions/"
 	if strings.HasPrefix(ref, defsPrefix) && defs != nil {
-		key := ref[len(defsPrefix):]
+		key := unescapeJSONPointerToken(ref[len(defsPrefix):])
 		if target, ok := defs[key].(map[string]any); ok {
 			return target
 		}
 	}
 	if strings.HasPrefix(ref, legacyPrefix) && legacyDefs != nil {
-		key := ref[len(legacyPrefix):]
+		key := unescapeJSONPointerToken(ref[len(legacyPrefix):])
 		if target, ok := legacyDefs[key].(map[string]any); ok {
 			return target
 		}
 	}
 	return nil
+}
+
+func unescapeJSONPointerToken(tok string) string {
+	if !strings.Contains(tok, "~") {
+		return tok
+	}
+	s := strings.ReplaceAll(tok, "~1", "/")
+	return strings.ReplaceAll(s, "~0", "~")
 }
 
 func mergeDefs(base, extra map[string]any) map[string]any {

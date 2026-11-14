@@ -90,14 +90,14 @@ func ProjectCompactTool(tool mcp.Tool, cfg CatalogConfig) mcp.Tool {
 	}
 }
 
-// CleanSummaryDescription extracts the first sentence and truncates to maxLen.
+// CleanSummaryDescription extracts the first sentence and truncates to maxLen runes.
 func CleanSummaryDescription(raw string, maxLen int) string {
-	if raw == "" {
+	if raw == "" || maxLen <= 0 {
 		return ""
 	}
 	// Strip leading markdown tags
 	s := strings.TrimSpace(raw)
-	s = strings.TrimPrefix(s, "#")
+	s = strings.TrimLeft(s, "#")
 	s = strings.TrimSpace(s)
 
 	// Remove markdown line breaks and collapses multiple spaces
@@ -114,18 +114,22 @@ func CleanSummaryDescription(raw string, maxLen int) string {
 			break
 		}
 	}
-	if strings.HasSuffix(s, ".") && !strings.HasSuffix(s, "..") {
-		// Keep trailing period
-	}
 
-	// Truncate at word boundary if exceeding maxLen
+	// Truncate at word boundary in rune space if exceeding maxLen
 	runes := []rune(s)
 	if len(runes) > maxLen {
-		truncated := string(runes[:maxLen])
-		if lastSpace := strings.LastIndex(truncated, " "); lastSpace > maxLen/2 {
-			truncated = truncated[:lastSpace]
+		truncRunes := runes[:maxLen]
+		lastSpaceRune := -1
+		for i := len(truncRunes) - 1; i >= 0; i-- {
+			if truncRunes[i] == ' ' {
+				lastSpaceRune = i
+				break
+			}
 		}
-		s = truncated + "..."
+		if lastSpaceRune > maxLen/2 {
+			truncRunes = truncRunes[:lastSpaceRune]
+		}
+		s = string(truncRunes) + "..."
 	}
 	return strings.TrimSpace(s)
 }

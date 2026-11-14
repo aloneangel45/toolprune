@@ -372,29 +372,45 @@ func truncateDescription(desc string, maxLen int) string {
 	return strings.TrimRight(string(runes[:cutoff]), " ,;:-") + "..."
 }
 
-// stripMarkdownLinks replaces [foo](bar) with foo.
+// stripMarkdownLinks replaces [foo](bar) with foo in a single linear pass,
+// even when non-link brackets such as "[NOTE]" precede markdown links.
 func stripMarkdownLinks(s string) string {
-	for {
-		startBracket := strings.Index(s, "[")
-		if startBracket == -1 {
+	if !strings.Contains(s, "[") {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		relStart := strings.IndexByte(s[i:], '[')
+		if relStart == -1 {
+			out.WriteString(s[i:])
 			break
 		}
-		endBracket := strings.Index(s[startBracket:], "]")
-		if endBracket == -1 {
-			break
-		}
-		endBracket += startBracket
+		startBracket := i + relStart
+		out.WriteString(s[i:startBracket])
 
+		relEnd := strings.IndexByte(s[startBracket+1:], ']')
+		if relEnd == -1 {
+			out.WriteString(s[startBracket:])
+			break
+		}
+		endBracket := startBracket + 1 + relEnd
+		if nestedBracket := strings.LastIndexByte(s[startBracket+1:endBracket], '['); nestedBracket != -1 {
+			actualStart := startBracket + 1 + nestedBracket
+			out.WriteString(s[startBracket:actualStart])
+			startBracket = actualStart
+		}
 		if endBracket+1 < len(s) && s[endBracket+1] == '(' {
-			endParen := strings.Index(s[endBracket+1:], ")")
-			if endParen != -1 {
-				endParen += endBracket + 1
-				linkText := s[startBracket+1 : endBracket]
-				s = s[:startBracket] + linkText + s[endParen+1:]
+			if relParen := strings.IndexByte(s[endBracket+2:], ')'); relParen != -1 {
+				endParen := endBracket + 2 + relParen
+				out.WriteString(s[startBracket+1 : endBracket])
+				i = endParen + 1
 				continue
 			}
 		}
-		break
+		out.WriteString(s[startBracket : endBracket+1])
+		i = endBracket + 1
 	}
-	return s
+	return out.String()
 }

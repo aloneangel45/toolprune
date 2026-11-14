@@ -11,7 +11,7 @@ import (
 
 var (
 	// Build metadata populated via -ldflags during build
-	Version   = "1.3.0"
+	Version   = "1.3.1"
 	GitCommit = "dev"
 	BuildDate = "unknown"
 
@@ -70,14 +70,14 @@ func resetCommandFlags(cmd *cobra.Command) {
 			return
 		}
 		fs.VisitAll(func(f *pflag.Flag) {
-			if f.Changed {
-				if sv, ok := f.Value.(pflag.SliceValue); ok {
+			if sv, ok := f.Value.(pflag.SliceValue); ok {
+				if f.Changed {
 					_ = sv.Replace(nil)
-				} else {
-					_ = f.Value.Set(f.DefValue)
 				}
-				f.Changed = false
+			} else {
+				_ = f.Value.Set(f.DefValue)
 			}
+			f.Changed = false
 		})
 	}
 	resetSet(cmd.LocalFlags())

@@ -50,7 +50,7 @@ jobs:
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"
           if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "$GITHUB_REF" ]; then
-            TAG_NAME="v1.3.0"
+            TAG_NAME="v1.3.1"
           fi
           echo "VERSION=${TAG_NAME}" >> $GITHUB_ENV
           echo "GIT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV

@@ -17,6 +17,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print ToolPrune version and build telemetry",
 	Run: func(cmd *cobra.Command, args []string) {
+		defer resetCommandFlags(cmd)
 		outWriter := cmd.OutOrStdout()
 		isJSON, _ := cmd.Flags().GetBool("json")
 		isShort, _ := cmd.Flags().GetBool("short")

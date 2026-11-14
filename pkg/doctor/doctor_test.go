@@ -47,7 +47,7 @@ func TestClassifyZedAndStandardEntries(t *testing.T) {
 	}
 
 	rep := Run(Options{
-		Version:     "1.3.0",
+		Version:     "1.3.1",
 		ProjectDir:  tmp,
 		DirExplicit: true,
 	})
@@ -62,5 +62,107 @@ func TestClassifyZedAndStandardEntries(t *testing.T) {
 	}
 	if !foundWarn {
 		t.Errorf("expected warn status on malformed cursor mcp.json, got %+v", rep.Clients)
+	}
+}
+
+func TestDoctorInspectsZedAndVSCodeJSONCWithoutFalseWarnings(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. Real-world Zed settings.json with UTF-8 BOM, // comments, /* */ comments, trailing commas, and URLs
+	zedPath := filepath.Join(tmp, "Zed", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(zedPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	zedJSONC := append([]byte{0xEF, 0xBB, 0xBF}, []byte(`// Zed settings
+// https://zed.dev/docs/configuring-zed
+{
+  /* UI configuration */
+  "theme": "Ayu Dark",
+  "context_servers": {
+    "unwrapped_git": {
+      "command": {
+        "path": "uvx",
+        "args": ["mcp-server-git",],
+      },
+    },
+    "wrapped_tp": {
+      "command": {
+        "path": "C:\\Users\\dev\\.local\\bin\\toolprune.exe",
+        "args": ["proxy", "--", "npx", "server",],
+      },
+    },
+    "remote_sse": {
+      "url": "https://mcp.example.com/sse/*live*/",
+    },
+  },
+}
+`)...)
+	if err := os.WriteFile(zedPath, zedJSONC, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	zedRes := inspectSingleClientConfig(clientTarget{
+		client:    "zed",
+		scope:     "user",
+		path:      zedPath,
+		schemaKey: "context_servers",
+		wrapHint:  "toolprune preset generate --client zed --merge",
+	})
+	if zedRes.Warning != "" || zedRes.Status == "warn" {
+		t.Fatalf("expected valid JSONC Zed settings.json with zero warning, got: %+v", zedRes)
+	}
+	if zedRes.TotalServers != 3 || zedRes.WrappedServers != 1 || zedRes.UnwrappedCount != 2 {
+		t.Errorf("unexpected Zed server counts: %+v", zedRes)
+	}
+
+	// 2. Comment-only Zed settings.json should report status="ok"
+	commentOnlyPath := filepath.Join(tmp, "ZedEmpty", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(commentOnlyPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(commentOnlyPath, []byte("// Default Zed settings\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	emptyRes := inspectSingleClientConfig(clientTarget{
+		client:    "zed",
+		scope:     "user",
+		path:      commentOnlyPath,
+		schemaKey: "context_servers",
+	})
+	if emptyRes.Status != "ok" || emptyRes.Warning != "" {
+		t.Errorf("expected comment-only Zed settings.json to be ok, got: %+v", emptyRes)
+	}
+
+	// 3. VS Code .vscode/mcp.json with JSONC comments and trailing commas via Run()
+	vscodePath := filepath.Join(tmp, ".vscode", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(vscodePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	vscodeJSONC := `{
+  // VS Code MCP config
+  "servers": {
+    "toolprune": {
+      "type": "stdio",
+      "command": "toolprune",
+      "args": ["proxy",],
+    },
+  },
+}`
+	if err := os.WriteFile(vscodePath, []byte(vscodeJSONC), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rep := Run(Options{
+		Version:     "1.3.1",
+		ProjectDir:  tmp,
+		DirExplicit: true,
+	})
+	foundVSCodeOK := false
+	for _, c := range rep.Clients {
+		if c.Client == "vscode" && c.Status == "ok" && c.WrappedServers == 1 {
+			foundVSCodeOK = true
+		}
+	}
+	if !foundVSCodeOK {
+		t.Errorf("expected vscode JSONC config to report status=ok with 1 wrapped server, got %+v", rep.Clients)
 	}
 }

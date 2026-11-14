@@ -348,7 +348,7 @@ func (r *Router) HandleToolsList(ctx context.Context, req *mcp.Message) (*mcp.Me
 	// Enforce RFC #1 token budget if configured
 	if cfg.MaxSchemaTokens > 0 && prunerEngine != nil && r.streamFilter != nil {
 		r.streamFilter.RegisterRawTools(rawAll, isDynamicCatalog, nil)
-		if budgeted, bMetrics, err := r.streamFilter.FilterToolsList(tools, prunerEngine); err == nil {
+		if budgeted, bMetrics, err := r.streamFilter.FilterProjectedToolsList(tools, prunerEngine); err == nil {
 			tools = budgeted
 			if bMetrics.CacheHit {
 				r.cacheHits.Add(1)

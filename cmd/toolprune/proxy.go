@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -70,6 +69,19 @@ func init() {
 }
 
 // resolvePresetToMode maps user-friendly preset aliases to canonical pruning tiers.
+func sanitizeWrapperUpstreamID(cmdName string) string {
+	normalized := strings.ReplaceAll(strings.TrimSpace(cmdName), `\`, `/`)
+	normalized = strings.TrimRight(normalized, `/`)
+	if idx := strings.LastIndex(normalized, `/`); idx >= 0 {
+		normalized = normalized[idx+1:]
+	}
+	normalized = strings.ReplaceAll(normalized, "__", "_")
+	if normalized == "" {
+		return "upstream"
+	}
+	return normalized
+}
+
 func resolvePresetToMode(preset string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(preset)) {
 	case "fast", "lossless":
@@ -249,7 +261,7 @@ func runWrapperModeWithFlags(ctx context.Context, cmdArgs []string, changed map[
 	)
 
 	upSpec := config.UpstreamConfig{
-		ID:        filepath.Base(cmdName),
+		ID:        sanitizeWrapperUpstreamID(cmdName),
 		Transport: "stdio",
 		Command:   cmdName,
 		Args:      cmdRest,

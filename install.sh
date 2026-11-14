@@ -106,7 +106,7 @@ elif command -v wget >/dev/null 2>&1; then
 fi
 
 if [ -z "${TAG}" ]; then
-    TAG="v1.3.0"
+    TAG="v1.3.1"
     log_warn "GitHub API rate limit reached or offline; falling back to release ${TAG}"
 fi
 

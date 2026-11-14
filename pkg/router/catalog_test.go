@@ -63,6 +63,30 @@ func TestCleanSummaryDescription(t *testing.T) {
 			maxLen:   20,
 			expected: "Supercalifragilistic...",
 		},
+		{
+			name:     "zero or negative maxLen returns empty without panic",
+			input:    "Valid description text",
+			maxLen:   -5,
+			expected: "",
+		},
+		{
+			name:     "strips multi-hash markdown header",
+			input:    "### Heading Summary. Extra details.",
+			maxLen:   80,
+			expected: "Heading Summary.",
+		},
+		{
+			name:     "multibyte UTF-8 rune word boundary truncation in second half",
+			input:    "日本語ツール 説明文テストデータ詳細情報一覧取得機能",
+			maxLen:   10,
+			expected: "日本語ツール...",
+		},
+		{
+			name:     "multibyte UTF-8 space in first half does not prematurely truncate due to byte offset",
+			input:    "日本語a 説明文テストデータ詳細情報一覧",
+			maxLen:   10,
+			expected: "日本語a 説明文テス...",
+		},
 	}
 
 	for _, tc := range tests {

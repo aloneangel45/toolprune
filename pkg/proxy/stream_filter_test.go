@@ -130,3 +130,125 @@ func TestStreamFilter_ContextBoostCacheAndPreBindingValidation(t *testing.T) {
 		t.Fatalf("expected sibling domain boost for postgres__inspect_tables, got %v", scores["postgres__inspect_tables"])
 	}
 }
+
+func TestStreamFilter_SchemaFingerprintCacheCloneAndOneOfNullableValidation(t *testing.T) {
+	opts := pruner.DefaultOptions(pruner.TierCompact)
+	opts.MaxSchemaTokens = 200
+	engine := pruner.New(opts)
+	sf := proxy.NewStreamFilter(proxy.StreamFilterConfig{
+		PruneMode:       "compact",
+		MaxSchemaTokens: 200,
+	})
+
+	toolsV1 := []mcp.Tool{
+		{
+			Name:        "deploy_service",
+			Description: "Deploy service.",
+			InputSchema: mcp.InputSchema{
+				Type:       "object",
+				Properties: map[string]any{"replicas": map[string]any{"type": "string"}},
+				Required:   []string{"replicas"},
+			},
+		},
+	}
+	out1, _, err := sf.FilterToolsList(toolsV1, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate returned slice/map and ensure cached copy is unaffected
+	out1[0].Name = "CORRUPTED_NAME"
+	out1[0].InputSchema.Properties["replicas"] = map[string]any{"type": "boolean"}
+
+	out1Cached, mHit, err := sf.FilterToolsList(toolsV1, engine)
+	if err != nil || !mHit.CacheHit {
+		t.Fatalf("expected cache hit on identical toolsV1, err=%v hit=%v", err, mHit.CacheHit)
+	}
+	if out1Cached[0].Name != "deploy_service" {
+		t.Fatalf("caller mutation corrupted cached tool name: %q", out1Cached[0].Name)
+	}
+
+	// Change property type from "string" to "integer" with same property count (1) and required count (1).
+	// Must bust FNV-1a cache AND update rawRegistry!
+	toolsV2 := []mcp.Tool{
+		{
+			Name:        "deploy_service",
+			Description: "Deploy service.",
+			InputSchema: mcp.InputSchema{
+				Type:       "object",
+				Properties: map[string]any{"replicas": map[string]any{"type": "integer"}},
+				Required:   []string{"replicas"},
+			},
+		},
+	}
+	_, mMiss, err := sf.FilterToolsList(toolsV2, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mMiss.CacheHit {
+		t.Fatal("expected CacheHit=false when property type changed from string to integer")
+	}
+	if rej := sf.InterceptToolCall("deploy_service", json.RawMessage(`{"replicas":"not_an_int"}`)); rej == nil || !rej.IsError {
+		t.Fatal("expected updated rawRegistry to reject string for integer replicas")
+	}
+
+	// Verify FilterProjectedToolsList does NOT overwrite rawRegistry with stubbed schemas
+	stubProjected := []mcp.Tool{
+		{
+			Name:        "deploy_service",
+			Description: "Deploy service. Required: replicas.",
+			InputSchema: mcp.InputSchema{Type: "object"},
+		},
+	}
+	if _, _, err := sf.FilterProjectedToolsList(stubProjected, engine); err != nil {
+		t.Fatal(err)
+	}
+	if rej := sf.InterceptToolCall("deploy_service", json.RawMessage(`{"replicas":"still_invalid"}`)); rej == nil || !rej.IsError {
+		t.Fatal("FilterProjectedToolsList overwrote rawRegistry; expected invalid replicas to still be rejected")
+	}
+
+	// Verify oneOf rejects multiple matching branches, nullable required fields accept null, and RFC 6901 $ref unescapes ~1/~0
+	complexSchema := mcp.InputSchema{
+		Type: "object",
+		Defs: map[string]any{
+			"ns/item~v1": map[string]any{
+				"type": "string",
+				"enum": []any{"alpha", "beta"},
+			},
+		},
+		Properties: map[string]any{
+			"mode": map[string]any{
+				"oneOf": []any{
+					map[string]any{"type": "number", "minimum": float64(0)},
+					map[string]any{"type": "number", "maximum": float64(10)},
+				},
+			},
+			"nullable_tag": map[string]any{
+				"type": []any{"string", "null"},
+			},
+			"strict_name": map[string]any{
+				"type": "string",
+			},
+			"escaped_ref": map[string]any{
+				"$ref": "#/$defs/ns~1item~0v1",
+			},
+		},
+		Required: []string{"mode", "nullable_tag", "strict_name"},
+	}
+
+	// mode=5 matches BOTH oneOf branches (>=0 and <=10) -> MUST fail oneOf!
+	if vErr := proxy.ValidateToolArguments("complex_tool", complexSchema, json.RawMessage(`{"mode":5,"nullable_tag":null,"strict_name":"ok"}`)); vErr == nil {
+		t.Fatal("expected oneOf validation error when value matches 2 branches")
+	}
+	// mode=20 matches exactly 1 branch (>=0), nullable_tag=null is explicitly allowed, escaped_ref="alpha" matches $defs["ns/item~v1"] -> MUST pass!
+	if vErr := proxy.ValidateToolArguments("complex_tool", complexSchema, json.RawMessage(`{"mode":20,"nullable_tag":null,"strict_name":"ok","escaped_ref":"alpha"}`)); vErr != nil {
+		t.Fatalf("expected valid oneOf + nullable required + escaped $ref to pass, got: %v", vErr.ToCallToolResult().Content[0].Text)
+	}
+	// escaped_ref="gamma" violates resolved $defs["ns/item~v1"] enum -> MUST fail!
+	if vErr := proxy.ValidateToolArguments("complex_tool", complexSchema, json.RawMessage(`{"mode":20,"nullable_tag":null,"strict_name":"ok","escaped_ref":"gamma"}`)); vErr == nil {
+		t.Fatal("expected escaped $ref enum violation to fail")
+	}
+	// strict_name=null on non-nullable required string -> MUST fail!
+	if vErr := proxy.ValidateToolArguments("complex_tool", complexSchema, json.RawMessage(`{"mode":20,"nullable_tag":null,"strict_name":null}`)); vErr == nil {
+		t.Fatal("expected non-nullable required property with null value to fail")
+	}
+}

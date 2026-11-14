@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/aloneangel45/toolprune/pkg/config"
+	"github.com/aloneangel45/toolprune/pkg/doctor"
+	"github.com/aloneangel45/toolprune/pkg/preset"
 )
 
 var (
@@ -31,6 +33,7 @@ var configInitCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Initialize a new toolprune.yaml configuration file",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		defer resetCommandFlags(cmd)
 		targetFile := "toolprune.yaml"
 		if _, err := os.Stat(targetFile); err == nil {
 			return fmt.Errorf("%s already exists in current directory", targetFile)
@@ -48,6 +51,7 @@ var configValidateCmd = &cobra.Command{
 	Use:   "validate",
 	Short: "Validate toolprune.yaml syntax and check upstream commands",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		defer resetCommandFlags(cmd)
 		configPath := globalConfig
 		if configPath == "" {
 			configPath = config.FindConfigFile()
@@ -117,8 +121,50 @@ func defaultClaudeConfigPath() (string, error) {
 }
 
 func isToolpruneBinary(cmdName string) bool {
-	base := strings.ToLower(filepath.Base(strings.TrimSpace(cmdName)))
-	return base == "toolprune" || base == "toolprune.exe"
+	return doctor.IsToolpruneBinary(cmdName)
+}
+
+func isValidPatchMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "none", "lossless", "compact", "aggressive", "dynamic":
+		return true
+	default:
+		return false
+	}
+}
+
+func atomicWriteFile(targetPath string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(targetPath)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, ".toolprune-patch-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 func runConfigPatchClaude(cmd *cobra.Command, args []string) error {
@@ -137,8 +183,12 @@ func runConfigPatchClaude(cmd *cobra.Command, args []string) error {
 
 	dryRun := cmd.Flags().Changed("dry-run") && patchClaudeDryRun
 	mode := "aggressive"
-	if cmd.Flags().Changed("mode") && strings.TrimSpace(patchClaudeMode) != "" {
-		mode = strings.TrimSpace(patchClaudeMode)
+	if cmd.Flags().Changed("mode") {
+		candidate := strings.ToLower(strings.TrimSpace(patchClaudeMode))
+		if !isValidPatchMode(candidate) {
+			return fmt.Errorf("invalid --mode %q: must be one of none, lossless, compact, aggressive, dynamic", patchClaudeMode)
+		}
+		mode = candidate
 	}
 	presetVal := ""
 	if cmd.Flags().Changed("preset") && strings.TrimSpace(patchClaudePreset) != "" {
@@ -154,7 +204,7 @@ func runConfigPatchClaude(cmd *cobra.Command, args []string) error {
 	}
 
 	var root map[string]any
-	if err := json.Unmarshal(origBytes, &root); err != nil {
+	if err := json.Unmarshal(preset.NormalizeJSONC(origBytes), &root); err != nil {
 		return fmt.Errorf("invalid JSON in %q: %w", targetPath, err)
 	}
 	if root == nil {
@@ -229,11 +279,11 @@ func runConfigPatchClaude(cmd *cobra.Command, args []string) error {
 	}
 
 	backupPath := targetPath + ".bak"
-	if err := os.WriteFile(backupPath, origBytes, 0600); err != nil {
+	if err := atomicWriteFile(backupPath, origBytes, 0600); err != nil {
 		return fmt.Errorf("failed to create backup %q: %w", backupPath, err)
 	}
 
-	if err := os.WriteFile(targetPath, patchedBytes, 0600); err != nil {
+	if err := atomicWriteFile(targetPath, patchedBytes, 0600); err != nil {
 		return fmt.Errorf("failed to write patched config %q: %w", targetPath, err)
 	}
 

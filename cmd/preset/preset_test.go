@@ -219,3 +219,37 @@ func TestPresetClaudeCodeAndZedGenerateValidate(t *testing.T) {
 		t.Errorf("expected Zed context_servers added, got %v", parsedZed)
 	}
 }
+
+func TestPresetEnvCommaValuesAndEmptyKeyRejection(t *testing.T) {
+	cmd := presetcmd.NewCommand()
+	out := new(bytes.Buffer)
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{
+		"generate",
+		"--client", "cursor",
+		"--stdout",
+		"--env", "ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:8080",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("preset generate with comma-containing --env failed: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("unmarshal stdout JSON failed: %v", err)
+	}
+	tp := parsed["mcpServers"].(map[string]any)["toolprune"].(map[string]any)
+	envMap := tp["env"].(map[string]any)
+	if envMap["ALLOWED_ORIGINS"] != "http://localhost:3000,http://127.0.0.1:8080" {
+		t.Errorf("comma-containing --env value corrupted: got %v", envMap["ALLOWED_ORIGINS"])
+	}
+
+	badCmd := presetcmd.NewCommand()
+	badCmd.SetOut(new(bytes.Buffer))
+	badCmd.SetErr(new(bytes.Buffer))
+	badCmd.SetArgs([]string{"generate", "--client", "cursor", "--stdout", "--env", "=missing_key"})
+	if err := badCmd.Execute(); err == nil {
+		t.Errorf("expected error for empty --env key '=missing_key'")
+	}
+}
