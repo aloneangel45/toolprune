@@ -120,9 +120,21 @@ func DefaultClaudeDesktopPath() (string, error) {
 	}
 }
 
+// crossPlatformBase extracts the final path segment regardless of whether the input
+// uses POSIX '/' or Windows '\' separators.
+func crossPlatformBase(p string) string {
+	s := strings.TrimSpace(p)
+	s = strings.ReplaceAll(s, "\\", "/")
+	s = strings.TrimRight(s, "/")
+	if idx := strings.LastIndexByte(s, '/'); idx >= 0 {
+		return s[idx+1:]
+	}
+	return s
+}
+
 // IsToolpruneBinary reports whether cmdName refers to a toolprune executable.
 func IsToolpruneBinary(cmdName string) bool {
-	base := strings.ToLower(filepath.Base(strings.TrimSpace(cmdName)))
+	base := strings.ToLower(crossPlatformBase(cmdName))
 	return base == "toolprune" || base == "toolprune.exe"
 }
 
@@ -526,7 +538,7 @@ func classifyStandardEntry(name string, entry map[string]any) bool {
 		if IsToolpruneBinary(cmdStr) {
 			return true
 		}
-		base := strings.ToLower(filepath.Base(strings.TrimSpace(cmdStr)))
+		base := strings.ToLower(crossPlatformBase(cmdStr))
 		if base == "docker" || base == "docker.exe" {
 			if rawArgs, ok := entry["args"].([]any); ok {
 				for _, a := range rawArgs {
