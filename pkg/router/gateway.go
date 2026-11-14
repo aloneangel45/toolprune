@@ -57,7 +57,7 @@ func NewRouterGateway(r *Router, cfg GatewayConfig) *RouterGateway {
 		cfg.RequestTimeout = 60 * time.Second
 	}
 	if cfg.ServerVersion == "" {
-		cfg.ServerVersion = "1.2.0"
+		cfg.ServerVersion = "1.3.0"
 	}
 	if cfg.DebounceInterval <= 0 {
 		cfg.DebounceInterval = 50 * time.Millisecond

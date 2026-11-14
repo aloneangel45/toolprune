@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "toolprune": {
+      "type": "stdio",
+      "command": "toolprune",
+      "args": [
+        "proxy",
+        "--config",
+        "toolprune.yaml"
+      ],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}

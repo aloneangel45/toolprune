@@ -98,3 +98,124 @@ func TestPresetMergePreservesUnknownSiblingFieldsAndValidateURL(t *testing.T) {
 		t.Errorf("expected toolprune server added after --merge")
 	}
 }
+
+func TestPresetVSCodeMergeAndValidate(t *testing.T) {
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, ".vscode", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{
+  "inputs": [
+    {"type": "promptString", "id": "gh-token", "password": true}
+  ],
+  "servers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    }
+  }
+}`
+	if err := os.WriteFile(outPath, []byte(existing), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	genCmd := presetcmd.NewCommand()
+	genCmd.SetOut(new(bytes.Buffer))
+	genCmd.SetErr(new(bytes.Buffer))
+	genCmd.SetArgs([]string{"generate", "--client", "vscode", "--output", outPath, "--merge", "--env", "GITHUB_TOKEN=${input:gh-token}"})
+	if err := genCmd.Execute(); err != nil {
+		t.Fatalf("preset generate --client vscode --merge failed: %v", err)
+	}
+
+	valCmd := presetcmd.NewCommand()
+	valCmd.SetOut(new(bytes.Buffer))
+	valCmd.SetErr(new(bytes.Buffer))
+	valCmd.SetArgs([]string{"validate", "--client", "vscode", outPath})
+	if err := valCmd.Execute(); err != nil {
+		t.Fatalf("preset validate --client vscode failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := parsed["inputs"].([]any); !ok {
+		t.Errorf("expected VS Code inputs array preserved, got %v", parsed["inputs"])
+	}
+	servers := parsed["servers"].(map[string]any)
+	if _, ok := servers["filesystem"]; !ok {
+		t.Errorf("expected filesystem server preserved in VS Code servers")
+	}
+	tp := servers["toolprune"].(map[string]any)
+	if tp["type"] != "stdio" || tp["command"] != "toolprune" {
+		t.Errorf("unexpected toolprune server in VS Code servers: %v", tp)
+	}
+}
+
+func TestPresetClaudeCodeAndZedGenerateValidate(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Claude Code (.mcp.json)
+	claudePath := filepath.Join(dir, ".mcp.json")
+	ccCmd := presetcmd.NewCommand()
+	ccCmd.SetOut(new(bytes.Buffer))
+	ccCmd.SetErr(new(bytes.Buffer))
+	ccCmd.SetArgs([]string{"generate", "--client", "claude-code", "--output", claudePath})
+	if err := ccCmd.Execute(); err != nil {
+		t.Fatalf("claude-code generate failed: %v", err)
+	}
+
+	valCC := presetcmd.NewCommand()
+	valCC.SetOut(new(bytes.Buffer))
+	valCC.SetErr(new(bytes.Buffer))
+	valCC.SetArgs([]string{"validate", claudePath})
+	if err := valCC.Execute(); err != nil {
+		t.Fatalf("claude-code validate failed: %v", err)
+	}
+
+	// 2. Zed (settings.json) — must preserve existing editor keys even without --merge!
+	zedPath := filepath.Join(dir, "Zed", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(zedPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(zedPath, []byte(`{"theme":"Ayu Dark","tab_size":2}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	zedCmd := presetcmd.NewCommand()
+	zedCmd.SetOut(new(bytes.Buffer))
+	zedCmd.SetErr(new(bytes.Buffer))
+	zedCmd.SetArgs([]string{"generate", "--client", "zed", "--output", zedPath})
+	if err := zedCmd.Execute(); err != nil {
+		t.Fatalf("zed generate failed: %v", err)
+	}
+
+	valZed := presetcmd.NewCommand()
+	valZed.SetOut(new(bytes.Buffer))
+	valZed.SetErr(new(bytes.Buffer))
+	valZed.SetArgs([]string{"validate", "--client", "zed", "--input", zedPath})
+	if err := valZed.Execute(); err != nil {
+		t.Fatalf("zed validate failed: %v", err)
+	}
+
+	zedRaw, err := os.ReadFile(zedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsedZed map[string]any
+	if err := json.Unmarshal(zedRaw, &parsedZed); err != nil {
+		t.Fatal(err)
+	}
+	if parsedZed["theme"] != "Ayu Dark" || parsedZed["tab_size"] != float64(2) {
+		t.Errorf("expected Zed theme and tab_size preserved, got %v", parsedZed)
+	}
+	if _, ok := parsedZed["context_servers"].(map[string]any); !ok {
+		t.Errorf("expected Zed context_servers added, got %v", parsedZed)
+	}
+}

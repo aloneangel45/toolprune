@@ -29,7 +29,7 @@ func repoRoot(t *testing.T) string {
 }
 
 // TestExamplePresetsSchemaCompatible verifies every sample config under examples/
-// conforms to the client MCP config schema enforced by preset.Validate.
+// conforms to the client MCP config schema enforced by preset.Validate and ValidateFile.
 func TestExamplePresetsSchemaCompatible(t *testing.T) {
 	root := repoRoot(t)
 	examples := filepath.Join(root, "examples")
@@ -41,6 +41,10 @@ func TestExamplePresetsSchemaCompatible(t *testing.T) {
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
+		}
+		client, err := preset.ParseClient(e.Name())
+		if err != nil {
+			t.Fatalf("example directory %q does not match a supported client: %v", e.Name(), err)
 		}
 		dir := filepath.Join(examples, e.Name())
 		files, err := os.ReadDir(dir)
@@ -60,32 +64,48 @@ func TestExamplePresetsSchemaCompatible(t *testing.T) {
 			if err := preset.Validate(data); err != nil {
 				t.Errorf("example %s failed schema validation: %v", path, err)
 			}
+			if err := preset.ValidateFile(path, client); err != nil {
+				t.Errorf("example %s failed ValidateFile(%s): %v", path, client, err)
+			}
 			// The preset must register a toolprune server.
-			cfg, err := preset.Generate(preset.DefaultOptions(preset.Client(e.Name())))
+			cfg, err := preset.Generate(preset.DefaultOptions(client))
 			if err != nil {
 				t.Fatalf("client %q not supported: %v", e.Name(), err)
 			}
-			if _, ok := cfg.MCPServers["toolprune"]; !ok {
+			if !cfg.HasServer("toolprune") {
 				t.Errorf("client %q preset missing toolprune entry", e.Name())
 			}
 		}
 	}
-	if checked == 0 {
-		t.Error("no example JSON files found under examples/")
+	if checked < 4 {
+		t.Errorf("expected at least 4 example JSON files (cursor, windsurf, vscode, claude-code), found %d", checked)
 	}
 }
 
-// TestGeneratedPresetMatchesExample ensures the generator output for the default
-// options validates and contains the toolprune stdio entry.
-func TestGeneratedPresetMatchesExample(t *testing.T) {
-	data, err := preset.GenerateJSON(preset.DefaultOptions(preset.ClientCursor))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := preset.Validate(data); err != nil {
-		t.Fatalf("generated preset invalid: %v", err)
-	}
-	if !strings.Contains(string(data), `"toolprune"`) {
-		t.Error("generated preset missing toolprune server name")
+// TestGeneratedPresetMatchesAllClients ensures generator output for all supported clients
+// validates cleanly in memory and on disk via WriteFile + ValidateFile.
+func TestGeneratedPresetMatchesAllClients(t *testing.T) {
+	for _, client := range preset.SupportedClients() {
+		t.Run(string(client), func(t *testing.T) {
+			data, err := preset.GenerateJSON(preset.DefaultOptions(client))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := preset.Validate(data); err != nil {
+				t.Fatalf("generated %s preset invalid: %v", client, err)
+			}
+			if !strings.Contains(string(data), `"toolprune"`) {
+				t.Errorf("generated %s preset missing toolprune server name", client)
+			}
+
+			tmp := t.TempDir()
+			outPath := filepath.Join(tmp, string(client), "config.json")
+			if err := preset.WriteFile(outPath, preset.DefaultOptions(client)); err != nil {
+				t.Fatalf("WriteFile(%s) failed: %v", client, err)
+			}
+			if err := preset.ValidateFile(outPath, client); err != nil {
+				t.Fatalf("ValidateFile(%s) failed: %v", client, err)
+			}
+		})
 	}
 }

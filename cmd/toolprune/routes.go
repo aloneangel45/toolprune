@@ -148,7 +148,7 @@ func runRoutes(cmd *cobra.Command, args []string) error {
 
 		if filterRe != nil {
 			target := u.Command
-			if u.Transport == "sse" && u.URL != "" {
+			if (u.Transport == "sse" || u.Transport == "streamable-http") && u.URL != "" {
 				target = u.URL
 			}
 			matched := filterRe.MatchString(u.ID) ||
@@ -198,7 +198,7 @@ func runRoutes(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(w, "UPSTREAM\tENDPOINT\tPREFIX\tACCESS\tDISABLED")
 	for _, entry := range evaluated {
 		endpoint := entry.Command
-		if entry.Transport == "sse" && entry.URL != "" {
+		if (entry.Transport == "sse" || entry.Transport == "streamable-http") && entry.URL != "" {
 			endpoint = entry.URL
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%t\n",

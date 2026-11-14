@@ -1,6 +1,7 @@
 # Binaries
 bin/
 dist/
+/toolprune
 *.exe
 *.exe~
 *.dll

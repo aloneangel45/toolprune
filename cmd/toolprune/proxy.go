@@ -503,7 +503,7 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 		}
 
 		var upTransport proxy.UpstreamTransport
-		if strings.EqualFold(u.Transport, "sse") {
+		if strings.EqualFold(u.Transport, "sse") || strings.EqualFold(u.Transport, "streamable-http") {
 			sseClient, cErr := proxy.NewSSEClientTransport(proxy.SSEClientConfig{
 				Name:           u.ID,
 				URL:            u.URL,

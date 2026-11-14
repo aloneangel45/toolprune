@@ -404,20 +404,20 @@ func (c *Config) Validate() error {
 		}
 
 		upTransport := strings.ToLower(strings.TrimSpace(up.Transport))
-		if upTransport != "stdio" && upTransport != "sse" {
-			errs = append(errs, fmt.Sprintf("upstream %q transport %q is invalid: must be 'stdio' or 'sse'", up.ID, up.Transport))
+		if upTransport != "stdio" && upTransport != "sse" && upTransport != "streamable-http" {
+			errs = append(errs, fmt.Sprintf("upstream %q transport %q is invalid: must be 'stdio' or 'sse' (or 'streamable-http')", up.ID, up.Transport))
 		}
 
 		if upTransport == "stdio" && strings.TrimSpace(up.Command) == "" {
 			errs = append(errs, fmt.Sprintf("upstream %q has transport 'stdio' but command is empty", up.ID))
 		}
 
-		if upTransport == "sse" {
+		if upTransport == "sse" || upTransport == "streamable-http" {
 			if strings.TrimSpace(up.URL) == "" {
-				errs = append(errs, fmt.Sprintf("upstream %q has transport 'sse' but url is empty", up.ID))
+				errs = append(errs, fmt.Sprintf("upstream %q has transport %q but url is empty", up.ID, upTransport))
 			} else {
 				parsedURL, err := url.ParseRequestURI(up.URL)
-				if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+				if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
 					errs = append(errs, fmt.Sprintf("upstream %q url %q is not a valid HTTP/HTTPS URL", up.ID, up.URL))
 				}
 			}

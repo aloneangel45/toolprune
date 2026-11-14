@@ -62,13 +62,16 @@ irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | 
 - [Client Integration Guides](#client-integration-guides)
   - [Claude Desktop](#claude-desktop)
   - [Cursor IDE](#cursor-ide)
-  - [Windsurf & Other MCP Clients](#windsurf--other-mcp-clients)
+  - [VS Code (GitHub Copilot MCP)](#vs-code-github-copilot-mcp)
+  - [Claude Code](#claude-code)
+  - [Windsurf & Zed](#windsurf--zed)
 - [CLI Reference](#cli-reference)
   - [`toolprune proxy`](#toolprune-proxy)
   - [`toolprune bench`](#toolprune-bench)
   - [`toolprune routes`](#toolprune-routes)
   - [`toolprune config`](#toolprune-config)
   - [`toolprune preset`](#toolprune-preset)
+  - [`toolprune doctor`](#toolprune-doctor)
   - [`toolprune version`](#toolprune-version)
 - [Configuration Reference (`toolprune.yaml`)](#configuration-reference-toolpruneyaml)
 - [Contributing & License](#contributing--license)
@@ -396,11 +399,33 @@ toolprune proxy --transport=sse --port=8080 --config=toolprune.yaml
 }
 ```
 
-### Windsurf & Other MCP Clients
+### VS Code (GitHub Copilot MCP)
+
+Generate or merge `.vscode/mcp.json` using VS Code's official `"servers"` schema (while preserving sibling `"inputs"` prompts and server fields):
 
 ```bash
-toolprune preset generate --client windsurf --output ~/.codeium/windsurf/mcp_config.json
+toolprune preset generate --client vscode --output .vscode/mcp.json --config toolprune.yaml --merge
+toolprune preset validate .vscode/mcp.json
+```
+
+### Claude Code
+
+Generate or merge project-level `.mcp.json` for Claude Code:
+
+```bash
+toolprune preset generate --client claude-code --output .mcp.json --config toolprune.yaml --merge
+toolprune preset validate .mcp.json
+```
+
+### Windsurf & Zed
+
+```bash
+# Windsurf (~/.codeium/windsurf/mcp_config.json)
+toolprune preset generate --client windsurf --config toolprune.yaml --merge
 toolprune preset validate --client windsurf --input ~/.codeium/windsurf/mcp_config.json
+
+# Zed (~/.config/zed/settings.json or %APPDATA%\Zed\settings.json — preserves all existing editor settings)
+toolprune preset generate --client zed --config toolprune.yaml --merge
 ```
 
 ---
@@ -471,15 +496,27 @@ Available Commands:
 ```
 
 ### `toolprune preset`
-Generates and validates MCP client presets for Cursor and Windsurf while preserving existing sibling keys.
+Generates and validates MCP client presets for Cursor, Windsurf, VS Code, Claude Code, and Zed while preserving existing sibling keys.
 
 ```text
 Usage:
   toolprune preset [command]
 
 Available Commands:
-  generate    Generate or merge a client MCP config preset for ToolPrune
-  validate    Validate a client MCP config file (supports command stdio and url SSE/HTTP servers)
+  generate    Generate or merge a client MCP config preset (--client cursor|windsurf|vscode|claude-code|zed)
+  validate    Validate a client MCP config file against the target schema (mcpServers, servers, context_servers)
+```
+
+### `toolprune doctor`
+Performs a strictly read-only health check of your local ToolPrune binary, `toolprune.yaml` upstream executables/URLs, and discovered IDE MCP client configs.
+
+```text
+Usage:
+  toolprune doctor [flags]
+
+Flags:
+      --dir string   Target project directory to scan (default: current working directory)
+      --json         Output health check report in structured JSON format
 ```
 
 ### `toolprune version`

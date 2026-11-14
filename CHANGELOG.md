@@ -5,6 +5,17 @@ All notable changes to **ToolPrune** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-14
+
+### Added
+- **Multi-IDE MCP Preset Expansion (`pkg/preset`, `cmd/preset`, `examples/`)**: Extended `SupportedClients()`, `ParseClient()`, `DefaultPath()`, `Generate()`, `MergeInto()`, `WriteFile()`, `Validate()`, `ValidateForClient()`, and `ValidateFile()` to support **VS Code** (`.vscode/mcp.json` using official `"servers"` + `"type": "stdio"|"sse"` schema while preserving `"inputs"` and per-server extras), **Claude Code** (`.mcp.json` using `"mcpServers"` + `"type": "stdio"|"sse"`), and **Zed** (`%APPDATA%\Zed\settings.json` on Windows or `~/.config/zed/settings.json` using `"context_servers"` -> `"command": {"path", "args", "env"}` while strictly preserving all existing Zed `settings.json` editor settings), alongside Cursor and Windsurf. Added ready-to-use `examples/vscode/mcp.json` and `examples/claude-code/.mcp.json` templates.
+- **`toolprune doctor` Diagnostic Subcommand (`cmd/toolprune/doctor.go`, `pkg/doctor`)**: Added `toolprune doctor [--json] [--dir <project_dir>]` to run a strictly read-only local MCP environment and configuration health check:
+  - Verifies `toolprune` binary build metadata (`version`, `commit`, `goVersion`, `os/arch`) and `PATH` discoverability.
+  - Validates `toolprune.yaml` syntax/semantics (when present) and verifies every active `stdio` upstream executable exists on `PATH` and every `sse` / `streamable-http` upstream carries a valid HTTP/HTTPS URL.
+  - Scans project and user MCP client configs (`.cursor/mcp.json`, `.vscode/mcp.json`, `.mcp.json`, Windsurf, Claude Desktop, Zed) without modifying disk, reporting wrapped vs unwrapped server counts and actionable `toolprune preset generate` / `toolprune config patch-claude` commands.
+  - Supports `--json` for structured CI/automation pipelines and exits non-zero only when an existing `toolprune.yaml` or configured upstream is broken.
+- **Explicit `streamable-http` Upstream Transport Alias (`pkg/config`, `cmd/toolprune`)**: Accepted `transport: "streamable-http"` alongside `transport: "sse"` in `toolprune.yaml` upstream definitions and route/doctor inspectors.
+
 ## [1.2.0] - 2026-11-10
 
 ### Added

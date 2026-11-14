@@ -21,7 +21,7 @@ Write-Host ">>> [INFO] Detected architecture: Windows/$Arch" -ForegroundColor Gr
 
 # 2. Resolve Latest Release
 Write-Host ">>> [INFO] Resolving latest release version from GitHub..." -ForegroundColor Gray
-$Tag = "v1.2.0"
+$Tag = "v1.3.0"
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $ReleaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 10

@@ -1,0 +1,24 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "github-token",
+      "description": "GitHub Personal Access Token",
+      "password": true
+    }
+  ],
+  "servers": {
+    "toolprune": {
+      "type": "stdio",
+      "command": "toolprune",
+      "args": [
+        "proxy",
+        "--config",
+        "toolprune.yaml"
+      ],
+      "env": {
+        "GITHUB_TOKEN": "${input:github-token}"
+      }
+    }
+  }
+}

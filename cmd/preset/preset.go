@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -24,23 +25,32 @@ type presetFlags struct {
 	stdout    bool
 }
 
+type validateFlags struct {
+	client string
+	input  string
+}
+
 // NewCommand builds a fresh 'preset' cobra command hierarchy with isolated flag state.
 func NewCommand() *cobra.Command {
 	flags := &presetFlags{}
+	vFlags := &validateFlags{}
 
 	cmd := &cobra.Command{
 		Use:   "preset",
-		Short: "Generate MCP client config presets (Cursor, Windsurf)",
+		Short: "Generate MCP client config presets (Cursor, Windsurf, VS Code, Claude Code, Zed)",
 		Long: `Generate out-of-the-box MCP client configuration presets that wire AI clients
-to a ToolPrune proxy instance.
+to a ToolPrune proxy instance while preserving existing sibling keys.
 
 Targets:
-  cursor    .cursor/mcp.json (project-level)
-  windsurf  ~/.codeium/windsurf/mcp_config.json (global)`,
+  cursor       .cursor/mcp.json (project-level)
+  windsurf     ~/.codeium/windsurf/mcp_config.json (global)
+  vscode       .vscode/mcp.json (project-level, "servers" schema)
+  claude-code  .mcp.json (project-level, "mcpServers" schema)
+  zed          ~/.config/zed/settings.json or %APPDATA%\Zed\settings.json ("context_servers")`,
 	}
 
 	genCmd := &cobra.Command{
-		Use:   "generate --client <cursor|windsurf> [flags]",
+		Use:   "generate --client <cursor|windsurf|vscode|claude-code|zed> [flags]",
 		Short: "Generate a client MCP config preset for ToolPrune",
 		RunE: func(c *cobra.Command, args []string) error {
 			return runPresetGenerate(c, flags)
@@ -50,20 +60,25 @@ Targets:
 	valCmd := &cobra.Command{
 		Use:   "validate <file>",
 		Short: "Validate a client MCP config file against the expected schema",
-		Args:  cobra.ExactArgs(1),
-		RunE:  runPresetValidate,
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			return runPresetValidate(c, args, vFlags)
+		},
 	}
 
-	genCmd.Flags().StringVar(&flags.client, "client", "cursor", "Target client (cursor, windsurf)")
+	genCmd.Flags().StringVar(&flags.client, "client", "cursor", "Target client (cursor, windsurf, vscode, claude-code, zed)")
 	genCmd.Flags().StringVarP(&flags.output, "output", "o", "", "Output file path (default: client's conventional path; use '-' for stdout)")
-	genCmd.Flags().StringVar(&flags.name, "name", "toolprune", "Server name under mcpServers")
+	genCmd.Flags().StringVar(&flags.name, "name", "toolprune", "Server name under the client's MCP servers map")
 	genCmd.Flags().StringVar(&flags.command, "command", "toolprune", "Executable used to launch the ToolPrune proxy")
 	genCmd.Flags().StringSliceVar(&flags.args, "args", []string{"proxy"}, "Arguments passed to the proxy command")
 	genCmd.Flags().StringSliceVar(&flags.env, "env", nil, "Extra environment variables as KEY=VALUE (repeatable)")
-	genCmd.Flags().StringVar(&flags.serverURL, "server-url", "", "Emit a remote {serverUrl} entry instead of a stdio command (e.g. http://127.0.0.1:8080/sse)")
+	genCmd.Flags().StringVar(&flags.serverURL, "server-url", "", "Emit a remote server entry instead of a stdio command (e.g. http://127.0.0.1:8080/sse)")
 	genCmd.Flags().StringVarP(&flags.config, "config", "c", "", "toolprune.yaml path to pass to the proxy as --config")
-	genCmd.Flags().BoolVar(&flags.merge, "merge", false, "Merge into an existing config file at --output, preserving other servers")
+	genCmd.Flags().BoolVar(&flags.merge, "merge", false, "Merge into an existing config file at --output, preserving other servers and keys")
 	genCmd.Flags().BoolVar(&flags.stdout, "stdout", false, "Print the generated config to stdout instead of writing a file")
+
+	valCmd.Flags().StringVar(&vFlags.client, "client", "", "Optional target client schema to enforce (cursor, windsurf, vscode, claude-code, zed)")
+	valCmd.Flags().StringVarP(&vFlags.input, "input", "i", "", "Path to MCP client config file to validate (alternative to positional <file>)")
 
 	cmd.AddCommand(genCmd)
 	cmd.AddCommand(valCmd)
@@ -138,7 +153,8 @@ func runPresetGenerate(cmd *cobra.Command, prFlags *presetFlags) error {
 		out = def
 	}
 
-	if prFlags.merge {
+	// Always preserve existing settings.json keys when writing to Zed, or whenever --merge is passed.
+	if prFlags.merge || client == preset.ClientZed {
 		if err := preset.WriteFile(out, opts); err != nil {
 			return err
 		}
@@ -160,14 +176,28 @@ func runPresetGenerate(cmd *cobra.Command, prFlags *presetFlags) error {
 	return nil
 }
 
-func runPresetValidate(cmd *cobra.Command, args []string) error {
-	data, err := os.ReadFile(args[0])
+func runPresetValidate(cmd *cobra.Command, args []string, vFlags *validateFlags) error {
+	target := strings.TrimSpace(vFlags.input)
+	if len(args) > 0 {
+		target = args[0]
+	}
+	if target == "" {
+		return fmt.Errorf("missing config file path: provide <file> or --input <file>")
+	}
+
+	var err error
+	if strings.TrimSpace(vFlags.client) != "" {
+		c, parseErr := preset.ParseClient(vFlags.client)
+		if parseErr != nil {
+			return parseErr
+		}
+		err = preset.ValidateFile(target, c)
+	} else {
+		err = preset.ValidateFile(target)
+	}
 	if err != nil {
-		return fmt.Errorf("failed to read %q: %w", args[0], err)
+		return fmt.Errorf("invalid MCP client config %q: %w", target, err)
 	}
-	if err := preset.Validate(data); err != nil {
-		return fmt.Errorf("invalid MCP client config %q: %w", args[0], err)
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "MCP client config %s is valid.\n", args[0])
+	fmt.Fprintf(cmd.OutOrStdout(), "MCP client config %s is valid.\n", target)
 	return nil
 }
