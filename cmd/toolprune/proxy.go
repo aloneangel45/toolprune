@@ -351,21 +351,13 @@ func runStdioTransport(ctx context.Context, p *proxy.Proxy, supervisor *proxy.Su
 	errCh := make(chan error, 1)
 	go func() {
 		for {
-			msg, err := stdioTransport.ReadMessage()
-			if err != nil {
+			if err := stdioTransport.HandleNext(ctx, session, p); err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, proxy.ErrTransportClosed) {
 					errCh <- nil
 					return
 				}
-				if rpcErrResp := proxy.ErrorToJSONRPCResponse(err); rpcErrResp != nil {
-					_ = stdioTransport.WriteMessage(rpcErrResp)
-					continue
-				}
 				errCh <- err
 				return
-			}
-			if err := p.HandleClientMessage(session, msg); err != nil {
-				logger.Warn("error handling client message", "err", err)
 			}
 		}
 	}()
@@ -706,21 +698,13 @@ func runGatewayStdioLoop(ctx context.Context, gw *router.RouterGateway, logger *
 	errCh := make(chan error, 1)
 	go func() {
 		for {
-			msg, err := stdioTransport.ReadMessage()
-			if err != nil {
+			if err := stdioTransport.HandleNext(ctx, session, gw); err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, proxy.ErrTransportClosed) {
 					errCh <- nil
 					return
 				}
-				if rpcErrResp := proxy.ErrorToJSONRPCResponse(err); rpcErrResp != nil {
-					_ = stdioTransport.WriteMessage(rpcErrResp)
-					continue
-				}
 				errCh <- err
 				return
-			}
-			if hErr := gw.HandleClientMessage(session, msg); hErr != nil {
-				logger.Warn("router gateway error handling message", "err", hErr)
 			}
 		}
 	}()

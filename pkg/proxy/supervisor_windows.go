@@ -8,12 +8,15 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 type windowsJobData struct {
+	mu        sync.Mutex
+	closeOnce sync.Once
 	jobHandle windows.Handle
 }
 
@@ -70,7 +73,10 @@ func attachPlatformSupervision(s *Supervisor) error {
 		return fmt.Errorf("AssignProcessToJobObject failed: %w", err)
 	}
 
+	s.platformMu.Lock()
 	s.platformData = &windowsJobData{jobHandle: job}
+	s.platformMu.Unlock()
+
 	s.logger.Debug("attached subprocess to Windows Job Object with KILL_ON_JOB_CLOSE",
 		"server", s.cfg.Name,
 		"pid", pid,
@@ -101,12 +107,24 @@ func terminatePlatformProcessTree(s *Supervisor) error {
 }
 
 func cleanupPlatformSupervision(s *Supervisor) {
-	if data, ok := s.platformData.(*windowsJobData); ok && data != nil {
+	if s == nil {
+		return
+	}
+	s.platformMu.Lock()
+	data, _ := s.platformData.(*windowsJobData)
+	s.platformMu.Unlock()
+	if data == nil {
+		return
+	}
+
+	data.closeOnce.Do(func() {
+		data.mu.Lock()
+		defer data.mu.Unlock()
 		if data.jobHandle != 0 {
 			_ = windows.CloseHandle(data.jobHandle)
 			data.jobHandle = 0
 		}
-	}
+	})
 }
 
 // ResolveExecutable finds the target executable on Windows, taking into account .cmd, .bat, and .exe wrappers.

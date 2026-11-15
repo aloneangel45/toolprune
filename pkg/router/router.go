@@ -28,12 +28,15 @@ type RouterConfig struct {
 
 // DefaultRouterConfig returns standard production defaults.
 func DefaultRouterConfig() RouterConfig {
+	cat := DefaultCatalogConfig()
+	cat.EnableInvokeMeta = true
 	return RouterConfig{
 		NamespaceMode:  NamespaceModeAuto,
 		PruneMode:      "aggressive",
 		ActiveProfile:  "full",
 		MaxActiveTools: 15,
 		EnableCatalog:  false,
+		Catalog:        cat,
 	}
 }
 
@@ -128,8 +131,13 @@ func (r *Router) handleMultiplexerChanged() {
 
 func (r *Router) effectiveCatalogConfig() CatalogConfig {
 	cat := r.cfg.Catalog
-	if cat.MaxSummaryLength <= 0 && cat.WindowSize <= 0 && cat.Mode == "" {
+	if cat == (CatalogConfig{}) {
 		cat = DefaultCatalogConfig()
+		if r.cfg.EnableCatalog || r.cfg.PruneMode != "none" {
+			cat.EnableInvokeMeta = true
+		} else {
+			cat.EnableMetaTools = false
+		}
 	}
 	if cat.WindowSize <= 0 {
 		cat.WindowSize = r.cfg.MaxActiveTools
@@ -140,11 +148,6 @@ func (r *Router) effectiveCatalogConfig() CatalogConfig {
 	if cat.MaxSummaryLength <= 0 {
 		cat.MaxSummaryLength = 80
 	}
-	cat.EnableMetaTools = true
-	cat.EnableSearchMeta = true
-	cat.EnableSchemaMeta = true
-	cat.EnableActivateMeta = true
-	cat.EnableInvokeMeta = true
 	return cat
 }
 
@@ -342,7 +345,9 @@ func (r *Router) HandleToolsList(ctx context.Context, req *mcp.Message) (*mcp.Me
 			}
 		}
 
-		tools = append(tools, GetMetaToolDefinitions(catCfg)...)
+		if cfg.PruneMode != "none" || window != nil {
+			tools = append(tools, GetMetaToolDefinitions(catCfg)...)
+		}
 	}
 
 	// Enforce RFC #1 token budget if configured
@@ -446,8 +451,12 @@ func (r *Router) RouteToolCall(msg *mcp.Message) (UpstreamTransport, *mcp.Messag
 
 	r.callsIntercepted.Add(1)
 
-	// Unwrap toolprune_invoke execution meta-tool transparently
-	if params.Name == MetaToolInvoke {
+	r.mu.RLock()
+	catCfg := r.effectiveCatalogConfig()
+	r.mu.RUnlock()
+
+	// Unwrap toolprune_invoke execution meta-tool transparently when enabled
+	if params.Name == MetaToolInvoke && catCfg.EnableMetaTools && catCfg.EnableInvokeMeta {
 		var invokeArgs struct {
 			ToolName  string          `json:"tool_name"`
 			Arguments json.RawMessage `json:"arguments"`
@@ -520,6 +529,13 @@ func (r *Router) HandleInternalToolCall(msg *mcp.Message) (*mcp.Message, bool) {
 		return nil, false
 	}
 
+	r.mu.RLock()
+	catCfg := r.effectiveCatalogConfig()
+	r.mu.RUnlock()
+	if !catCfg.EnableMetaTools {
+		return nil, false
+	}
+
 	var reqID mcp.RequestID
 	if msg.ID != nil {
 		reqID = *msg.ID
@@ -527,6 +543,9 @@ func (r *Router) HandleInternalToolCall(msg *mcp.Message) (*mcp.Message, bool) {
 
 	switch params.Name {
 	case MetaToolSearch:
+		if !catCfg.EnableSearchMeta {
+			return nil, false
+		}
 		r.callsIntercepted.Add(1)
 		var args struct {
 			Query  string `json:"query"`
@@ -539,6 +558,9 @@ func (r *Router) HandleInternalToolCall(msg *mcp.Message) (*mcp.Message, bool) {
 		return resp, true
 
 	case MetaToolGetSchema:
+		if !catCfg.EnableSchemaMeta {
+			return nil, false
+		}
 		r.callsIntercepted.Add(1)
 		var args struct {
 			ToolNames []string `json:"tool_names"`
@@ -558,6 +580,9 @@ func (r *Router) HandleInternalToolCall(msg *mcp.Message) (*mcp.Message, bool) {
 		return resp, true
 
 	case MetaToolActivate:
+		if !catCfg.EnableActivateMeta {
+			return nil, false
+		}
 		r.callsIntercepted.Add(1)
 		var args struct {
 			Tools []string `json:"tools"`
@@ -605,6 +630,9 @@ func (r *Router) HandleInternalToolCall(msg *mcp.Message) (*mcp.Message, bool) {
 		return resp, true
 
 	case MetaToolInvoke:
+		if !catCfg.EnableInvokeMeta {
+			return nil, false
+		}
 		var args struct {
 			ToolName  string          `json:"tool_name"`
 			Arguments json.RawMessage `json:"arguments"`

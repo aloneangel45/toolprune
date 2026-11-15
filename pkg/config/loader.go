@@ -71,17 +71,52 @@ func ExpandEnvBytes(input []byte) []byte {
 	return []byte(ExpandEnv(string(input)))
 }
 
+// expandYAMLNode recursively expands ${VAR} placeholders inside parsed YAML scalar values
+// so environment variables containing Windows backslashes (C:\Users\...) or '#' comments
+// never corrupt YAML/JSON lexing.
+func expandYAMLNode(node *yaml.Node, visited map[*yaml.Node]bool) {
+	if node == nil || visited[node] {
+		return
+	}
+	visited[node] = true
+
+	if node.Kind == yaml.ScalarNode {
+		expanded := ExpandEnv(node.Value)
+		if expanded != node.Value {
+			node.Value = expanded
+			// Allow unquoted plain scalars (e.g., port: ${TP_PORT:-8080}) to re-resolve native YAML types (int/bool).
+			if node.Style == 0 {
+				node.Tag = ""
+			}
+		}
+	}
+
+	if node.Alias != nil {
+		expandYAMLNode(node.Alias, visited)
+	}
+	for _, child := range node.Content {
+		expandYAMLNode(child, visited)
+	}
+}
+
 // Parse unmarshals raw YAML or JSON bytes into a validated Config instance.
-// It automatically expands environment variables, fills defaults, and executes validation.
+// It expands environment variables on parsed scalar nodes, fills defaults, and executes validation.
 func Parse(data []byte) (*Config, error) {
-	expanded := ExpandEnvBytes(data)
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("failed to parse configuration: %w", err)
+	}
+
+	expandYAMLNode(&doc, make(map[*yaml.Node]bool))
 
 	var cfg Config
-	// Initialize with defaults before unmarshaling so omitted sections retain defaults
+	// Initialize with defaults before decoding so omitted sections retain defaults
 	cfg = *DefaultConfig()
 
-	if err := yaml.Unmarshal(expanded, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse configuration: %w", err)
+	if doc.Kind != 0 && len(doc.Content) > 0 {
+		if err := doc.Decode(&cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse configuration: %w", err)
+		}
 	}
 
 	cfg.ApplyDefaults()

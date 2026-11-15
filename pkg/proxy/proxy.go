@@ -286,14 +286,22 @@ func (p *Proxy) UnregisterClient(sessionID string) {
 	delete(p.clients, sessionID)
 }
 
+func (p *Proxy) snapshotClients() []ClientSession {
+	p.clientsMu.RLock()
+	clients := make([]ClientSession, 0, len(p.clients))
+	for _, client := range p.clients {
+		clients = append(clients, client)
+	}
+	p.clientsMu.RUnlock()
+	return clients
+}
+
 // BroadcastNotification delivers a server notification to all active client sessions.
 func (p *Proxy) BroadcastNotification(msg *mcp.Message) error {
 	if msg == nil {
 		return nil
 	}
-	p.clientsMu.RLock()
-	defer p.clientsMu.RUnlock()
-	for _, client := range p.clients {
+	for _, client := range p.snapshotClients() {
 		_ = client.Send(msg)
 	}
 	return nil
@@ -661,23 +669,25 @@ func (p *Proxy) handleUpstreamNotification(msg *mcp.Message) {
 	if msg.Method == mcp.MethodNotificationsToolsListChanged && p.streamFilter != nil {
 		p.streamFilter.InvalidateCache()
 	}
-	p.clientsMu.RLock()
-	defer p.clientsMu.RUnlock()
-
-	for _, client := range p.clients {
+	for _, client := range p.snapshotClients() {
 		_ = client.Send(msg)
 	}
 }
 
-// handleUpstreamRequest routes reverse requests (e.g. sampling/createMessage) to clients.
+// handleUpstreamRequest routes reverse requests (e.g. sampling/createMessage, roots/list, ping) to clients.
 func (p *Proxy) handleUpstreamRequest(msg *mcp.Message) {
-	// For single-client routing, forward to first active client
-	p.clientsMu.RLock()
-	defer p.clientsMu.RUnlock()
-
-	for _, client := range p.clients {
-		_ = client.Send(msg)
-		return
+	for _, client := range p.snapshotClients() {
+		if err := client.Send(msg); err == nil {
+			return
+		}
+	}
+	if p.upstream != nil && msg != nil && msg.ID != nil {
+		errResp := mcp.NewErrorMessage(
+			msg.ID,
+			mcp.CodeMethodNotFound,
+			fmt.Sprintf("Method not found: %s", msg.Method),
+		)
+		_ = p.upstream.Send(errResp)
 	}
 }
 

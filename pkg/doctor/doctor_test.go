@@ -47,7 +47,7 @@ func TestClassifyZedAndStandardEntries(t *testing.T) {
 	}
 
 	rep := Run(Options{
-		Version:     "1.3.1",
+		Version:     "1.3.2",
 		ProjectDir:  tmp,
 		DirExplicit: true,
 	})
@@ -152,7 +152,7 @@ func TestDoctorInspectsZedAndVSCodeJSONCWithoutFalseWarnings(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep := Run(Options{
-		Version:     "1.3.1",
+		Version:     "1.3.2",
 		ProjectDir:  tmp,
 		DirExplicit: true,
 	})

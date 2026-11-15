@@ -4,159 +4,218 @@
 # Repository: https://github.com/aloneangel45/toolprune
 # ==============================================================================
 
-$ErrorActionPreference = "Stop"
+function Install-ToolPrune {
+    $ErrorActionPreference = "Stop"
 
-$Repo = "aloneangel45/toolprune"
-$BinaryName = "toolprune.exe"
-$InstallDir = Join-Path $env:USERPROFILE ".local\bin"
+    $Repo = "aloneangel45/toolprune"
+    $BinaryName = "toolprune.exe"
 
-Write-Host ">>> [INFO] Initiating toolprune Windows installer..." -ForegroundColor Cyan
-
-# 1. Detect Architecture
-$Arch = "amd64"
-if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
-    $Arch = "arm64"
-}
-Write-Host ">>> [INFO] Detected architecture: Windows/$Arch" -ForegroundColor Gray
-
-# 2. Resolve Latest Release
-Write-Host ">>> [INFO] Resolving latest release version from GitHub..." -ForegroundColor Gray
-$Tag = "v1.3.1"
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $ReleaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 10
-    if ($ReleaseInfo.tag_name) {
-        $Tag = $ReleaseInfo.tag_name
+    $InstallDir = $env:TOOLPRUNE_INSTALL_DIR
+    if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+        $BaseProfile = $env:USERPROFILE
+        if ([string]::IsNullOrWhiteSpace($BaseProfile)) {
+            $BaseProfile = [Environment]::GetFolderPath("UserProfile")
+        }
+        $InstallDir = [System.IO.Path]::Combine($BaseProfile, ".local", "bin")
     }
-} catch {
-    Write-Host ">>> [WARN] Using default release fallback: $Tag" -ForegroundColor Yellow
-}
 
-Write-Host ">>> [INFO] Target release: $Tag" -ForegroundColor Green
+    [Console]::WriteLine(">>> [INFO] Initiating toolprune Windows installer...")
 
-# 3. Download Release Asset and Checksums
-$ArchiveName = "toolprune-windows-$Arch.zip"
-$DownloadUrl = "https://github.com/$Repo/releases/download/$Tag/$ArchiveName"
-$ChecksumUrl = "https://github.com/$Repo/releases/download/$Tag/checksums.txt"
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
-New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+    # 1. Detect Architecture
+    $Arch = "amd64"
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+        $Arch = "arm64"
+    }
+    [Console]::WriteLine(">>> [INFO] Detected architecture: Windows/$Arch")
 
-try {
-    $ZipPath = Join-Path $TempDir $ArchiveName
-    $ChecksumPath = Join-Path $TempDir "checksums.txt"
+    # 2. Configure TLS 1.2+ without clobbering TLS 1.3 and Resolve Release
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-    Write-Host ">>> [INFO] Downloading $DownloadUrl..." -ForegroundColor Gray
+    $Tag = "v1.3.2"
+    $AssetDir = $env:TOOLPRUNE_ASSET_DIR
+    if ([string]::IsNullOrWhiteSpace($AssetDir)) {
+        [Console]::WriteLine(">>> [INFO] Resolving latest release version from GitHub...")
+        try {
+            $ApiClient = [System.Net.WebClient]::new()
+            try {
+                $ApiClient.Headers.Add("User-Agent", "toolprune-installer")
+                $ReleaseJson = $ApiClient.DownloadString("https://api.github.com/repos/$Repo/releases/latest")
+                $TagMatch = [System.Text.RegularExpressions.Regex]::Match($ReleaseJson, '"tag_name"\s*:\s*"([^"]+)"')
+                if ($TagMatch.Success -and -not [string]::IsNullOrWhiteSpace($TagMatch.Groups[1].Value)) {
+                    $Tag = $TagMatch.Groups[1].Value
+                }
+            } finally {
+                $ApiClient.Dispose()
+            }
+        } catch {
+            [Console]::WriteLine(">>> [WARN] Using default release fallback: $Tag")
+        }
+    }
+
+    [Console]::WriteLine(">>> [INFO] Target release: $Tag")
+
+    # 3. Acquire Release Asset and Checksums
+    $ArchiveName = "toolprune-windows-$Arch.zip"
+    $DownloadUrl = "https://github.com/$Repo/releases/download/$Tag/$ArchiveName"
+    $ChecksumUrl = "https://github.com/$Repo/releases/download/$Tag/checksums.txt"
+    $TempDir = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("toolprune-install-" + [System.Guid]::NewGuid().ToString("N")))
+    [void][System.IO.Directory]::CreateDirectory($TempDir)
+
+    $DestinationFile = [System.IO.Path]::Combine($InstallDir, $BinaryName)
+
     try {
-        Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
-    } catch {
-        Write-Error "Failed to download toolprune package from $DownloadUrl"
-        exit 1
-    }
+        $ZipPath = [System.IO.Path]::Combine($TempDir, $ArchiveName)
+        $ChecksumPath = [System.IO.Path]::Combine($TempDir, "checksums.txt")
 
-    Write-Host ">>> [INFO] Downloading SHA-256 checksums from $ChecksumUrl..." -ForegroundColor Gray
-    try {
-        Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -UseBasicParsing
-    } catch {
-        Write-Error "Failed to download checksums.txt from $ChecksumUrl"
-        exit 1
-    }
+        if (-not [string]::IsNullOrWhiteSpace($AssetDir)) {
+            $LocalZip = [System.IO.Path]::Combine($AssetDir, $ArchiveName)
+            $LocalChecksum = [System.IO.Path]::Combine($AssetDir, "checksums.txt")
+            if (-not [System.IO.File]::Exists($LocalZip)) {
+                throw "Local release archive not found at $LocalZip"
+            }
+            if (-not [System.IO.File]::Exists($LocalChecksum)) {
+                throw "Local checksums.txt not found at $LocalChecksum"
+            }
+            [System.IO.File]::Copy($LocalZip, $ZipPath, $true)
+            [System.IO.File]::Copy($LocalChecksum, $ChecksumPath, $true)
+        } else {
+            [Console]::WriteLine(">>> [INFO] Downloading $DownloadUrl...")
+            $WebClient = [System.Net.WebClient]::new()
+            try {
+                $WebClient.Headers.Add("User-Agent", "toolprune-installer")
+                try {
+                    $WebClient.DownloadFile($DownloadUrl, $ZipPath)
+                } catch {
+                    throw "Failed to download toolprune package from ${DownloadUrl}: $($_.Exception.Message)"
+                }
+                [Console]::WriteLine(">>> [INFO] Downloading SHA-256 checksums from $ChecksumUrl...")
+                try {
+                    $WebClient.DownloadFile($ChecksumUrl, $ChecksumPath)
+                } catch {
+                    throw "Failed to download checksums.txt from ${ChecksumUrl}: $($_.Exception.Message)"
+                }
+            } finally {
+                $WebClient.Dispose()
+            }
+        }
 
-    # 4. Verify SHA-256 Checksum
-    $ExpectedHash = $null
-    foreach ($Line in (Get-Content -Path $ChecksumPath)) {
-        $Trimmed = $Line.Trim()
-        if (-not $Trimmed) { continue }
-        $Parts = $Trimmed -split "\s+"
-        if ($Parts.Length -ge 2) {
-            $FileName = $Parts[-1].TrimStart('*')
-            if ($FileName -eq $ArchiveName) {
-                $ExpectedHash = $Parts[0].ToLowerInvariant()
-                break
+        # 4. Verify SHA-256 Checksum (pure .NET)
+        $ExpectedHash = $null
+        foreach ($Line in [System.IO.File]::ReadAllLines($ChecksumPath)) {
+            $Trimmed = $Line.Trim()
+            if ([string]::IsNullOrEmpty($Trimmed)) { continue }
+            $Parts = $Trimmed -split "\s+"
+            if ($Parts.Length -ge 2) {
+                $FileName = $Parts[$Parts.Length - 1].TrimStart('*')
+                if ($FileName -eq $ArchiveName) {
+                    $ExpectedHash = $Parts[0].ToLowerInvariant()
+                    break
+                }
+            }
+        }
+
+        if ([string]::IsNullOrEmpty($ExpectedHash)) {
+            throw "Checksum entry for $ArchiveName not found in checksums.txt"
+        }
+
+        $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $FileStream = [System.IO.File]::OpenRead($ZipPath)
+            try {
+                $HashBytes = $Sha256.ComputeHash($FileStream)
+            } finally {
+                $FileStream.Dispose()
+            }
+        } finally {
+            $Sha256.Dispose()
+        }
+        $ActualHash = [System.BitConverter]::ToString($HashBytes).Replace("-", "").ToLowerInvariant()
+        if ($ActualHash -ne $ExpectedHash) {
+            throw "SHA-256 checksum mismatch for $ArchiveName (expected $ExpectedHash, got $ActualHash)"
+        }
+        [Console]::WriteLine(">>> [INFO] SHA-256 checksum verified: $ActualHash")
+
+        # 5. Extract and Install (pure .NET without PowerShell module autoloading)
+        [Console]::WriteLine(">>> [INFO] Extracting archive...")
+        if (-not ("System.IO.Compression.ZipFile" -as [type])) {
+            $LoadedAssembly = [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem")
+            if (-not $LoadedAssembly -and -not ("System.IO.Compression.ZipFile" -as [type])) {
+                throw "Failed to load System.IO.Compression.FileSystem assembly."
+            }
+        }
+        $ExtractDir = [System.IO.Path]::Combine($TempDir, "extracted")
+        [void][System.IO.Directory]::CreateDirectory($ExtractDir)
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractDir)
+
+        $ExtractedExecutables = [System.IO.Directory]::GetFiles($ExtractDir, "*.exe", [System.IO.SearchOption]::AllDirectories)
+        if (-not $ExtractedExecutables -or $ExtractedExecutables.Length -eq 0) {
+            throw "Extraction failed: Executable not found in archive."
+        }
+        $ExtractedBinary = $ExtractedExecutables[0]
+
+        if (-not [System.IO.Directory]::Exists($InstallDir)) {
+            [void][System.IO.Directory]::CreateDirectory($InstallDir)
+        }
+
+        if ([System.IO.File]::Exists($DestinationFile)) {
+            $ExistingAttrs = [System.IO.File]::GetAttributes($DestinationFile)
+            if (($ExistingAttrs -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+                [System.IO.File]::SetAttributes($DestinationFile, ($ExistingAttrs -band (-bnot [System.IO.FileAttributes]::ReadOnly)))
+            }
+        }
+        [System.IO.File]::Copy($ExtractedBinary, $DestinationFile, $true)
+    } finally {
+        # 6. Clean up temporary directory
+        if ([System.IO.Directory]::Exists($TempDir)) {
+            try {
+                [System.IO.Directory]::Delete($TempDir, $true)
+            } catch {
+                # Ignore transient antivirus file-lock on temp cleanup
             }
         }
     }
 
-    if (-not $ExpectedHash) {
-        Write-Error "Checksum entry for $ArchiveName not found in checksums.txt"
-        exit 1
-    }
-
-    $Sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $FileStream = [System.IO.File]::OpenRead($ZipPath)
-        try {
-            $HashBytes = $Sha256.ComputeHash($FileStream)
-        } finally {
-            $FileStream.Dispose()
+    # 7. Ensure PATH is updated in User Environment
+    if ($env:TOOLPRUNE_SKIP_PATH_UPDATE -ne "1") {
+        $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+        $NormalizedInstallDir = $InstallDir.TrimEnd('\', '/')
+        $NonEmptyEntries = 0
+        $AlreadyInPath = $false
+        if (-not [string]::IsNullOrEmpty($UserPath)) {
+            foreach ($RawEntry in $UserPath.Split(';')) {
+                if (-not [string]::IsNullOrWhiteSpace($RawEntry)) {
+                    $NonEmptyEntries++
+                    if ($RawEntry.Trim().TrimEnd('\', '/').Equals($NormalizedInstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $AlreadyInPath = $true
+                        break
+                    }
+                }
+            }
         }
-    } finally {
-        $Sha256.Dispose()
-    }
-    $ActualHash = [System.BitConverter]::ToString($HashBytes).Replace("-", "").ToLowerInvariant()
-    if ($ActualHash -ne $ExpectedHash) {
-        Write-Error "SHA-256 checksum mismatch for $ArchiveName (expected $ExpectedHash, got $ActualHash)"
-        exit 1
-    }
-    Write-Host ">>> [INFO] SHA-256 checksum verified: $ActualHash" -ForegroundColor Green
-
-    # 5. Extract and Install (using built-in .NET ZipFile for restricted PSModulePath sessions)
-    Write-Host ">>> [INFO] Extracting archive..." -ForegroundColor Gray
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $ExtractDir = Join-Path $TempDir "extracted"
-    New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractDir)
-
-    $ExtractedBinary = Get-ChildItem -Path $ExtractDir -Filter "*.exe" -Recurse | Select-Object -First 1
-    if (-not $ExtractedBinary) {
-        Write-Error "Extraction failed: Executable not found in archive."
-        exit 1
+        if (-not $AlreadyInPath) {
+            [Console]::WriteLine(">>> [INFO] Adding $InstallDir to User PATH...")
+            if ($NonEmptyEntries -gt 0) {
+                $NewPath = "$InstallDir;$UserPath"
+            } else {
+                $NewPath = $InstallDir
+            }
+            [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+            $env:PATH = "$InstallDir;$env:PATH"
+        }
     }
 
-    if (-not (Test-Path $InstallDir)) {
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    }
-
-    $DestinationFile = Join-Path $InstallDir $BinaryName
-    Copy-Item -Path $ExtractedBinary.FullName -Destination $DestinationFile -Force
-} finally {
-    # 6. Clean up
-    Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+    [Console]::WriteLine("")
+    [Console]::WriteLine("================================================================")
+    [Console]::WriteLine("  toolprune installed successfully to $DestinationFile")
+    [Console]::WriteLine("================================================================")
+    [Console]::WriteLine("")
+    [Console]::WriteLine("  Quick Start:")
+    [Console]::WriteLine("    toolprune proxy --help                 # View options")
+    [Console]::WriteLine("    toolprune proxy --preset balanced      # Run balanced mode")
+    [Console]::WriteLine("    toolprune proxy --preset strict        # Maximum token savings")
+    [Console]::WriteLine("")
+    [Console]::WriteLine("  Documentation: https://github.com/$Repo")
+    [Console]::WriteLine("")
 }
 
-# 7. Ensure PATH is updated in User Environment
-$UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-$NormalizedInstallDir = $InstallDir.TrimEnd('\', '/')
-$PathEntries = @()
-if ($UserPath) {
-    $PathEntries = $UserPath -split ';' | Where-Object { $_ -and $_.Trim() -ne "" }
-}
-$AlreadyInPath = $false
-foreach ($Entry in $PathEntries) {
-    if ($Entry.Trim().TrimEnd('\', '/').Equals($NormalizedInstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $AlreadyInPath = $true
-        break
-    }
-}
-if (-not $AlreadyInPath) {
-    Write-Host ">>> [INFO] Adding $InstallDir to User PATH..." -ForegroundColor Cyan
-    if ($PathEntries.Count -gt 0) {
-        $NewPath = "$InstallDir;$UserPath"
-    } else {
-        $NewPath = $InstallDir
-    }
-    [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
-    $env:PATH = "$InstallDir;$env:PATH"
-}
-
-Write-Host ""
-Write-Host "================================================================" -ForegroundColor Green
-Write-Host "  toolprune installed successfully to $DestinationFile" -ForegroundColor Green
-Write-Host "================================================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "  Quick Start:" -ForegroundColor White
-Write-Host "    toolprune proxy --help                 # View options" -ForegroundColor Yellow
-Write-Host "    toolprune proxy --preset balanced      # Run balanced mode" -ForegroundColor Yellow
-Write-Host "    toolprune proxy --preset strict        # Maximum token savings" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  Documentation: https://github.com/$Repo" -ForegroundColor Gray
-Write-Host ""
+Install-ToolPrune

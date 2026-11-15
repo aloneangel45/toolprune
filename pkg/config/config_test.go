@@ -359,3 +359,101 @@ func TestValidateHelper(t *testing.T) {
 		t.Errorf("unexpected error validating DefaultConfig: %v", err)
 	}
 }
+
+func TestParse_WindowsBackslashesAndHashInEnvVars(t *testing.T) {
+	winExe := `C:\Users\alice\new_folder\tabs_test\toolprune-mcp.exe`
+	winDir := `C:\Program Files\MCP Servers\v1`
+	secretWithHash := `sec_live_123 # not-a-yaml-comment: [a, b]`
+	t.Setenv("TP_WIN_EXE", winExe)
+	t.Setenv("TP_WIN_DIR", winDir)
+	t.Setenv("TP_HASH_SECRET", secretWithHash)
+	t.Setenv("TP_CUSTOM_PORT", "9191")
+
+	yamlDoc := `
+version: "1"
+server:
+  transport: "sse"
+  host: "127.0.0.1"
+  port: ${TP_CUSTOM_PORT:-8080}
+upstreams:
+  - id: "win_srv"
+    transport: "stdio"
+    command: "${TP_WIN_EXE}"
+    dir: ${TP_WIN_DIR}
+    env:
+      QUOTED_SECRET: "${TP_HASH_SECRET}"
+      UNQUOTED_SECRET: ${TP_HASH_SECRET}
+`
+	cfg, err := Parse([]byte(yamlDoc))
+	if err != nil {
+		t.Fatalf("Parse() failed on Windows backslashes / '#' env vars: %v", err)
+	}
+	if cfg.Server.Port != 9191 {
+		t.Errorf("Server.Port = %d, want 9191", cfg.Server.Port)
+	}
+	if len(cfg.Upstreams) != 1 {
+		t.Fatalf("expected 1 upstream, got %d", len(cfg.Upstreams))
+	}
+	if cfg.Upstreams[0].Command != winExe {
+		t.Errorf("Command = %q, want %q", cfg.Upstreams[0].Command, winExe)
+	}
+	if cfg.Upstreams[0].Dir != winDir {
+		t.Errorf("Dir = %q, want %q", cfg.Upstreams[0].Dir, winDir)
+	}
+	if cfg.Upstreams[0].Env["QUOTED_SECRET"] != secretWithHash {
+		t.Errorf("QUOTED_SECRET = %q, want %q", cfg.Upstreams[0].Env["QUOTED_SECRET"], secretWithHash)
+	}
+	if cfg.Upstreams[0].Env["UNQUOTED_SECRET"] != secretWithHash {
+		t.Errorf("UNQUOTED_SECRET = %q, want %q", cfg.Upstreams[0].Env["UNQUOTED_SECRET"], secretWithHash)
+	}
+}
+
+func TestValidate_DuplicateEffectivePrefix(t *testing.T) {
+	t.Run("rejects duplicate explicit prefix when namespace_mode uses prefixes", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Routing.NamespaceMode = "always"
+		cfg.Upstreams = []UpstreamConfig{
+			{ID: "gh_primary", Prefix: "gh", Transport: "stdio", Command: "npx"},
+			{ID: "gh_enterprise", Prefix: "gh", Transport: "stdio", Command: "npx"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "duplicate effective upstream prefix") {
+			t.Fatalf("expected duplicate effective upstream prefix error, got: %v", err)
+		}
+	})
+
+	t.Run("rejects implicit prefix colliding with explicit prefix", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Routing.NamespaceMode = "auto"
+		cfg.Upstreams = []UpstreamConfig{
+			{ID: "gh", Transport: "stdio", Command: "npx"},
+			{ID: "github_ent", Prefix: "gh", Transport: "stdio", Command: "npx"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "duplicate effective upstream prefix") {
+			t.Fatalf("expected duplicate effective upstream prefix error, got: %v", err)
+		}
+	})
+
+	t.Run("allows disabled upstream or namespace_mode none", func(t *testing.T) {
+		cfgDisabled := DefaultConfig()
+		cfgDisabled.Routing.NamespaceMode = "always"
+		cfgDisabled.Upstreams = []UpstreamConfig{
+			{ID: "gh1", Prefix: "gh", Transport: "stdio", Command: "npx"},
+			{ID: "gh2", Prefix: "gh", Transport: "stdio", Command: "npx", Disabled: true},
+		}
+		if err := cfgDisabled.Validate(); err != nil {
+			t.Fatalf("unexpected error when duplicate prefix upstream is disabled: %v", err)
+		}
+
+		cfgNone := DefaultConfig()
+		cfgNone.Routing.NamespaceMode = "none"
+		cfgNone.Upstreams = []UpstreamConfig{
+			{ID: "gh1", Prefix: "gh", Transport: "stdio", Command: "npx"},
+			{ID: "gh2", Prefix: "gh", Transport: "stdio", Command: "npx"},
+		}
+		if err := cfgNone.Validate(); err != nil {
+			t.Fatalf("unexpected error when namespace_mode is none: %v", err)
+		}
+	})
+}

@@ -32,25 +32,34 @@ func terminatePlatformProcessTree(s *Supervisor) error {
 	// Stage 1: Send SIGTERM to entire process group (-pgid)
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 
-	// Await termination with short grace period
+	// Await termination with short grace period; stopPoll guarantees the polling goroutine never leaks.
 	done := make(chan struct{})
+	stopPoll := make(chan struct{})
+	defer close(stopPoll)
+
 	go func() {
-		// Poll process state
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
 		for {
-			err := syscall.Kill(-pgid, 0)
-			if err != nil {
-				// Process group no longer exists
+			if err := syscall.Kill(-pgid, 0); err != nil {
 				close(done)
 				return
 			}
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-stopPoll:
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
+
+	timer := time.NewTimer(1 * time.Second)
+	defer timer.Stop()
 
 	select {
 	case <-done:
 		return nil
-	case <-time.After(1 * time.Second):
+	case <-timer.C:
 		// Stage 2: Escalate to SIGKILL to entire process group (-pgid)
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		return fmt.Errorf("process group %d did not terminate on SIGTERM, killed with SIGKILL", pgid)
@@ -58,7 +67,7 @@ func terminatePlatformProcessTree(s *Supervisor) error {
 }
 
 func cleanupPlatformSupervision(s *Supervisor) {
-	// No OS handles to close on POSIX
+	// No OS handles to close on POSIX (idempotent no-op)
 }
 
 // ResolveExecutable resolves executable using standard exec.LookPath on Unix.

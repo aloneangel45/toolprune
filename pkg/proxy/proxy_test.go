@@ -1114,3 +1114,406 @@ func TestSSE_StreamableHTTP_Lifecycle(t *testing.T) {
 		t.Fatalf("expected 404 Not Found for terminated session, got %d", postDeletedResp.StatusCode)
 	}
 }
+
+type mockErrorDispatcher struct {
+	mu          sync.Mutex
+	registered  map[string]proxy.ClientSession
+	failMethods map[string]error
+}
+
+func newMockErrorDispatcher() *mockErrorDispatcher {
+	return &mockErrorDispatcher{
+		registered:  make(map[string]proxy.ClientSession),
+		failMethods: make(map[string]error),
+	}
+}
+
+func (d *mockErrorDispatcher) RegisterClient(client proxy.ClientSession) {
+	if client == nil {
+		return
+	}
+	d.mu.Lock()
+	d.registered[client.ID()] = client
+	d.mu.Unlock()
+}
+
+func (d *mockErrorDispatcher) UnregisterClient(clientID string) {
+	d.mu.Lock()
+	delete(d.registered, clientID)
+	d.mu.Unlock()
+}
+
+func (d *mockErrorDispatcher) RegisteredCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.registered)
+}
+
+func (d *mockErrorDispatcher) HandleClientMessage(client proxy.ClientSession, msg *mcp.Message) error {
+	if msg == nil {
+		return errors.New("nil message")
+	}
+	d.mu.Lock()
+	failErr := d.failMethods[msg.Method]
+	d.mu.Unlock()
+	if failErr != nil {
+		return failErr
+	}
+	if msg.IsRequest() {
+		resp, err := mcp.NewResponse(*msg.ID, map[string]any{"ok": msg.Method})
+		if err != nil {
+			return err
+		}
+		return client.Send(resp)
+	}
+	return nil
+}
+
+type stdioTestClientSession struct {
+	id string
+	tr *proxy.StdioTransport
+}
+
+func (s *stdioTestClientSession) ID() string                    { return s.id }
+func (s *stdioTestClientSession) Send(msg *mcp.Message) error   { return s.tr.WriteMessage(msg) }
+func (s *stdioTestClientSession) Close() error                  { return nil }
+func (s *stdioTestClientSession) Context() context.Context      { return context.Background() }
+
+func TestStdio_BatchSupport(t *testing.T) {
+	input := strings.Join([]string{
+		`[]`,
+		`[{"jsonrpc":"2.0","id":10,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},123]`,
+		`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	transport := proxy.NewStdioTransport(proxy.StdioOptions{
+		In:  strings.NewReader(input),
+		Out: &out,
+	})
+	sess := &stdioTestClientSession{id: "stdio-batch", tr: transport}
+	disp := newMockErrorDispatcher()
+
+	for {
+		err := transport.HandleNext(context.Background(), sess, disp)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected HandleNext error: %v", err)
+		}
+	}
+	transport.WaitPendingBatches()
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 output lines (empty batch error + mixed batch response; zero output for notification-only batch), got %d: %q", len(lines), out.String())
+	}
+
+	// Line 1: empty batch -> single -32600 error object
+	var emptyErr mcp.Message
+	if err := json.Unmarshal([]byte(lines[0]), &emptyErr); err != nil {
+		t.Fatalf("decode line 1 failed: %v", err)
+	}
+	if emptyErr.Error == nil || emptyErr.Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("expected -32600 for empty batch, got %+v", emptyErr)
+	}
+
+	// Line 2: mixed batch -> 2-element array ([id=10 result, -32600 invalid element])
+	var batchResps []mcp.Message
+	if err := json.Unmarshal([]byte(lines[1]), &batchResps); err != nil {
+		t.Fatalf("decode line 2 batch array failed: %v", err)
+	}
+	if len(batchResps) != 2 {
+		t.Fatalf("expected 2 batch responses, got %d: %+v", len(batchResps), batchResps)
+	}
+	if batchResps[0].ID == nil || batchResps[0].ID.String() != "10" || batchResps[0].Error != nil {
+		t.Fatalf("expected first batch item id=10 result, got %+v", batchResps[0])
+	}
+	if batchResps[1].Error == nil || batchResps[1].Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("expected second batch item -32600 Invalid Request, got %+v", batchResps[1])
+	}
+}
+
+func TestSSE_StreamableHTTP_BatchAndDispatcherError(t *testing.T) {
+	disp := newMockErrorDispatcher()
+	disp.failMethods["explode"] = errors.New("simulated upstream failure")
+
+	sseSrv := proxy.NewSSEServerWithDispatcher(proxy.DefaultSSEServerConfig(), disp)
+	ts := httptest.NewServer(sseSrv.Handler())
+	defer ts.Close()
+	defer sseSrv.Shutdown(context.Background())
+
+	// 1. Empty batch [] on POST /mcp -> 400 with -32600
+	emptyResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`[]`))
+	if err != nil {
+		t.Fatalf("POST /mcp [] failed: %v", err)
+	}
+	defer emptyResp.Body.Close()
+	if emptyResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for empty batch, got %d", emptyResp.StatusCode)
+	}
+	var emptyMsg mcp.Message
+	if err := json.NewDecoder(emptyResp.Body).Decode(&emptyMsg); err != nil {
+		t.Fatalf("decode empty batch error failed: %v", err)
+	}
+	if emptyMsg.Error == nil || emptyMsg.Error.Code != mcp.CodeInvalidRequest {
+		t.Fatalf("expected -32600 for empty batch, got %+v", emptyMsg)
+	}
+
+	// 2. Mixed batch on POST /mcp -> 200 JSON array (ordered)
+	batchBody := `[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":2,"method":"explode"}]`
+	batchResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(batchBody))
+	if err != nil {
+		t.Fatalf("POST /mcp batch failed: %v", err)
+	}
+	defer batchResp.Body.Close()
+	if batchResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for mixed batch, got %d", batchResp.StatusCode)
+	}
+	var batchItems []mcp.Message
+	if err := json.NewDecoder(batchResp.Body).Decode(&batchItems); err != nil {
+		t.Fatalf("decode mixed batch response failed: %v", err)
+	}
+	if len(batchItems) != 2 {
+		t.Fatalf("expected 2 responses in batch array, got %d: %+v", len(batchItems), batchItems)
+	}
+	if batchItems[0].ID == nil || batchItems[0].ID.String() != "1" || batchItems[0].Error != nil {
+		t.Fatalf("expected item[0] id=1 success, got %+v", batchItems[0])
+	}
+	if batchItems[1].ID == nil || batchItems[1].ID.String() != "2" || batchItems[1].Error == nil || batchItems[1].Error.Code != mcp.CodeInternalError {
+		t.Fatalf("expected item[1] id=2 -32603 internal error, got %+v", batchItems[1])
+	}
+
+	// 3. Notification-only batch on POST /mcp -> 202 Accepted
+	notifBatchResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`))
+	if err != nil {
+		t.Fatalf("POST /mcp notification batch failed: %v", err)
+	}
+	_ = notifBatchResp.Body.Close()
+	if notifBatchResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted for notification-only batch, got %d", notifBatchResp.StatusCode)
+	}
+
+	// 4. Single request where HandleClientMessage returns non-nil error -> immediate -32603 (never hangs!)
+	client := &http.Client{Timeout: 2 * time.Second}
+	errReqResp, err := client.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":99,"method":"explode"}`))
+	if err != nil {
+		t.Fatalf("POST /mcp explode timed out or failed: %v", err)
+	}
+	defer errReqResp.Body.Close()
+	var errMsg mcp.Message
+	if err := json.NewDecoder(errReqResp.Body).Decode(&errMsg); err != nil {
+		t.Fatalf("decode explode response failed: %v", err)
+	}
+	if errMsg.Error == nil || errMsg.Error.Code != mcp.CodeInternalError {
+		t.Fatalf("expected -32603 Internal Error when dispatcher fails, got %+v", errMsg)
+	}
+}
+
+func TestSSE_ClientLifecycleAndSessionEviction(t *testing.T) {
+	disp := newMockErrorDispatcher()
+	sseSrv := proxy.NewSSEServerWithDispatcher(proxy.DefaultSSEServerConfig(), disp)
+	ts := httptest.NewServer(sseSrv.Handler())
+	defer ts.Close()
+	defer sseSrv.Shutdown(context.Background())
+
+	// 1. Stateless POST /mcp must NOT register push client on dispatcher
+	initResp, err := http.Post(ts.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	if err != nil {
+		t.Fatalf("POST /mcp initialize failed: %v", err)
+	}
+	sessionID := initResp.Header.Get("Mcp-Session-Id")
+	_ = initResp.Body.Close()
+	if disp.RegisteredCount() != 0 {
+		t.Fatalf("expected 0 registered push clients after stateless POST /mcp, got %d", disp.RegisteredCount())
+	}
+
+	// 2. GET /mcp registers push client and unregisters cleanly when r.Context().Done() fires
+	ctx, cancel := context.WithCancel(context.Background())
+	getReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/mcp", nil)
+	getReq.Header.Set("Mcp-Session-Id", sessionID)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /mcp failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		_ = getResp.Body.Close()
+		cancel()
+		t.Fatalf("expected 200 OK on GET /mcp, got %d", getResp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for disp.RegisteredCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if disp.RegisteredCount() != 1 {
+		_ = getResp.Body.Close()
+		cancel()
+		t.Fatalf("expected 1 registered push client while GET /mcp stream is open, got %d", disp.RegisteredCount())
+	}
+
+	cancel()
+	_ = getResp.Body.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for disp.RegisteredCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if disp.RegisteredCount() != 0 {
+		t.Fatalf("expected 0 registered push clients after GET /mcp disconnect, got %d", disp.RegisteredCount())
+	}
+
+	// 3. Non-blocking SSESession.Send when buffer is full
+	smallSess := proxy.NewSSESession(context.Background(), "small-buf", 1)
+	defer smallSess.Close()
+	notif, _ := mcp.NewNotification("notifications/message", map[string]any{"x": 1})
+	if err := smallSess.Send(notif); err != nil {
+		t.Fatalf("first send to buffer=1 should succeed: %v", err)
+	}
+	start := time.Now()
+	err = smallSess.Send(notif)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected buffer-full error on second send without draining")
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("expected non-blocking SSESession.Send (<100ms), took %v", elapsed)
+	}
+
+	// 4. SessionManager idle eviction and MaxSessions cap
+	var evicted []string
+	var evMu sync.Mutex
+	mgr := proxy.NewSessionManagerWithConfig(proxy.SessionManagerConfig{
+		MaxSessions: 2,
+		IdleTTL:     40 * time.Millisecond,
+		OnEvict: func(id string) {
+			evMu.Lock()
+			evicted = append(evicted, id)
+			evMu.Unlock()
+		},
+	})
+	s1 := mgr.CreateSession(context.Background())
+	time.Sleep(5 * time.Millisecond)
+	s2 := mgr.CreateSession(context.Background())
+	time.Sleep(5 * time.Millisecond)
+	s3 := mgr.CreateSession(context.Background()) // exceeds MaxSessions=2 -> evicts oldest idle s1
+	if mgr.Count() != 2 {
+		t.Fatalf("expected MaxSessions=2 to cap count at 2, got %d", mgr.Count())
+	}
+	if _, ok := mgr.GetSession(s1.ID()); ok {
+		t.Fatal("expected oldest session s1 to be evicted when MaxSessions exceeded")
+	}
+	if _, ok := mgr.GetSession(s2.ID()); !ok {
+		t.Fatal("expected s2 to remain active")
+	}
+	if _, ok := mgr.GetSession(s3.ID()); !ok {
+		t.Fatal("expected s3 to remain active")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if n := mgr.EvictIdle(time.Now()); n != 2 {
+		t.Fatalf("expected 2 idle sessions evicted after TTL, got %d", n)
+	}
+	evMu.Lock()
+	evCount := len(evicted)
+	evMu.Unlock()
+	if evCount != 3 {
+		t.Fatalf("expected OnEvict called for all 3 evicted sessions, got %d", evCount)
+	}
+}
+
+func TestSSE_CORSAndHostHardening_V132(t *testing.T) {
+	disp := newMockErrorDispatcher()
+
+	// 1. Loopback server accepts 127.0.0.2 and trailing-dot localhost.
+	loopSrv := proxy.NewSSEServerWithDispatcher(proxy.DefaultSSEServerConfig(), disp)
+	h := loopSrv.Handler()
+
+	for _, hostHdr := range []string{"127.0.0.2:8080", "localhost.:8080"} {
+		req := httptest.NewRequest(http.MethodGet, "http://"+hostHdr+"/health", nil)
+		req.Host = hostHdr
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected loopback host %q to be accepted (200), got %d", hostHdr, rr.Code)
+		}
+	}
+
+	// 2. Wildcard "*" on non-loopback listener emits literal "*" without reflecting arbitrary Origin or Allow-Credentials
+	wildCfg := proxy.DefaultSSEServerConfig()
+	wildCfg.Host = "0.0.0.0"
+	wildCfg.CORSOrigins = []string{"*"}
+	wildSrv := proxy.NewSSEServerWithDispatcher(wildCfg, disp)
+	wh := wildSrv.Handler()
+
+	req := httptest.NewRequest(http.MethodOptions, "http://example.internal:8080/mcp", nil)
+	req.Host = "example.internal:8080"
+	req.Header.Set("Origin", "https://attacker.example")
+	rr := httptest.NewRecorder()
+	wh.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 on OPTIONS preflight, got %d", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("expected literal '*' Access-Control-Allow-Origin on wildcard config, got %q", got)
+	}
+	if creds := rr.Header().Get("Access-Control-Allow-Credentials"); creds != "" {
+		t.Fatalf("wildcard CORS must never set Access-Control-Allow-Credentials, got %q", creds)
+	}
+}
+
+func TestSupervisor_NaturalExitIdempotentCleanup(t *testing.T) {
+	for iter := 0; iter < 3; iter++ {
+		sup := proxy.NewSupervisor(proxy.SupervisorConfig{
+			Command: os.Args[0],
+			Args:    []string{"-test.run=TestHelperProcess"},
+			Env: map[string]string{
+				"GO_WANT_HELPER_PROCESS": "1",
+				"HELPER_MODE":            "emit_and_exit_immediately",
+			},
+		})
+		if err := sup.Start(context.Background()); err != nil {
+			t.Fatalf("iter %d Start failed: %v", iter, err)
+		}
+		select {
+		case <-sup.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iter %d timed out waiting for natural child exit", iter)
+		}
+		// Multiple Stop() calls after natural exit must be completely idempotent
+		if err := sup.Stop(); err != nil {
+			t.Fatalf("iter %d first Stop() after natural exit failed: %v", iter, err)
+		}
+		if err := sup.Stop(); err != nil {
+			t.Fatalf("iter %d second Stop() after natural exit failed: %v", iter, err)
+		}
+	}
+}
+
+func TestProxy_UpstreamRequestNoClientReturnsMethodNotFound(t *testing.T) {
+	mockUpstream := NewMockUpstream()
+	prx := proxy.NewProxy(proxy.DefaultProxyConfig(), mockUpstream, nil)
+	prx.Start()
+	defer prx.Shutdown()
+
+	// Upstream sends a server->client request (e.g. roots/list) while zero clients are connected
+	reqID := mcp.NewIntID(77)
+	upReq, err := mcp.NewRequest(reqID, "roots/list", map[string]any{})
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	mockUpstream.PushToProxy(upReq)
+
+	select {
+	case reply := <-mockUpstream.outbound:
+		if reply == nil || reply.ID == nil || reply.ID.String() != "77" {
+			t.Fatalf("expected correlated reply id=77 to upstream, got %+v", reply)
+		}
+		if reply.Error == nil || reply.Error.Code != mcp.CodeMethodNotFound {
+			t.Fatalf("expected -32601 Method not found when no client handles upstream request, got %+v", reply)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for -32601 reply to upstream request")
+	}
+}

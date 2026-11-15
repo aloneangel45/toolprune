@@ -141,6 +141,10 @@ func IsMetaTool(name string) bool {
 
 // GetMetaToolDefinitions returns the mcp.Tool declarations for active meta-tools.
 func GetMetaToolDefinitions(cfg CatalogConfig) []mcp.Tool {
+	if !cfg.EnableMetaTools {
+		return nil
+	}
+
 	var metaTools []mcp.Tool
 
 	if cfg.EnableSearchMeta {

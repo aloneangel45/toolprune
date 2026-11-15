@@ -609,3 +609,94 @@ func TestRouterGateway_MultiUpstreamStreamableHTTP(t *testing.T) {
 		t.Fatalf("expected upstream response containing rewritten 'get_pr', got %s", string(rpcCall.Result))
 	}
 }
+
+func TestRouter_CatalogMetaToolFlagsHonored(t *testing.T) {
+	ctx := context.Background()
+	pruneEngine := pruner.New()
+
+	t.Run("EnableMetaTools false omits all meta-tools and disables internal handling", func(t *testing.T) {
+		cfg := router.DefaultRouterConfig()
+		cfg.PruneMode = "dynamic"
+		cfg.EnableCatalog = true
+		cfg.Catalog.EnableMetaTools = false
+
+		r := router.NewRouter(cfg, pruneEngine, nil)
+		defer func() { _ = r.Close() }()
+
+		_ = r.Multiplexer().RegisterUpstream(ctx, router.UpstreamConfig{ID: "gh"})
+		r.Multiplexer().SyncUpstreamTools(ctx, "gh", []mcp.Tool{
+			{Name: "list_issues", Description: "List issues", InputSchema: mcp.InputSchema{Type: "object"}},
+		})
+
+		listReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodToolsList, nil)
+		resp, err := r.HandleToolsList(ctx, listReq)
+		if err != nil {
+			t.Fatalf("HandleToolsList failed: %v", err)
+		}
+		var listRes mcp.ListToolsResult
+		_ = json.Unmarshal(resp.Result, &listRes)
+		for _, tool := range listRes.Tools {
+			if router.IsMetaTool(tool.Name) {
+				t.Fatalf("expected zero meta-tools when EnableMetaTools=false, found %q", tool.Name)
+			}
+		}
+
+		searchPayload, _ := json.Marshal(mcp.CallToolRequestParams{
+			Name:      router.MetaToolSearch,
+			Arguments: json.RawMessage(`{"query":"issues"}`),
+		})
+		searchReq, _ := mcp.NewRequest(mcp.NewIntID(2), mcp.MethodToolsCall, json.RawMessage(searchPayload))
+		if _, handled := r.HandleInternalToolCall(searchReq); handled {
+			t.Fatal("expected HandleInternalToolCall to return handled=false when EnableMetaTools=false")
+		}
+	})
+
+	t.Run("selective Enable*Meta booleans respected", func(t *testing.T) {
+		cfg := router.DefaultRouterConfig()
+		cfg.PruneMode = "dynamic"
+		cfg.EnableCatalog = true
+		cfg.Catalog.EnableSearchMeta = true
+		cfg.Catalog.EnableSchemaMeta = false
+		cfg.Catalog.EnableActivateMeta = false
+		cfg.Catalog.EnableInvokeMeta = false
+
+		r := router.NewRouter(cfg, pruneEngine, nil)
+		defer func() { _ = r.Close() }()
+
+		listReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodToolsList, nil)
+		resp, err := r.HandleToolsList(ctx, listReq)
+		if err != nil {
+			t.Fatalf("HandleToolsList failed: %v", err)
+		}
+		var listRes mcp.ListToolsResult
+		_ = json.Unmarshal(resp.Result, &listRes)
+		if len(listRes.Tools) != 1 || listRes.Tools[0].Name != router.MetaToolSearch {
+			t.Fatalf("expected only %q, got %+v", router.MetaToolSearch, listRes.Tools)
+		}
+	})
+
+	t.Run("PruneMode none without catalog or window injects zero meta-tools", func(t *testing.T) {
+		cfg := router.DefaultRouterConfig()
+		cfg.PruneMode = "none"
+		cfg.EnableCatalog = false
+
+		r := router.NewRouter(cfg, pruneEngine, nil)
+		defer func() { _ = r.Close() }()
+
+		_ = r.Multiplexer().RegisterUpstream(ctx, router.UpstreamConfig{ID: "gh"})
+		r.Multiplexer().SyncUpstreamTools(ctx, "gh", []mcp.Tool{
+			{Name: "ping_repo", Description: "Ping repo", InputSchema: mcp.InputSchema{Type: "object"}},
+		})
+
+		listReq, _ := mcp.NewRequest(mcp.NewIntID(1), mcp.MethodToolsList, nil)
+		resp, err := r.HandleToolsList(ctx, listReq)
+		if err != nil {
+			t.Fatalf("HandleToolsList failed: %v", err)
+		}
+		var listRes mcp.ListToolsResult
+		_ = json.Unmarshal(resp.Result, &listRes)
+		if len(listRes.Tools) != 1 || listRes.Tools[0].Name != "ping_repo" {
+			t.Fatalf("expected pure passthrough [ping_repo], got %+v", listRes.Tools)
+		}
+	})
+}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,14 @@ type gatewayInFlight struct {
 	StartTime     time.Time
 }
 
+type reverseGatewayInFlight struct {
+	UpstreamID    string
+	UpstreamReqID *mcp.RequestID
+	Target        *UpstreamTarget
+	Method        string
+	StartTime     time.Time
+}
+
 // RouterGateway bridges client transports (Stdio, SSE, Streamable HTTP) to a multi-upstream Router
 // with full asynchronous multiplexing, per-upstream crash isolation, timeout sweeping, and debounced
 // tools/list_changed notifications.
@@ -42,9 +51,10 @@ type RouterGateway struct {
 	clientsMu sync.RWMutex
 	clients   map[string]proxy.ClientSession
 
-	trackMu  sync.Mutex
-	inFlight map[string]*gatewayInFlight
-	seq      atomic.Uint64
+	trackMu         sync.Mutex
+	inFlight        map[string]*gatewayInFlight
+	reverseInFlight map[string]*reverseGatewayInFlight
+	seq             atomic.Uint64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -57,7 +67,7 @@ func NewRouterGateway(r *Router, cfg GatewayConfig) *RouterGateway {
 		cfg.RequestTimeout = 60 * time.Second
 	}
 	if cfg.ServerVersion == "" {
-		cfg.ServerVersion = "1.3.1"
+		cfg.ServerVersion = "1.3.2"
 	}
 	if cfg.DebounceInterval <= 0 {
 		cfg.DebounceInterval = 50 * time.Millisecond
@@ -69,13 +79,14 @@ func NewRouterGateway(r *Router, cfg GatewayConfig) *RouterGateway {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	gw := &RouterGateway{
-		cfg:      cfg,
-		router:   r,
-		logger:   logger,
-		clients:  make(map[string]proxy.ClientSession),
-		inFlight: make(map[string]*gatewayInFlight),
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:             cfg,
+		router:          r,
+		logger:          logger,
+		clients:         make(map[string]proxy.ClientSession),
+		inFlight:        make(map[string]*gatewayInFlight),
+		reverseInFlight: make(map[string]*reverseGatewayInFlight),
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 	gw.seq.Store(1000)
 
@@ -126,10 +137,22 @@ func (g *RouterGateway) UnregisterClient(sessionID string) {
 	delete(g.clients, sessionID)
 }
 
-func (g *RouterGateway) broadcastMessage(msg *mcp.Message) error {
+func (g *RouterGateway) snapshotClients() []proxy.ClientSession {
 	g.clientsMu.RLock()
-	defer g.clientsMu.RUnlock()
+	clients := make([]proxy.ClientSession, 0, len(g.clients))
 	for _, client := range g.clients {
+		clients = append(clients, client)
+	}
+	g.clientsMu.RUnlock()
+	sort.Slice(clients, func(i, j int) bool {
+		return clients[i].ID() < clients[j].ID()
+	})
+	return clients
+}
+
+func (g *RouterGateway) broadcastMessage(msg *mcp.Message) error {
+	clients := g.snapshotClients()
+	for _, client := range clients {
 		_ = client.Send(msg)
 	}
 	return nil
@@ -139,6 +162,24 @@ func (g *RouterGateway) broadcastMessage(msg *mcp.Message) error {
 func (g *RouterGateway) HandleClientMessage(session proxy.ClientSession, msg *mcp.Message) error {
 	if msg == nil {
 		return errors.New("nil message received")
+	}
+
+	if msg.IsResponse() {
+		if msg.ID != nil {
+			key := msg.ID.String()
+			g.trackMu.Lock()
+			rev, ok := g.reverseInFlight[key]
+			if ok {
+				delete(g.reverseInFlight, key)
+			}
+			g.trackMu.Unlock()
+			if ok && rev.Target != nil && rev.Target.Transport() != nil {
+				out := *msg
+				out.ID = rev.UpstreamReqID
+				return rev.Target.Transport().Send(&out)
+			}
+		}
+		return nil
 	}
 
 	if msg.IsNotification() {
@@ -313,6 +354,49 @@ func (g *RouterGateway) HandleUpstreamNotification(upstreamID string, msg *mcp.M
 	_ = g.broadcastMessage(msg)
 }
 
+// HandleUpstreamRequest satisfies UpstreamRequestHandler, forwarding upstream-initiated JSON-RPC
+// requests (such as roots/list, sampling/createMessage, or ping) to an active client or immediately
+// replying with -32601 Method not found when no active client is available so upstreams never hang.
+func (g *RouterGateway) HandleUpstreamRequest(upstreamID string, target *UpstreamTarget, msg *mcp.Message) {
+	if msg == nil || target == nil || target.Transport() == nil {
+		return
+	}
+
+	clients := g.snapshotClients()
+	if len(clients) > 0 && msg.ID != nil {
+		revKey := fmt.Sprintf("tp_up_%d", g.seq.Add(1))
+		revID := mcp.NewStringID(revKey)
+		g.trackMu.Lock()
+		g.reverseInFlight[revID.String()] = &reverseGatewayInFlight{
+			UpstreamID:    upstreamID,
+			UpstreamReqID: msg.ID,
+			Target:        target,
+			Method:        msg.Method,
+			StartTime:     time.Now(),
+		}
+		g.trackMu.Unlock()
+
+		out := *msg
+		out.ID = &revID
+		for _, client := range clients {
+			if err := client.Send(&out); err == nil {
+				return
+			}
+		}
+
+		g.trackMu.Lock()
+		delete(g.reverseInFlight, revID.String())
+		g.trackMu.Unlock()
+	}
+
+	errResp := mcp.NewErrorMessage(
+		msg.ID,
+		mcp.CodeMethodNotFound,
+		fmt.Sprintf("Method not found: %s", msg.Method),
+	)
+	_ = target.Transport().Send(errResp)
+}
+
 // HandleUpstreamCrash satisfies UpstreamMessageHandler, failing only requests routed to the crashed upstream.
 func (g *RouterGateway) HandleUpstreamCrash(upstreamID string, err error) {
 	g.trackMu.Lock()
@@ -321,6 +405,11 @@ func (g *RouterGateway) HandleUpstreamCrash(upstreamID string, err error) {
 		if req.UpstreamID == upstreamID {
 			affected = append(affected, req)
 			delete(g.inFlight, k)
+		}
+	}
+	for k, rev := range g.reverseInFlight {
+		if rev.UpstreamID == upstreamID {
+			delete(g.reverseInFlight, k)
 		}
 	}
 	g.trackMu.Unlock()
@@ -355,6 +444,7 @@ func (g *RouterGateway) runTimeoutSweeper() {
 		case <-ticker.C:
 			now := time.Now()
 			var expired []*gatewayInFlight
+			var expiredRev []*reverseGatewayInFlight
 			g.trackMu.Lock()
 			for k, req := range g.inFlight {
 				if now.Sub(req.StartTime) > g.cfg.RequestTimeout {
@@ -362,11 +452,23 @@ func (g *RouterGateway) runTimeoutSweeper() {
 					delete(g.inFlight, k)
 				}
 			}
+			for k, rev := range g.reverseInFlight {
+				if now.Sub(rev.StartTime) > g.cfg.RequestTimeout {
+					expiredRev = append(expiredRev, rev)
+					delete(g.reverseInFlight, k)
+				}
+			}
 			g.trackMu.Unlock()
 
 			for _, req := range expired {
 				errMsg := mcp.NewErrorMessage(req.ClientID, mcp.CodeInternalError, "upstream request timed out")
 				_ = req.ClientSession.Send(errMsg)
+			}
+			for _, rev := range expiredRev {
+				if rev.Target != nil && rev.Target.Transport() != nil {
+					errMsg := mcp.NewErrorMessage(rev.UpstreamReqID, mcp.CodeMethodNotFound, fmt.Sprintf("Method not found: %s", rev.Method))
+					_ = rev.Target.Transport().Send(errMsg)
+				}
 			}
 		}
 	}

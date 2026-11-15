@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,11 +52,12 @@ func ErrorToJSONRPCResponse(err error) *mcp.Message {
 }
 
 // StdioTransport manages thread-safe, buffered newline-delimited JSON-RPC 2.0 communication
-// over standard input/output streams.
+// over standard input/output streams, supporting both single messages and JSON-RPC 2.0 batch arrays.
 type StdioTransport struct {
 	reader         *bufio.Reader
 	writer         io.Writer
 	writeMu        sync.Mutex
+	batchWg        sync.WaitGroup
 	logger         *slog.Logger
 	maxMessageSize int
 	closed         atomic.Bool
@@ -99,10 +101,9 @@ func NewStdioTransport(opts StdioOptions) *StdioTransport {
 	}
 }
 
-// ReadMessage reads a single newline-delimited JSON-RPC 2.0 message from the input stream.
-// It enforces maxMessageSize prior to heap allocation and classifies parse vs invalid-request errors
-// so stdio loops can emit protocol-compliant JSON-RPC error responses without crashing.
-func (t *StdioTransport) ReadMessage() (*mcp.Message, error) {
+// ReadPayload reads the next newline-delimited JSON-RPC 2.0 payload (either a single object
+// or a non-empty JSON-RPC 2.0 batch array [...]) from the input stream.
+func (t *StdioTransport) ReadPayload() (*ParsedPayload, error) {
 	if t.closed.Load() {
 		return nil, ErrTransportClosed
 	}
@@ -121,9 +122,7 @@ func (t *StdioTransport) ReadMessage() (*mcp.Message, error) {
 			}
 		}
 
-		// Normalize line endings and strip whitespace
 		trimmed := bytes.TrimSpace(line)
-		// Ignore empty lines / blank heartbeats
 		if len(trimmed) == 0 {
 			if err != nil {
 				return nil, err
@@ -131,46 +130,71 @@ func (t *StdioTransport) ReadMessage() (*mcp.Message, error) {
 			continue
 		}
 
-		// Batch arrays [...] or bare JSON primitives are valid JSON syntax (-32600 Invalid Request)
-		// rather than syntax parse errors (-32700 Parse error).
-		if trimmed[0] != '{' {
-			var probe any
-			if synErr := json.Unmarshal(trimmed, &probe); synErr != nil {
-				t.logger.Warn("malformed JSON-RPC message received",
-					"error", synErr,
-					"raw_snippet", truncateSnippet(trimmed, 128),
-				)
-				return nil, fmt.Errorf("%w: %v", mcp.ErrParse, synErr)
-			}
-			return nil, fmt.Errorf("%w: JSON-RPC batch arrays and non-object payloads are not supported", mcp.ErrInvalidRequest)
-		}
-
-		var msg mcp.Message
-		if unmarshalErr := json.Unmarshal(trimmed, &msg); unmarshalErr != nil {
+		parsed, parseErr := ParseJSONRPCPayload(trimmed)
+		if parseErr != nil {
 			t.logger.Warn("malformed JSON-RPC message received",
-				"error", unmarshalErr,
+				"error", parseErr,
 				"raw_snippet", truncateSnippet(trimmed, 128),
 			)
-			if errors.Is(unmarshalErr, mcp.ErrInvalidRequestID) {
-				return nil, fmt.Errorf("%w: %v", mcp.ErrInvalidRequest, unmarshalErr)
-			}
-			var syntaxErr *json.SyntaxError
-			if errors.As(unmarshalErr, &syntaxErr) {
-				return nil, fmt.Errorf("%w: %v", mcp.ErrParse, unmarshalErr)
-			}
-			var typeErr *json.UnmarshalTypeError
-			if errors.As(unmarshalErr, &typeErr) {
-				return nil, fmt.Errorf("%w: %v", mcp.ErrInvalidRequest, unmarshalErr)
-			}
-			return nil, fmt.Errorf("%w: %v", mcp.ErrParse, unmarshalErr)
+			return nil, parseErr
 		}
 
-		if envErr := msg.ValidateEnvelope(); envErr != nil {
-			return nil, envErr
-		}
-
-		return &msg, nil
+		return parsed, nil
 	}
+}
+
+// ReadMessage reads a single newline-delimited JSON-RPC 2.0 message from the input stream.
+func (t *StdioTransport) ReadMessage() (*mcp.Message, error) {
+	parsed, err := t.ReadPayload()
+	if err != nil {
+		return nil, err
+	}
+	if parsed.IsBatch {
+		return nil, fmt.Errorf("%w: unexpected batch array in single-message ReadMessage; use ReadPayload or HandleNext", mcp.ErrInvalidRequest)
+	}
+	return parsed.Single, nil
+}
+
+// HandleNext reads one JSON-RPC 2.0 line (single object or batch array [...]), emits protocol-compliant
+// error responses on recoverable parse/invalid-request errors, and dispatches valid messages or batches.
+// Returns io.EOF or ErrTransportClosed cleanly when the stream terminates.
+func (t *StdioTransport) HandleNext(ctx context.Context, session ClientSession, dispatcher MessageDispatcher) error {
+	payload, err := t.ReadPayload()
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, ErrTransportClosed) {
+			t.batchWg.Wait()
+			return err
+		}
+		if rpcErrResp := ErrorToJSONRPCResponse(err); rpcErrResp != nil {
+			_ = t.WriteMessage(rpcErrResp)
+			return nil
+		}
+		t.batchWg.Wait()
+		return err
+	}
+
+	if payload.IsBatch {
+		elems := payload.Batch
+		t.batchWg.Add(1)
+		go func() {
+			defer t.batchWg.Done()
+			resps := DispatchBatch(ctx, session, dispatcher, elems)
+			if len(resps) > 0 {
+				_ = t.WriteBatch(resps)
+			}
+		}()
+		return nil
+	}
+
+	if hErr := dispatcher.HandleClientMessage(session, payload.Single); hErr != nil {
+		t.logger.Warn("error handling stdio client message", "err", hErr)
+	}
+	return nil
+}
+
+// WaitPendingBatches blocks until all in-flight batch responses have been written.
+func (t *StdioTransport) WaitPendingBatches() {
+	t.batchWg.Wait()
 }
 
 // WriteMessage serializes a JSON-RPC 2.0 message to JSON and writes it to stdout with a trailing newline.
@@ -188,13 +212,29 @@ func (t *StdioTransport) WriteMessage(msg *mcp.Message) error {
 	return t.WriteRaw(data)
 }
 
+// WriteBatch serializes a non-empty slice of JSON-RPC 2.0 responses as a single JSON array line.
+func (t *StdioTransport) WriteBatch(msgs []*mcp.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	if t.closed.Load() {
+		return ErrTransportClosed
+	}
+
+	data, err := json.Marshal(msgs)
+	if err != nil {
+		return fmt.Errorf("marshal JSON-RPC batch response: %w", err)
+	}
+
+	return t.WriteRaw(data)
+}
+
 // WriteRaw writes arbitrary raw JSON bytes followed by a newline atomically under the write lock.
 func (t *StdioTransport) WriteRaw(data []byte) error {
 	if t.closed.Load() {
 		return ErrTransportClosed
 	}
 
-	// Prepare buffer with trailing newline to execute a single atomic Write call
 	payload := make([]byte, len(data)+1)
 	copy(payload, data)
 	payload[len(data)] = '\n'

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,8 @@ type SSEServerConfig struct {
 	CORSOrigins     []string      // Allowed CORS origins (default: ["*"])
 	KeepAlivePeriod time.Duration // Interval for ": ping" comments (default: 15s)
 	MaxBodySize     int64         // Maximum inbound POST body (default: 10MB)
+	MaxSessions     int           // Maximum tracked HTTP/SSE sessions (default: 1024)
+	SessionIdleTTL  time.Duration // Idle session eviction TTL (default: 30m)
 }
 
 // DefaultSSEServerConfig returns production-ready default configuration.
@@ -46,6 +49,8 @@ func DefaultSSEServerConfig() SSEServerConfig {
 		CORSOrigins:     []string{"*"},
 		KeepAlivePeriod: 15 * time.Second,
 		MaxBodySize:     10 * 1024 * 1024, // 10MB
+		MaxSessions:     DefaultMaxSessions,
+		SessionIdleTTL:  DefaultSessionIdleTTL,
 	}
 }
 
@@ -90,13 +95,27 @@ func NewSSEServerWithDispatcher(cfg SSEServerConfig, dispatcher MessageDispatche
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	sessions := NewSessionManagerWithConfig(SessionManagerConfig{
+		MaxSessions: cfg.MaxSessions,
+		IdleTTL:     cfg.SessionIdleTTL,
+		OnEvict: func(sessionID string) {
+			if dispatcher != nil {
+				dispatcher.UnregisterClient(sessionID)
+			}
+		},
+	})
 	return &SSEServer{
 		config:     cfg,
-		sessions:   NewSessionManager(),
+		sessions:   sessions,
 		dispatcher: dispatcher,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
+}
+
+// Sessions returns the server's underlying SessionManager.
+func (s *SSEServer) Sessions() *SessionManager {
+	return s.sessions
 }
 
 // Handler initializes HTTP routing handlers wrapped with localhost DNS-rebinding and CORS security middleware.
@@ -136,13 +155,15 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	session := s.sessions.CreateSession(r.Context())
 	if session == nil {
-		writeJSONError(w, http.StatusServiceUnavailable, "Server shutting down")
+		writeJSONError(w, http.StatusServiceUnavailable, "Server shutting down or session limit reached")
 		return
 	}
+	session.AcquireStream()
+	defer session.ReleaseStream()
 	defer s.sessions.RemoveSession(session.ID())
 	if s.dispatcher != nil {
-		defer s.dispatcher.UnregisterClient(session.ID())
 		s.dispatcher.RegisterClient(session)
+		defer s.dispatcher.UnregisterClient(session.ID())
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -197,7 +218,7 @@ func (s *SSEServer) streamSessionEvents(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-// handleMessages handles POST /messages?sessionId=... requests.
+// handleMessages handles POST /messages?sessionId=... requests (supporting single JSON-RPC messages and batches).
 func (s *SSEServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method Not Allowed")
@@ -222,18 +243,34 @@ func (s *SSEServer) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, status, rpcErrMsg := s.readAndValidateBody(w, r)
+	payload, status, rpcErrMsg := s.readAndValidatePayload(w, r)
 	if rpcErrMsg != nil {
 		writeJSONRPCError(w, status, rpcErrMsg)
 		return
 	}
 
 	if s.dispatcher != nil {
-		go func() {
-			if err := s.dispatcher.HandleClientMessage(session, msg); err != nil {
-				slog.Error("dispatcher error handling SSE message", "sessionId", sessionID, "method", msg.Method, "err", err)
-			}
-		}()
+		if payload.IsBatch {
+			elems := payload.Batch
+			go func() {
+				resps := DispatchBatch(session.Context(), session, s.dispatcher, elems)
+				if len(resps) > 0 {
+					if data, err := json.Marshal(resps); err == nil {
+						_ = session.SendRaw(data)
+					}
+				}
+			}()
+		} else {
+			msg := payload.Single
+			go func() {
+				if err := s.dispatcher.HandleClientMessage(session, msg); err != nil {
+					slog.Error("dispatcher error handling SSE message", "sessionId", sessionID, "method", msg.Method, "err", err)
+					if msg.IsRequest() && msg.ID != nil {
+						_ = session.Send(mcp.NewErrorMessage(msg.ID, mcp.CodeInternalError, err.Error()))
+					}
+				}
+			}()
+		}
 	}
 
 	w.WriteHeader(http.StatusAccepted)
@@ -311,6 +348,7 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 		}
 
 		var session *SSESession
+		createdTransient := false
 		if sessionID != "" {
 			existing, exists := s.sessions.GetSession(sessionID)
 			if !exists {
@@ -319,14 +357,26 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 			}
 			session = existing
 		} else {
-			session = s.sessions.CreateSession(s.ctx)
+			session = s.sessions.CreateSession(r.Context())
 			if session == nil {
-				writeJSONError(w, http.StatusServiceUnavailable, "Server shutting down")
+				writeJSONError(w, http.StatusServiceUnavailable, "Server shutting down or session limit reached")
 				return
 			}
-			if s.dispatcher != nil {
-				s.dispatcher.RegisterClient(session)
+			createdTransient = true
+		}
+
+		session.AcquireStream()
+		defer func() {
+			session.ReleaseStream()
+			if s.dispatcher != nil && session.ActiveStreams() <= 0 {
+				s.dispatcher.UnregisterClient(session.ID())
 			}
+			if createdTransient {
+				s.sessions.RemoveSession(session.ID())
+			}
+		}()
+		if s.dispatcher != nil {
+			s.dispatcher.RegisterClient(session)
 		}
 
 		w.Header().Set("Mcp-Session-Id", session.ID())
@@ -341,7 +391,7 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 		return
 
 	case http.MethodPost:
-		msg, status, rpcErrMsg := s.readAndValidateBody(w, r)
+		payload, status, rpcErrMsg := s.readAndValidatePayload(w, r)
 		if rpcErrMsg != nil {
 			writeJSONRPCError(w, status, rpcErrMsg)
 			return
@@ -356,10 +406,11 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 		if sessionID == "" {
 			session = s.sessions.CreateSession(s.ctx)
 			if session == nil {
-				writeJSONError(w, http.StatusServiceUnavailable, "Server shutting down")
+				writeJSONError(w, http.StatusServiceUnavailable, "Server shutting down or session limit reached")
 				return
 			}
-			s.dispatcher.RegisterClient(session)
+			// Do NOT call s.dispatcher.RegisterClient(session) on stateless POST /mcp requests;
+			// only active GET /mcp or GET /sse streams register as push notification clients.
 		} else {
 			existing, exists := s.sessions.GetSession(sessionID)
 			if !exists {
@@ -370,6 +421,36 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 		}
 
 		w.Header().Set("Mcp-Session-Id", session.ID())
+
+		if payload.IsBatch {
+			resps := DispatchBatch(r.Context(), session, s.dispatcher, payload.Batch)
+			if len(resps) == 0 {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			data, err := json.Marshal(resps)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "failed to marshal batch response")
+				return
+			}
+			accept := r.Header.Get("Accept")
+			if strings.Contains(accept, "text/event-stream") && !strings.Contains(accept, "application/json") {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache, no-transform")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(append(data, '\n'))
+			return
+		}
+
+		msg := payload.Single
 
 		// Notifications and client responses return 202 Accepted immediately.
 		if msg.IsNotification() || msg.IsResponse() {
@@ -387,6 +468,7 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 		go func() {
 			if err := s.dispatcher.HandleClientMessage(capture, msg); err != nil {
 				slog.Error("dispatcher error handling Streamable HTTP request", "sessionId", session.ID(), "method", msg.Method, "err", err)
+				_ = capture.Send(mcp.NewErrorMessage(msg.ID, mcp.CodeInternalError, err.Error()))
 			}
 		}()
 
@@ -427,7 +509,7 @@ func (s *SSEServer) handleStreamableHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func (s *SSEServer) readAndValidateBody(w http.ResponseWriter, r *http.Request) (*mcp.Message, int, *mcp.Message) {
+func (s *SSEServer) readAndValidatePayload(w http.ResponseWriter, r *http.Request) (*ParsedPayload, int, *mcp.Message) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -443,31 +525,15 @@ func (s *SSEServer) readAndValidateBody(w http.ResponseWriter, r *http.Request) 
 		return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeParseError, "empty JSON-RPC payload")
 	}
 
-	if trimmed[0] != '{' {
-		var probe any
-		if synErr := json.Unmarshal(trimmed, &probe); synErr != nil {
+	parsed, parseErr := ParseJSONRPCPayload(trimmed)
+	if parseErr != nil {
+		if errors.Is(parseErr, mcp.ErrParse) {
 			return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeParseError, "Parse error")
 		}
-		return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeInvalidRequest, "Invalid Request: batch arrays and non-object payloads are not supported")
+		return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeInvalidRequest, parseErr.Error())
 	}
 
-	var msg mcp.Message
-	if err := json.Unmarshal(trimmed, &msg); err != nil {
-		if errors.Is(err, mcp.ErrInvalidRequestID) {
-			return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeInvalidRequest, err.Error())
-		}
-		var syntaxErr *json.SyntaxError
-		if errors.As(err, &syntaxErr) {
-			return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeParseError, "Parse error")
-		}
-		return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeInvalidRequest, "Invalid Request")
-	}
-
-	if envErr := msg.ValidateEnvelope(); envErr != nil {
-		return nil, http.StatusBadRequest, mcp.NewErrorMessage(nil, mcp.CodeInvalidRequest, envErr.Error())
-	}
-
-	return &msg, http.StatusOK, nil
+	return parsed, http.StatusOK, nil
 }
 
 func (s *SSEServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -479,24 +545,24 @@ func (s *SSEServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // securityAndCORSMiddleware validates Host and Origin headers to defeat localhost DNS-rebinding
-// and cross-origin browser attacks, and emits spec-compliant single-origin CORS headers.
+// and cross-origin browser attacks, and emits spec-compliant CORS headers.
 func (s *SSEServer) securityAndCORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isLoopbackBindHost(s.config.Host) {
-			if !isLoopbackHostHeader(r.Host) {
+			if !isAllowedHostHeader(r.Host) {
 				writeJSONError(w, http.StatusForbidden, "forbidden Host header on loopback listener")
 				return
 			}
 		}
 
 		origin := strings.TrimSpace(r.Header.Get("Origin"))
-		matchedOrigin, allowed := s.matchAllowedOrigin(origin)
+		matchedOrigin, isWildcard, allowed := s.matchAllowedOrigin(origin)
 		if !allowed {
 			writeJSONError(w, http.StatusForbidden, "Origin not allowed")
 			return
 		}
 
-		s.applyCORSHeaders(w, matchedOrigin)
+		s.applyCORSHeaders(w, matchedOrigin, isWildcard)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -515,87 +581,124 @@ func (s *SSEServer) hasWildcardCORS() bool {
 	return false
 }
 
-func (s *SSEServer) matchAllowedOrigin(origin string) (string, bool) {
+func (s *SSEServer) matchAllowedOrigin(origin string) (matched string, isWildcard bool, allowed bool) {
 	loopbackBind := isLoopbackBindHost(s.config.Host)
 	wildcard := s.hasWildcardCORS()
 
 	if origin == "" {
 		if !loopbackBind && wildcard {
-			return "*", true
+			return "*", true, true
 		}
-		return "", true
+		return "", wildcard, true
 	}
 
-	for _, allowed := range s.config.CORSOrigins {
-		trimmed := strings.TrimSpace(allowed)
+	for _, allowedEntry := range s.config.CORSOrigins {
+		trimmed := strings.TrimSpace(allowedEntry)
 		if trimmed == "" || trimmed == "*" {
 			continue
 		}
 		if strings.EqualFold(trimmed, origin) {
-			return origin, true
+			return origin, false, true
 		}
 	}
 
 	if wildcard {
 		if loopbackBind {
 			if isLoopbackOrigin(origin) {
-				return origin, true
+				return origin, true, true
 			}
-			return "", false
+			return "", true, false
 		}
 		if strings.EqualFold(origin, "null") {
-			return "", false
+			return "", true, false
 		}
-		return origin, true
+		// Never reflect arbitrary Origin headers on wildcard "*"; emit literal "*" without credentials.
+		return "*", true, true
 	}
 
-	return "", false
+	return "", false, false
 }
 
-func (s *SSEServer) applyCORSHeaders(w http.ResponseWriter, matchedOrigin string) {
-	w.Header().Add("Vary", "Origin")
-	if matchedOrigin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", matchedOrigin)
+func (s *SSEServer) applyCORSHeaders(w http.ResponseWriter, matchedOrigin string, isWildcard bool) {
+	if isWildcard || matchedOrigin == "*" {
+		w.Header().Del("Access-Control-Allow-Credentials")
+	}
+	if matchedOrigin == "*" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	} else {
+		w.Header().Add("Vary", "Origin")
+		if matchedOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", matchedOrigin)
+		}
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-ID, Mcp-Session-Id, Accept, Last-Event-ID, X-Requested-With")
 	w.Header().Set("Access-Control-Expose-Headers", "Content-Type, Mcp-Session-Id")
 }
 
+func isLoopbackHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return false
+	}
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	if zoneIdx := strings.IndexByte(h, '%'); zoneIdx >= 0 {
+		h = h[:zoneIdx]
+	}
+	lower := strings.ToLower(strings.TrimSpace(h))
+	if lower == "localhost" || lower == "localhost." {
+		return true
+	}
+	if ip := net.ParseIP(lower); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 func isLoopbackBindHost(host string) bool {
-	h := strings.TrimSpace(strings.ToLower(host))
+	h := strings.TrimSpace(host)
 	if h == "" {
 		return true
 	}
-	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
-	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+	return isLoopbackHost(h)
 }
 
-func isLoopbackHostHeader(hostHeader string) bool {
+func isAllowedHostHeader(hostHeader string) bool {
 	h := strings.TrimSpace(hostHeader)
 	if h == "" {
 		return false
 	}
-	if splitHost, _, err := net.SplitHostPort(h); err == nil {
+	if splitHost, portStr, err := net.SplitHostPort(h); err == nil {
+		if portStr != "" {
+			portNum, pErr := strconv.Atoi(portStr)
+			if pErr != nil || portNum < 1 || portNum > 65535 {
+				return false
+			}
+		}
 		h = splitHost
-	} else {
-		h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+	} else if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	} else if strings.Contains(h, ":") {
+		// Reject malformed host:port while allowing bare IPv6 literals if ever sent without brackets
+		if net.ParseIP(h) == nil {
+			return false
+		}
 	}
-	h = strings.ToLower(strings.TrimSpace(h))
-	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+	return isLoopbackHost(h)
 }
 
 func isLoopbackOrigin(origin string) bool {
 	u, err := url.Parse(origin)
-	if err != nil {
+	if err != nil || u.User != nil || u.Host == "" {
 		return false
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
 		return false
 	}
-	host := strings.ToLower(u.Hostname())
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	return isLoopbackHost(u.Hostname())
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {

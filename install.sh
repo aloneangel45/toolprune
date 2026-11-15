@@ -106,7 +106,7 @@ elif command -v wget >/dev/null 2>&1; then
 fi
 
 if [ -z "${TAG}" ]; then
-    TAG="v1.3.1"
+    TAG="v1.3.2"
     log_warn "GitHub API rate limit reached or offline; falling back to release ${TAG}"
 fi
 
@@ -160,20 +160,34 @@ if [ ! -f "${TMP_DIR}/${BINARY_NAME}" ]; then
     exit 1
 fi
 
-chmod +x "${TMP_DIR}/${BINARY_NAME}"
+chmod 0755 "${TMP_DIR}/${BINARY_NAME}"
 
-# 7. Determine Installation Target Directory
-if [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
+# 7. Determine Installation Target Directory (atomic install: cp -> chmod 0755 -> mv -f)
+if [ -n "${TOOLPRUNE_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="${TOOLPRUNE_INSTALL_DIR}"
+    mkdir -p "${INSTALL_DIR}"
+    TMP_DEST="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
+    cp "${TMP_DIR}/${BINARY_NAME}" "${TMP_DEST}"
+    chmod 0755 "${TMP_DEST}"
+    mv -f "${TMP_DEST}" "${INSTALL_DIR}/${BINARY_NAME}"
+elif [ "$(id -u)" -eq 0 ] || [ -w "/usr/local/bin" ]; then
     INSTALL_DIR="/usr/local/bin"
     SUDO=""
-    if [ ! -w "/usr/local/bin" ] && command -v sudo >/dev/null 2>&1; then
+    if [ "$(id -u)" -ne 0 ] && [ ! -w "/usr/local/bin" ] && command -v sudo >/dev/null 2>&1; then
         SUDO="sudo"
     fi
-    ${SUDO} mv "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    ${SUDO} mkdir -p "${INSTALL_DIR}"
+    TMP_DEST="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
+    ${SUDO} cp "${TMP_DIR}/${BINARY_NAME}" "${TMP_DEST}"
+    ${SUDO} chmod 0755 "${TMP_DEST}"
+    ${SUDO} mv -f "${TMP_DEST}" "${INSTALL_DIR}/${BINARY_NAME}"
 else
     INSTALL_DIR="${HOME}/.local/bin"
     mkdir -p "${INSTALL_DIR}"
-    mv "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    TMP_DEST="${INSTALL_DIR}/.${BINARY_NAME}.tmp.$$"
+    cp "${TMP_DIR}/${BINARY_NAME}" "${TMP_DEST}"
+    chmod 0755 "${TMP_DEST}"
+    mv -f "${TMP_DEST}" "${INSTALL_DIR}/${BINARY_NAME}"
 fi
 
 log_success "toolprune installed successfully to ${BOLD}${INSTALL_DIR}/${BINARY_NAME}${RESET}"

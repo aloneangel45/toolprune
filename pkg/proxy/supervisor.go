@@ -130,6 +130,7 @@ type Supervisor struct {
 	state          atomic.Int32
 	writeMu        sync.Mutex
 	wg             sync.WaitGroup
+	platformMu     sync.Mutex
 	platformData   any // Platform-specific handle (e.g. WindowsJob)
 	waitErr        error
 	waitErrMu      sync.Mutex
@@ -260,6 +261,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		defer close(s.doneCh)
 		pipeWg.Wait()
 		err := s.cmd.Wait()
+		cleanupPlatformSupervision(s)
 		s.waitErrMu.Lock()
 		s.waitErr = err
 		s.waitErrMu.Unlock()

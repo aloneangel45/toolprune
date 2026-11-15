@@ -30,6 +30,13 @@ type UpstreamMessageHandler interface {
 	HandleUpstreamCrash(upstreamID string, err error)
 }
 
+// UpstreamRequestHandler is an optional extension implemented by UpstreamMessageHandler
+// implementations (such as RouterGateway) that handle server-initiated JSON-RPC requests
+// (e.g., roots/list, sampling/createMessage, ping) from an upstream MCP server.
+type UpstreamRequestHandler interface {
+	HandleUpstreamRequest(upstreamID string, target *UpstreamTarget, msg *mcp.Message)
+}
+
 var (
 	// ErrUpstreamAlreadyExists is returned when attempting to register an upstream with duplicate ID.
 	ErrUpstreamAlreadyExists = errors.New("upstream server already registered")
@@ -111,16 +118,17 @@ func (u *UpstreamTarget) Transport() UpstreamTransport {
 
 // Multiplexer coordinates multi-server upstream registration, routing, and message reading.
 type Multiplexer struct {
-	mu             sync.RWMutex
-	mode           NamespaceMode
-	upstreams      map[string]*UpstreamTarget
-	routes         map[string]ToolRoute // exposedName -> ToolRoute
-	handler        UpstreamMessageHandler
-	onToolsChanged func()
-	logger         *slog.Logger
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	mu               sync.RWMutex
+	mode             NamespaceMode
+	upstreams        map[string]*UpstreamTarget
+	routes           map[string]ToolRoute // exposedName -> ToolRoute
+	lastCollisionErr error
+	handler          UpstreamMessageHandler
+	onToolsChanged   func()
+	logger           *slog.Logger
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
 }
 
 // NewMultiplexer creates an initialized Multiplexer instance.
@@ -248,9 +256,17 @@ func (m *Multiplexer) SyncUpstreamTools(ctx context.Context, id string, tools []
 	}
 }
 
-// rebuildRoutesUnderLock regenerates the routes table according to active NamespaceMode.
+// LastCollisionError returns the most recent tool collision error detected during route table rebuild, if any.
+func (m *Multiplexer) LastCollisionError() error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastCollisionErr
+}
+
+// rebuildRoutesUnderLock regenerates the routes table deterministically according to active NamespaceMode.
 func (m *Multiplexer) rebuildRoutesUnderLock() {
 	newRoutes := make(map[string]ToolRoute)
+	var firstCollisionErr error
 	effectiveMode := m.mode
 	if effectiveMode == NamespaceModeAuto {
 		if len(m.upstreams) > 1 {
@@ -260,10 +276,17 @@ func (m *Multiplexer) rebuildRoutesUnderLock() {
 		}
 	}
 
+	upstreamIDs := make([]string, 0, len(m.upstreams))
+	for id := range m.upstreams {
+		upstreamIDs = append(upstreamIDs, id)
+	}
+	sort.Strings(upstreamIDs)
+
 	// Detect collisions if in on_collision or none mode
 	toolOccurrences := make(map[string]int)
 	if effectiveMode == NamespaceModePrefixCollision || effectiveMode == NamespaceModeNone {
-		for _, target := range m.upstreams {
+		for _, id := range upstreamIDs {
+			target := m.upstreams[id]
 			target.mu.RLock()
 			for toolName := range target.tools {
 				toolOccurrences[toolName]++
@@ -272,10 +295,18 @@ func (m *Multiplexer) rebuildRoutesUnderLock() {
 		}
 	}
 
-	for _, target := range m.upstreams {
+	for _, id := range upstreamIDs {
+		target := m.upstreams[id]
 		target.mu.RLock()
 		prefix := target.Prefix()
-		for originalName, tool := range target.tools {
+		toolNames := make([]string, 0, len(target.tools))
+		for originalName := range target.tools {
+			toolNames = append(toolNames, originalName)
+		}
+		sort.Strings(toolNames)
+
+		for _, originalName := range toolNames {
+			tool := target.tools[originalName]
 			var exposedName string
 			switch effectiveMode {
 			case NamespaceModePrefixAlways:
@@ -290,6 +321,20 @@ func (m *Multiplexer) rebuildRoutesUnderLock() {
 				fallthrough
 			default:
 				exposedName = originalName
+			}
+
+			if existing, dup := newRoutes[exposedName]; dup {
+				colErr := fmt.Errorf("%w: tool %q exposed by both %q and %q", ErrToolCollision, exposedName, existing.UpstreamID, target.id)
+				if firstCollisionErr == nil {
+					firstCollisionErr = colErr
+				}
+				m.logger.Warn("skipping duplicate colliding tool route",
+					"tool", exposedName,
+					"kept_upstream", existing.UpstreamID,
+					"skipped_upstream", target.id,
+					"err", colErr,
+				)
+				continue
 			}
 
 			// Clone tool and update Name to exposedName
@@ -308,6 +353,7 @@ func (m *Multiplexer) rebuildRoutesUnderLock() {
 	}
 
 	m.routes = newRoutes
+	m.lastCollisionErr = firstCollisionErr
 }
 
 // ResolveRoute resolves an exposed tool name to its target upstream and original tool.
@@ -406,7 +452,18 @@ func (m *Multiplexer) runUpstreamLoop(target *UpstreamTarget) {
 		handler := m.handler
 		m.mu.RUnlock()
 
-		if handler != nil {
+		if msg.IsRequest() {
+			if reqHandler, ok := handler.(UpstreamRequestHandler); ok && handler != nil {
+				reqHandler.HandleUpstreamRequest(target.id, target, msg)
+			} else {
+				errResp := mcp.NewErrorMessage(
+					msg.ID,
+					mcp.CodeMethodNotFound,
+					fmt.Sprintf("Method not found: %s", msg.Method),
+				)
+				_ = target.transport.Send(errResp)
+			}
+		} else if handler != nil {
 			if msg.IsResponse() {
 				handler.HandleUpstreamResponse(target.id, msg)
 			} else if msg.IsNotification() {

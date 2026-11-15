@@ -566,12 +566,12 @@ func TestE2E_V12_StdioMalformedJSONAndBatchRecovery(t *testing.T) {
 		t.Fatalf("expected -32700 Parse error, got %+v", parseErrMsg)
 	}
 
-	// 2. Unsupported JSON-RPC batch array -> JSON-RPC -32600 Invalid Request
+	// 2. Empty JSON-RPC batch array -> JSON-RPC -32600 Invalid Request
 	p.mu.Lock()
-	_, err = io.WriteString(p.stdin, `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`+"\n")
+	_, err = io.WriteString(p.stdin, "[]\n")
 	if err != nil {
 		p.mu.Unlock()
-		t.Fatalf("write batch array failed: %v", err)
+		t.Fatalf("write empty batch array failed: %v", err)
 	}
 	batchErrMsg, err := mcp.ReadMessage(p.reader)
 	p.mu.Unlock()
@@ -579,10 +579,30 @@ func TestE2E_V12_StdioMalformedJSONAndBatchRecovery(t *testing.T) {
 		t.Fatalf("read -32600 response failed: %v", err)
 	}
 	if batchErrMsg.Error == nil || batchErrMsg.Error.Code != mcp.CodeInvalidRequest {
-		t.Fatalf("expected -32600 Invalid Request, got %+v", batchErrMsg)
+		t.Fatalf("expected -32600 Invalid Request on empty batch, got %+v", batchErrMsg)
 	}
 
-	// 3. Subsequent normal ping must succeed cleanly
+	// 3. Valid JSON-RPC 2.0 batch array (request + notification) -> JSON array of 1 response
+	p.mu.Lock()
+	_, err = io.WriteString(p.stdin, `[{"jsonrpc":"2.0","id":101,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"}]`+"\n")
+	if err != nil {
+		p.mu.Unlock()
+		t.Fatalf("write valid batch array failed: %v", err)
+	}
+	rawBatchLine, err := mcp.ReadBoundedLine(p.reader, mcp.DefaultMaxMessageSize)
+	p.mu.Unlock()
+	if err != nil {
+		t.Fatalf("read batch response failed: %v", err)
+	}
+	var batchResponses []mcp.Message
+	if err := json.Unmarshal(rawBatchLine, &batchResponses); err != nil {
+		t.Fatalf("expected JSON array response for valid batch, got %q: %v", string(rawBatchLine), err)
+	}
+	if len(batchResponses) != 1 || batchResponses[0].ID == nil || batchResponses[0].ID.String() != "101" || batchResponses[0].Error != nil {
+		t.Fatalf("unexpected batch response array: %+v", batchResponses)
+	}
+
+	// 4. Subsequent normal ping must succeed cleanly
 	pingResp := p.Call(t, mcp.MethodPing, map[string]any{})
 	if pingResp.Error != nil {
 		t.Fatalf("ping after recovery failed: %v", pingResp.Error)

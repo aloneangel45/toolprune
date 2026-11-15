@@ -165,25 +165,73 @@ func TestInferClientFromPath_CrossPlatformWindowsAndPOSIX(t *testing.T) {
 	}
 }
 
-func TestInstallPS1_RestrictedPowerShellNoModuleCmdlets(t *testing.T) {
-	scriptPath := filepath.Join("..", "..", "install.ps1")
+func TestInstallSH_ZeroCarriageReturnBytes(t *testing.T) {
+	scriptPath := filepath.Join("..", "..", "install.sh")
+	raw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read install.sh: %v", err)
+	}
+	if bytes.Contains(raw, []byte{'\r'}) {
+		t.Fatalf("install.sh contains CR (\\r) bytes; must be pure LF (\\n)")
+	}
+	script := string(raw)
+	if strings.Count(script, `mkdir -p "${INSTALL_DIR}"`) < 2 {
+		t.Errorf("install.sh must run mkdir -p \"${INSTALL_DIR}\" in both root and non-root branches")
+	}
+	if !strings.Contains(script, `.tmp.$$`) || !strings.Contains(script, `chmod 0755`) || !strings.Contains(script, `mv -f`) {
+		t.Errorf("install.sh must perform atomic install via cp to .tmp.$$, chmod 0755, and mv -f")
+	}
+}
+
+func TestWindowsPowerShellEmptyPSModulePath(t *testing.T) {
+	scriptPath, err := filepath.Abs(filepath.Join("..", "..", "install.ps1"))
+	if err != nil {
+		t.Fatalf("abs install.ps1: %v", err)
+	}
 	raw, err := os.ReadFile(scriptPath)
 	if err != nil {
 		t.Fatalf("read install.ps1: %v", err)
 	}
 	script := string(raw)
 
-	if strings.Contains(script, "Get-FileHash") {
-		t.Errorf("install.ps1 must not rely on Get-FileHash (fails in restricted PSModulePath)")
+	forbiddenCmdlets := []string{
+		"Get-FileHash",
+		"Expand-Archive",
+		"Join-Path",
+		"Write-Host",
+		"Write-Error",
+		"Invoke-RestMethod",
+		"Invoke-WebRequest",
+		"New-Item",
+		"Get-Content",
+		"Add-Type",
+		"Get-ChildItem",
+		"Select-Object",
+		"Test-Path",
+		"Copy-Item",
+		"Remove-Item",
+		"Where-Object",
+		"Out-Null",
 	}
-	if strings.Contains(script, "Expand-Archive") {
-		t.Errorf("install.ps1 must not rely on Expand-Archive (fails in restricted PSModulePath)")
+	for _, cmdlet := range forbiddenCmdlets {
+		if strings.Contains(script, cmdlet) {
+			t.Errorf("install.ps1 must not rely on %s (fails when PSModulePath is empty or polluted)", cmdlet)
+		}
+	}
+	if strings.Contains(script, "\nexit ") || strings.Contains(script, " exit ") {
+		t.Errorf("install.ps1 must use throw inside function wrapper rather than exit")
 	}
 	if !strings.Contains(script, "[System.Security.Cryptography.SHA256]::Create()") {
 		t.Errorf("install.ps1 expected .NET SHA256 implementation")
 	}
 	if !strings.Contains(script, "[System.IO.Compression.ZipFile]::ExtractToDirectory") {
 		t.Errorf("install.ps1 expected .NET ZipFile::ExtractToDirectory implementation")
+	}
+	if !strings.Contains(script, "-bor [Net.SecurityProtocolType]::Tls12") {
+		t.Errorf("install.ps1 expected additive TLS 1.2 flag (-bor Tls12)")
+	}
+	if !strings.Contains(script, `LoadWithPartialName("System.IO.Compression.FileSystem")`) {
+		t.Errorf("install.ps1 expected LoadWithPartialName fallback for System.IO.Compression.FileSystem")
 	}
 
 	if runtime.GOOS != "windows" {
@@ -194,19 +242,22 @@ func TestInstallPS1_RestrictedPowerShellNoModuleCmdlets(t *testing.T) {
 		t.Skip("powershell.exe not found in PATH")
 	}
 
-	// Build a real zip archive containing a dummy toolprune.exe and verify the exact .NET
-	// SHA-256 + ZipFile extraction commands work with PSModulePath cleared!
-	tmp := t.TempDir()
-	zipPath := filepath.Join(tmp, "toolprune-windows-amd64.zip")
-	extractDir := filepath.Join(tmp, "extracted")
+	arch := "amd64"
+	if runtime.GOARCH == "arm64" {
+		arch = "arm64"
+	}
+	archiveName := "toolprune-windows-" + arch + ".zip"
+
+	assetDir := t.TempDir()
+	zipPath := filepath.Join(assetDir, archiveName)
 
 	var zipBuf bytes.Buffer
 	zw := zip.NewWriter(&zipBuf)
-	fw, err := zw.Create("toolprune.exe")
+	fw, err := zw.Create("toolprune-windows-" + arch + ".exe")
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte("MZ-mock-binary-payload-v1.3.1")
+	payload := []byte("MZ-mock-binary-payload-v1.3.2")
 	if _, err := fw.Write(payload); err != nil {
 		t.Fatal(err)
 	}
@@ -216,54 +267,72 @@ func TestInstallPS1_RestrictedPowerShellNoModuleCmdlets(t *testing.T) {
 	if err := os.WriteFile(zipPath, zipBuf.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}
-	wantSum := sha256.Sum256(zipBuf.Bytes())
-	wantHex := hex.EncodeToString(wantSum[:])
+	sum := sha256.Sum256(zipBuf.Bytes())
+	sumHex := hex.EncodeToString(sum[:])
+	checksumContent := sumHex + "  " + archiveName + "\n"
+	if err := os.WriteFile(filepath.Join(assetDir, "checksums.txt"), []byte(checksumContent), 0644); err != nil {
+		t.Fatal(err)
+	}
 
-	psCmd := `
-$ErrorActionPreference = "Stop"
-$ZipPath = $env:TEST_ZIP_PATH
-$ExtractDir = $env:TEST_EXTRACT_DIR
-$Sha256 = [System.Security.Cryptography.SHA256]::Create()
-try {
-    $FileStream = [System.IO.File]::OpenRead($ZipPath)
-    try {
-        $HashBytes = $Sha256.ComputeHash($FileStream)
-    } finally {
-        $FileStream.Dispose()
-    }
-} finally {
-    $Sha256.Dispose()
+	cases := []struct {
+		name         string
+		psModulePath string
+	}{
+		{"empty_PSModulePath", ""},
+		{"pwsh7_polluted_PSModulePath", `C:\Program Files\PowerShell\7\Modules;C:\nonexistent_modules_dir`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			installDir := filepath.Join(t.TempDir(), "nested", "bin")
+			if err := os.MkdirAll(installDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			// Pre-populate a ReadOnly toolprune.exe to ensure ReadOnly attribute is cleared before overwrite.
+			destExe := filepath.Join(installDir, "toolprune.exe")
+			if err := os.WriteFile(destExe, []byte("old-readonly-binary"), 0444); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = os.Chmod(destExe, 0666)
+			})
+
+			cmd := exec.Command(psExe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+			env := make([]string, 0, len(os.Environ())+4)
+			for _, kv := range os.Environ() {
+				upper := strings.ToUpper(kv)
+				if strings.HasPrefix(upper, "PSMODULEPATH=") ||
+					strings.HasPrefix(upper, "TOOLPRUNE_ASSET_DIR=") ||
+					strings.HasPrefix(upper, "TOOLPRUNE_INSTALL_DIR=") ||
+					strings.HasPrefix(upper, "TOOLPRUNE_SKIP_PATH_UPDATE=") {
+					continue
+				}
+				env = append(env, kv)
+			}
+			env = append(env,
+				"PSModulePath="+tc.psModulePath,
+				"TOOLPRUNE_ASSET_DIR="+assetDir,
+				"TOOLPRUNE_INSTALL_DIR="+installDir,
+				"TOOLPRUNE_SKIP_PATH_UPDATE=1",
+			)
+			cmd.Env = env
+
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("install.ps1 failed with %s: %v\noutput:\n%s", tc.name, err, string(out))
+			}
+
+			gotBytes, err := os.ReadFile(destExe)
+			if err != nil {
+				t.Fatalf("expected installed toolprune.exe: %v", err)
+			}
+			if !bytes.Equal(gotBytes, payload) {
+				t.Fatalf("installed binary payload mismatch: got %q, want %q", string(gotBytes), string(payload))
+			}
+		})
+	}
 }
-$ActualHash = [System.BitConverter]::ToString($HashBytes).Replace("-", "").ToLowerInvariant()
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Directory]::CreateDirectory($ExtractDir) | Out-Null
-[System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractDir)
-Write-Output $ActualHash
-`
-	cmd := exec.Command(psExe, "-NoProfile", "-NonInteractive", "-Command", psCmd)
-	// Strip PSModulePath to simulate restricted/non-autoload PowerShell session
-	env := make([]string, 0, len(os.Environ())+3)
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(strings.ToUpper(kv), "PSMODULEPATH=") {
-			env = append(env, kv)
-		}
-	}
-	env = append(env, "PSModulePath=", "TEST_ZIP_PATH="+zipPath, "TEST_EXTRACT_DIR="+extractDir)
-	cmd.Env = env
 
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("restricted PowerShell .NET hash+extract failed: %v\noutput: %s", err, string(out))
-	}
-	gotHex := strings.TrimSpace(string(out))
-	if gotHex != wantHex {
-		t.Errorf("SHA-256 mismatch: got %q, want %q", gotHex, wantHex)
-	}
-	extractedBytes, err := os.ReadFile(filepath.Join(extractDir, "toolprune.exe"))
-	if err != nil {
-		t.Fatalf("expected extracted toolprune.exe: %v", err)
-	}
-	if !bytes.Equal(extractedBytes, payload) {
-		t.Errorf("extracted binary payload mismatch")
-	}
+func TestInstallPS1_RestrictedPowerShellNoModuleCmdlets(t *testing.T) {
+	TestWindowsPowerShellEmptyPSModulePath(t)
 }

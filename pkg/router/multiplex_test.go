@@ -491,3 +491,140 @@ func TestMultiplexer_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestMultiplexer_UpstreamRequestNeverHangs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("multiplexer without active client returns -32601 Method not found immediately", func(t *testing.T) {
+		mux := router.NewMultiplexer(router.NamespaceModeAuto, nil)
+		defer func() { _ = mux.Close() }()
+
+		handler := newTestUpstreamHandler()
+		mux.SetMessageHandler(handler)
+
+		tr := newChannelTransport()
+		if err := mux.RegisterUpstream(ctx, router.UpstreamConfig{ID: "fs_srv", Transport: tr}); err != nil {
+			t.Fatalf("RegisterUpstream failed: %v", err)
+		}
+
+		for idx, method := range []string{"roots/list", "sampling/createMessage", "ping"} {
+			reqID := mcp.NewIntID(int64(500 + idx))
+			upReq, _ := mcp.NewRequest(reqID, method, nil)
+			tr.in <- upReq
+
+			select {
+			case reply := <-tr.out:
+				if reply == nil || reply.ID == nil || reply.ID.String() != reqID.String() {
+					t.Fatalf("unexpected reply ID for %s: %+v", method, reply)
+				}
+				if reply.Error == nil || reply.Error.Code != mcp.CodeMethodNotFound {
+					t.Fatalf("expected -32601 Method not found for %s, got: %+v", method, reply.Error)
+				}
+			case <-time.After(1 * time.Second):
+				t.Fatalf("upstream server hung waiting for response to %s!", method)
+			}
+		}
+	})
+
+	t.Run("RouterGateway forwards upstream request to active client and routes response back", func(t *testing.T) {
+		r := router.NewRouter(router.DefaultRouterConfig(), nil, nil)
+		gw := router.NewRouterGateway(r, router.GatewayConfig{RequestTimeout: 2 * time.Second})
+		defer gw.Shutdown()
+
+		tr := newChannelTransport()
+		_ = r.Multiplexer().RegisterUpstream(ctx, router.UpstreamConfig{ID: "fs_srv", Transport: tr})
+		if err := gw.Start(); err != nil {
+			t.Fatalf("gw.Start failed: %v", err)
+		}
+
+		// Register an active client session and verify round-trip roots/list forwarding
+		clientCh := make(chan *mcp.Message, 4)
+		clientSess := &funcClientSession{
+			id:  "active-client-1",
+			ctx: ctx,
+			sendFn: func(msg *mcp.Message) error {
+				clientCh <- msg
+				return nil
+			},
+		}
+		gw.RegisterClient(clientSess)
+
+		upReqID := mcp.NewStringID("up-roots-1")
+		rootsReq, _ := mcp.NewRequest(upReqID, "roots/list", nil)
+		tr.in <- rootsReq
+
+		var forwarded *mcp.Message
+		select {
+		case forwarded = <-clientCh:
+		case <-time.After(1 * time.Second):
+			t.Fatal("timed out waiting for upstream request to reach active client")
+		}
+		if forwarded.Method != "roots/list" || forwarded.ID == nil {
+			t.Fatalf("unexpected forwarded message: %+v", forwarded)
+		}
+
+		// Client responds to forwarded request
+		clientReply, _ := mcp.NewResponse(*forwarded.ID, map[string]any{"roots": []any{}})
+		if err := gw.HandleClientMessage(clientSess, clientReply); err != nil {
+			t.Fatalf("HandleClientMessage(response) failed: %v", err)
+		}
+
+		select {
+		case upstreamReply := <-tr.out:
+			if upstreamReply.ID == nil || upstreamReply.ID.String() != upReqID.String() {
+				t.Fatalf("expected restored upstream request ID %s, got %+v", upReqID.String(), upstreamReply.ID)
+			}
+			if upstreamReply.Error != nil {
+				t.Fatalf("unexpected error in upstream reply: %+v", upstreamReply.Error)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatal("timed out waiting for client response to reach upstream")
+		}
+	})
+}
+
+type funcClientSession struct {
+	id     string
+	ctx    context.Context
+	sendFn func(*mcp.Message) error
+}
+
+func (f *funcClientSession) ID() string              { return f.id }
+func (f *funcClientSession) Send(m *mcp.Message) error { return f.sendFn(m) }
+func (f *funcClientSession) Close() error            { return nil }
+func (f *funcClientSession) Context() context.Context {
+	if f.ctx != nil {
+		return f.ctx
+	}
+	return context.Background()
+}
+
+func TestMultiplexer_DeterministicCollisionDetection(t *testing.T) {
+	ctx := context.Background()
+
+	for iter := 0; iter < 50; iter++ {
+		mux := router.NewMultiplexer(router.NamespaceModeNone, nil)
+		_ = mux.RegisterUpstream(ctx, router.UpstreamConfig{ID: "zeta_srv"})
+		_ = mux.RegisterUpstream(ctx, router.UpstreamConfig{ID: "alpha_srv"})
+
+		mux.SyncUpstreamTools(ctx, "zeta_srv", []mcp.Tool{
+			{Name: "shared_tool", Description: "From zeta"},
+		})
+		mux.SyncUpstreamTools(ctx, "alpha_srv", []mcp.Tool{
+			{Name: "shared_tool", Description: "From alpha"},
+		})
+
+		if !errors.Is(mux.LastCollisionError(), router.ErrToolCollision) {
+			t.Fatalf("iter %d: expected LastCollisionError to wrap ErrToolCollision, got %v", iter, mux.LastCollisionError())
+		}
+
+		route, ok := mux.ResolveRoute("shared_tool")
+		if !ok {
+			t.Fatalf("iter %d: expected shared_tool route to exist", iter)
+		}
+		if route.UpstreamID != "alpha_srv" {
+			t.Fatalf("iter %d: non-deterministic route winner: got %q, want 'alpha_srv'", iter, route.UpstreamID)
+		}
+		_ = mux.Close()
+	}
+}

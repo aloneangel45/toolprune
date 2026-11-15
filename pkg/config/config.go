@@ -386,6 +386,8 @@ func (c *Config) Validate() error {
 
 	// 4. Upstream server validation
 	seenIDs := make(map[string]bool, len(c.Upstreams))
+	seenPrefixes := make(map[string]string, len(c.Upstreams))
+	checkDupPrefix := mode != "none"
 	for i, up := range c.Upstreams {
 		if strings.TrimSpace(up.ID) == "" {
 			errs = append(errs, fmt.Sprintf("upstreams[%d].id cannot be empty", i))
@@ -394,13 +396,26 @@ func (c *Config) Validate() error {
 		if strings.Contains(up.ID, "__") {
 			errs = append(errs, fmt.Sprintf("upstreams[%d].id %q contains '__', which is reserved for namespace routing", i, up.ID))
 		}
-		if seenIDs[up.ID] {
+		dupID := seenIDs[up.ID]
+		if dupID {
 			errs = append(errs, fmt.Sprintf("duplicate upstream id %q found at index %d", up.ID, i))
 		}
 		seenIDs[up.ID] = true
 
 		if strings.Contains(up.Prefix, "__") {
 			errs = append(errs, fmt.Sprintf("upstreams[%d].prefix %q cannot contain '__'", i, up.Prefix))
+		}
+
+		if checkDupPrefix && !up.Disabled && !dupID {
+			effPrefix := strings.TrimSpace(up.Prefix)
+			if effPrefix == "" {
+				effPrefix = strings.TrimSpace(up.ID)
+			}
+			if firstID, exists := seenPrefixes[effPrefix]; exists {
+				errs = append(errs, fmt.Sprintf("duplicate effective upstream prefix %q shared by upstreams %q and %q", effPrefix, firstID, up.ID))
+			} else {
+				seenPrefixes[effPrefix] = up.ID
+			}
 		}
 
 		upTransport := strings.ToLower(strings.TrimSpace(up.Transport))
@@ -472,15 +487,18 @@ func (c *Config) ToSSEServerConfig() proxy.SSEServerConfig {
 
 // ToRouterConfig converts configuration to a router.RouterConfig instance.
 func (c *Config) ToRouterConfig() router.RouterConfig {
-	return router.RouterConfig{
-		NamespaceMode:   router.NamespaceMode(c.Routing.NamespaceMode),
-		PruneMode:       c.Pruning.Tier,
-		MaxSchemaTokens: c.Pruning.MaxSchemaTokens,
-		ActiveProfile:   c.Routing.DefaultProfile,
-		MaxActiveTools:  c.Routing.ActiveWindowSize,
-		PinnedTools:     append([]string(nil), c.Routing.PinnedTools...),
-		EnableCatalog:   c.Pruning.Tier == "dynamic",
+	rc := router.DefaultRouterConfig()
+	rc.NamespaceMode = router.NamespaceMode(c.Routing.NamespaceMode)
+	rc.PruneMode = c.Pruning.Tier
+	rc.MaxSchemaTokens = c.Pruning.MaxSchemaTokens
+	rc.ActiveProfile = c.Routing.DefaultProfile
+	rc.MaxActiveTools = c.Routing.ActiveWindowSize
+	rc.PinnedTools = append([]string(nil), c.Routing.PinnedTools...)
+	rc.EnableCatalog = c.Pruning.Tier == "dynamic"
+	if !rc.EnableCatalog && c.Pruning.Tier == "none" {
+		rc.Catalog.EnableMetaTools = false
 	}
+	return rc
 }
 
 // ToFilterConfig converts configuration to a router.FilterConfig instance.
