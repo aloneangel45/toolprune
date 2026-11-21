@@ -419,6 +419,26 @@ func (p *Proxy) handleClientRequest(session ClientSession, msg *mcp.Message) err
 					return session.Send(resp)
 				}
 				if fwdName != "" {
+					// Re-check security guard quarantine & profile filter on unwrapped target tool
+					if p.config.SecurityGuard != nil {
+						if reason, blocked := p.config.SecurityGuard.IsQuarantined(p.config.UpstreamID, fwdName); blocked {
+							p.preBindRejections.Add(1)
+							if p.config.Telemetry != nil {
+								p.config.Telemetry.RecordRequest(p.config.UpstreamID, 0, true)
+							}
+							res := mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", fwdName, reason))
+							resp, _ := mcp.NewResponse(*msg.ID, res)
+							return session.Send(resp)
+						}
+					}
+					if p.config.ToolFilterFunc != nil && !strings.HasPrefix(fwdName, "toolprune_") {
+						if !p.config.ToolFilterFunc(fwdName) {
+							p.preBindRejections.Add(1)
+							res := mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is blocked by the active ToolPrune profile", fwdName))
+							resp, _ := mcp.NewResponse(*msg.ID, res)
+							return session.Send(resp)
+						}
+					}
 					callParams.Name = fwdName
 					callParams.Arguments = fwdArgs
 					if rewritten, err := json.Marshal(callParams); err == nil {
@@ -488,9 +508,27 @@ func (p *Proxy) handleClientRequest(session ClientSession, msg *mcp.Message) err
 }
 
 // handleClientNotification forwards notifications to upstream.
+// Never forwards smuggled tools/call notifications (standalone or inside JSON-RPC batches),
+// preventing notification-based quarantine and profile filter bypasses.
 func (p *Proxy) handleClientNotification(session ClientSession, msg *mcp.Message) error {
 	if p.upstream == nil {
 		return errors.New("upstream transport is nil")
+	}
+	if msg.Method == mcp.MethodToolsCall {
+		p.preBindRejections.Add(1)
+		toolName := ""
+		var callParams mcp.CallToolRequestParams
+		if len(msg.Params) > 0 && json.Unmarshal(msg.Params, &callParams) == nil {
+			toolName = callParams.Name
+		}
+		if p.config.Telemetry != nil {
+			p.config.Telemetry.RecordRequest(p.config.UpstreamID, 0, true)
+		}
+		slog.Warn("dropped notification-smuggled tools/call request (tools/call requires a JSON-RPC request id)",
+			"upstream", p.config.UpstreamID,
+			"tool", toolName,
+		)
+		return nil
 	}
 	switch msg.Method {
 	case "notifications/cancelled":

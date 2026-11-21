@@ -173,6 +173,9 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	if !changed["security-mode"] {
 		bindEnvFallback("security-mode", "TOOLPRUNE_SECURITY_MODE", func(v string) { pFlags.securityMode = v })
 	}
+	if !changed["lockfile"] {
+		bindEnvFallback("lockfile", "TOOLPRUNE_LOCKFILE", func(v string) { pFlags.lockfile = v })
+	}
 	if !changed["security-log"] {
 		bindEnvFallback("security-log", "TOOLPRUNE_SECURITY_LOG", func(v string) { pFlags.securityLog = v })
 	}
@@ -212,15 +215,27 @@ func runProxy(cmd *cobra.Command, args []string) error {
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
+	sigDone := make(chan struct{})
+	defer func() {
+		signal.Stop(sigCh)
+		close(sigDone)
+	}()
 	go func() {
-		_, ok := <-sigCh
-		if !ok {
+		select {
+		case <-sigDone:
 			return
+		case _, ok := <-sigCh:
+			if !ok {
+				return
+			}
 		}
-		_, ok = <-sigCh
-		if !ok {
+		select {
+		case <-sigDone:
 			return
+		case _, ok := <-sigCh:
+			if !ok {
+				return
+			}
 		}
 		fmt.Fprintln(os.Stderr, "\nReceived second interrupt. Forcing immediate termination...")
 		os.Exit(130)
@@ -353,7 +368,7 @@ func runWrapperModeWithFlags(ctx context.Context, cmdArgs []string, changed map[
 	}
 
 	// v1.4.0 Security Guard (Tool Poisoning + SHA-256 Rug-Pull Lockfile)
-	if !strings.EqualFold(cfg.Security.Mode, security.ModeOff) {
+	if secMode := strings.ToLower(strings.TrimSpace(cfg.Security.Mode)); secMode != "" && secMode != security.ModeOff {
 		secGuard, gErr := security.NewGuard(cfg.ToSecurityGuardConfig(logger))
 		if gErr != nil {
 			return fmt.Errorf("failed to initialize security guard: %w", gErr)
@@ -577,13 +592,14 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 
 	// v1.4.0 Security Guard
 	var secGuard *security.Guard
-	if !strings.EqualFold(cfg.Security.Mode, security.ModeOff) {
+	if secMode := strings.ToLower(strings.TrimSpace(cfg.Security.Mode)); secMode != "" && secMode != security.ModeOff {
 		var gErr error
 		secGuard, gErr = security.NewGuard(cfg.ToSecurityGuardConfig(logger))
 		if gErr != nil {
 			return fmt.Errorf("failed to initialize security guard: %w", gErr)
 		}
 		defer func() { _ = secGuard.Close() }()
+		r.AttachSecurityGuard(secGuard)
 	}
 
 	// v1.4.0 Deterministic Tool Output / Response Pruner

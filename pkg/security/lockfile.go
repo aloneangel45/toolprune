@@ -48,19 +48,26 @@ func NewLockfile() *Lockfile {
 
 // canonicalToolEnvelope isolates the canonical fields hashed for rug-pull detection.
 type canonicalToolEnvelope struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema mcp.InputSchema `json:"inputSchema"`
+	Name         string               `json:"name"`
+	Title        string               `json:"title,omitempty"`
+	Description  string               `json:"description"`
+	InputSchema  mcp.InputSchema      `json:"inputSchema"`
+	OutputSchema map[string]any       `json:"outputSchema,omitempty"`
+	Annotations  *mcp.ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // ComputeToolHash computes the deterministic canonical SHA-256 hex digest of
-// a tool's (name, description, inputSchema). Go's encoding/json deterministically
-// sorts map keys, so structurally identical schemas produce identical digests.
+// a tool's (name, title, description, inputSchema, outputSchema, annotations).
+// Go's encoding/json deterministically sorts map keys, so structurally identical
+// schemas produce identical digests.
 func ComputeToolHash(tool mcp.Tool) string {
 	env := canonicalToolEnvelope{
-		Name:        tool.Name,
-		Description: tool.Description,
-		InputSchema: tool.InputSchema,
+		Name:         tool.Name,
+		Title:        tool.Title,
+		Description:  tool.Description,
+		InputSchema:  tool.InputSchema,
+		OutputSchema: tool.OutputSchema,
+		Annotations:  tool.Annotations,
 	}
 	raw, err := json.Marshal(env)
 	if err != nil {
@@ -148,6 +155,10 @@ func SaveLockfile(path string, lf *Lockfile) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -210,8 +221,25 @@ func (lf *Lockfile) Verify(upstream string, tools []mcp.Tool) []Finding {
 	})
 
 	for _, t := range sorted {
-		gotHash := ComputeToolHash(t)
+		lookupTool := t
 		locked, ok := pinned[t.Name]
+		if !ok {
+			// Handle prefixed vs unprefixed lookup (e.g., "github__create_issue" vs "create_issue")
+			prefix := upstream + "__"
+			if strings.HasPrefix(t.Name, prefix) {
+				bare := strings.TrimPrefix(t.Name, prefix)
+				if candidate, found := pinned[bare]; found {
+					locked = candidate
+					ok = true
+					lookupTool.Name = bare
+				}
+			} else if candidate, found := pinned[prefix+t.Name]; found {
+				locked = candidate
+				ok = true
+				lookupTool.Name = prefix + t.Name
+			}
+		}
+		gotHash := ComputeToolHash(lookupTool)
 		if !ok {
 			findings = append(findings, Finding{
 				RuleID:      RuleRugPullUnpinned,

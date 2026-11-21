@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -70,7 +71,7 @@ type Registry struct {
 // NewRegistry creates a new live telemetry registry.
 func NewRegistry(version string) *Registry {
 	if version == "" {
-		version = "1.4.0"
+		version = "1.4.1"
 	}
 	return &Registry{
 		version:               version,
@@ -82,7 +83,7 @@ func NewRegistry(version string) *Registry {
 
 // SetPricePerMillionTokens configures the USD per 1M tokens rate used for savings estimation.
 func (r *Registry) SetPricePerMillionTokens(usd float64) {
-	if r == nil || usd < 0 {
+	if r == nil || math.IsNaN(usd) || math.IsInf(usd, 0) || usd < 0 {
 		return
 	}
 	r.mu.Lock()
@@ -202,11 +203,18 @@ func (r *Registry) Snapshot() TelemetrySnapshot {
 	return TelemetrySnapshot{
 		Version:               r.version,
 		StartedAt:             r.startedAt,
-		UptimeSeconds:         time.Since(r.startedAt).Seconds(),
-		PricePerMillionTokens: r.pricePerMillionTokens,
+		UptimeSeconds:         sanitizeFloat(time.Since(r.startedAt).Seconds()),
+		PricePerMillionTokens: sanitizeFloat(r.pricePerMillionTokens),
 		Totals:                buildUpstreamStats("total", &tot, r.pricePerMillionTokens),
 		Upstreams:             upstreams,
 	}
+}
+
+func sanitizeFloat(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
 }
 
 func buildUpstreamStats(name string, c *upstreamCounter, pricePerMillion float64) UpstreamStats {
@@ -218,13 +226,13 @@ func buildUpstreamStats(name string, c *upstreamCounter, pricePerMillion float64
 	}
 	var savingsPct float64
 	if rawTotal > 0 {
-		savingsPct = float64(saved) * 100.0 / float64(rawTotal)
+		savingsPct = sanitizeFloat(float64(saved) * 100.0 / float64(rawTotal))
 	}
 	var avgMs float64
 	if c.latencySamples > 0 {
-		avgMs = (float64(c.totalLatencyNs) / float64(c.latencySamples)) / 1e6
+		avgMs = sanitizeFloat((float64(c.totalLatencyNs) / float64(c.latencySamples)) / 1e6)
 	}
-	usdSaved := (float64(saved) / 1_000_000.0) * pricePerMillion
+	usdSaved := sanitizeFloat((float64(saved) / 1_000_000.0) * sanitizeFloat(pricePerMillion))
 
 	return UpstreamStats{
 		Upstream:             name,
@@ -253,49 +261,49 @@ func (r *Registry) RenderPrometheus(w io.Writer) {
 	fmt.Fprintln(w, "# HELP toolprune_requests_total Total MCP RPC requests handled per upstream.")
 	fmt.Fprintln(w, "# TYPE toolprune_requests_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_requests_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.Requests)
+		fmt.Fprintf(w, "toolprune_requests_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.Requests)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_errors_total Total MCP RPC errors per upstream.")
 	fmt.Fprintln(w, "# TYPE toolprune_errors_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_errors_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.Errors)
+		fmt.Fprintf(w, "toolprune_errors_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.Errors)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_schema_tokens_raw_total Raw tools/list schema tokens before pruning.")
 	fmt.Fprintln(w, "# TYPE toolprune_schema_tokens_raw_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_schema_tokens_raw_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.SchemaTokensRaw)
+		fmt.Fprintf(w, "toolprune_schema_tokens_raw_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.SchemaTokensRaw)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_schema_tokens_pruned_total Pruned tools/list schema tokens sent to clients.")
 	fmt.Fprintln(w, "# TYPE toolprune_schema_tokens_pruned_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_schema_tokens_pruned_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.SchemaTokensPruned)
+		fmt.Fprintf(w, "toolprune_schema_tokens_pruned_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.SchemaTokensPruned)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_response_tokens_raw_total Raw tools/call response tokens before pruning.")
 	fmt.Fprintln(w, "# TYPE toolprune_response_tokens_raw_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_response_tokens_raw_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.ResponseTokensRaw)
+		fmt.Fprintf(w, "toolprune_response_tokens_raw_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.ResponseTokensRaw)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_response_tokens_pruned_total Pruned tools/call response tokens sent to clients.")
 	fmt.Fprintln(w, "# TYPE toolprune_response_tokens_pruned_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_response_tokens_pruned_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.ResponseTokensPruned)
+		fmt.Fprintf(w, "toolprune_response_tokens_pruned_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.ResponseTokensPruned)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_security_alerts_total Total security poisoning and rug-pull alerts detected.")
 	fmt.Fprintln(w, "# TYPE toolprune_security_alerts_total counter")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_security_alerts_total{upstream=%q} %d\n", escapePromLabel(u.Upstream), u.SecurityAlerts)
+		fmt.Fprintf(w, "toolprune_security_alerts_total{upstream=\"%s\"} %d\n", escapePromLabel(u.Upstream), u.SecurityAlerts)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_avg_latency_ms Average upstream request latency in milliseconds.")
 	fmt.Fprintln(w, "# TYPE toolprune_avg_latency_ms gauge")
 	for _, u := range snap.Upstreams {
-		fmt.Fprintf(w, "toolprune_avg_latency_ms{upstream=%q} %.3f\n", escapePromLabel(u.Upstream), u.AvgLatencyMs)
+		fmt.Fprintf(w, "toolprune_avg_latency_ms{upstream=\"%s\"} %.3f\n", escapePromLabel(u.Upstream), u.AvgLatencyMs)
 	}
 
 	fmt.Fprintln(w, "# HELP toolprune_estimated_usd_saved Estimated USD saved via token pruning.")
@@ -303,10 +311,26 @@ func (r *Registry) RenderPrometheus(w io.Writer) {
 	fmt.Fprintf(w, "toolprune_estimated_usd_saved %.6f\n", snap.Totals.EstimatedUSDSaved)
 }
 
+// escapePromLabel escapes label values per Prometheus 0.0.4 text exposition format:
+// backslash -> \\, double-quote -> \", newline -> \n.
 func escapePromLabel(v string) string {
-	v = strings.ReplaceAll(v, "\n", " ")
-	v = strings.ReplaceAll(v, "\r", " ")
-	return v
+	var b strings.Builder
+	b.Grow(len(v))
+	for _, r := range v {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteByte(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // Handler returns an http.Handler serving /metrics (Prometheus), /api/stats (JSON), and /healthz.
@@ -363,6 +387,9 @@ func StartServer(addr string, reg *Registry, logger *slog.Logger) (*Server, erro
 	srv := &http.Server{
 		Handler:           reg.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

@@ -158,6 +158,11 @@ func (c *Config) ApplyEnvOverrides() error {
 			c.Security.Mode = trimmed
 		}
 	}
+	if raw, ok := os.LookupEnv("TOOLPRUNE_LOCKFILE"); ok {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			c.Security.Lockfile = trimmed
+		}
+	}
 	if raw, ok := os.LookupEnv("TOOLPRUNE_SECURITY_LOG"); ok {
 		if trimmed := strings.TrimSpace(raw); trimmed != "" {
 			c.Security.SecurityLog = trimmed

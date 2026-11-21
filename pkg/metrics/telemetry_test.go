@@ -1,9 +1,11 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -144,5 +146,72 @@ func TestStartServerAndShutdown(t *testing.T) {
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown failed: %v", err)
+	}
+}
+
+func TestRegistry_PrometheusLabelEscapingAndNaNInfGuards(t *testing.T) {
+	reg := NewRegistry("1.4.1")
+	// Special chars: backslash, quote, newline, tab, and Unicode
+	trickyUpstream := "srv\\prod\"alpha\nbeta\t日本語"
+	reg.RecordRequest(trickyUpstream, 5*time.Millisecond, false)
+
+	// Invalid NaN / Inf / negative prices must be rejected so JSON/Prometheus never emit NaN/Inf
+	reg.SetPricePerMillionTokens(math.NaN())
+	reg.SetPricePerMillionTokens(math.Inf(1))
+	reg.SetPricePerMillionTokens(math.Inf(-1))
+	reg.SetPricePerMillionTokens(-5.0)
+
+	// Zero-sample / zero-token upstream must not divide by zero
+	reg.RecordSecurityAlert("zero_div", 1)
+
+	var promBuf bytes.Buffer
+	reg.RenderPrometheus(&promBuf)
+	prom := promBuf.String()
+
+	// Strict Prometheus 0.0.4 label escaping: \ -> \\, " -> \", \n -> \n (and NO Go %q escapes like \t or \u)
+	wantLabel := `upstream="srv\\prod\"alpha\nbeta	日本語"`
+	if !strings.Contains(prom, wantLabel) {
+		t.Errorf("expected Prometheus 0.0.4 escaped label %s in:\n%s", wantLabel, prom)
+	}
+	if strings.Contains(prom, `\t`) || strings.Contains(prom, `\u`) {
+		t.Errorf("Prometheus output must not contain Go %%q escape sequences (\\t or \\u):\n%s", prom)
+	}
+
+	// Verify /api/stats marshals cleanly to valid JSON with zero NaN/Inf
+	ts := httptest.NewServer(reg.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("GET /api/stats failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var snap TelemetrySnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+		t.Fatalf("expected valid JSON from /api/stats after NaN/Inf guard: %v", err)
+	}
+	if snap.PricePerMillionTokens != DefaultPricePerMillionTokens {
+		t.Errorf("expected default price %.2f preserved, got %.2f", DefaultPricePerMillionTokens, snap.PricePerMillionTokens)
+	}
+	for _, u := range snap.Upstreams {
+		if math.IsNaN(u.AvgLatencyMs) || math.IsInf(u.AvgLatencyMs, 0) || math.IsNaN(u.SavingsPercent) || math.IsInf(u.SavingsPercent, 0) {
+			t.Errorf("non-finite float metric detected for %q: %+v", u.Upstream, u)
+		}
+	}
+}
+
+func TestStartServer_TimeoutsConfigured(t *testing.T) {
+	srv, err := StartServer("127.0.0.1:0", NewRegistry("1.4.1"), nil)
+	if err != nil {
+		t.Fatalf("StartServer failed: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	if srv.httpServer.ReadHeaderTimeout <= 0 || srv.httpServer.IdleTimeout <= 0 || srv.httpServer.ReadTimeout <= 0 || srv.httpServer.WriteTimeout <= 0 {
+		t.Fatalf("metrics http.Server missing required timeouts: ReadHeader=%v Read=%v Write=%v Idle=%v",
+			srv.httpServer.ReadHeaderTimeout, srv.httpServer.ReadTimeout, srv.httpServer.WriteTimeout, srv.httpServer.IdleTimeout)
 	}
 }

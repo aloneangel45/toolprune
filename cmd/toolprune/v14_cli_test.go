@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -215,5 +216,170 @@ upstreams: []
 	doctor.FormatReport(&formatted, rep)
 	if !strings.Contains(formatted.String(), "Security Guard:") || !strings.Contains(formatted.String(), "Response Pruner:") {
 		t.Errorf("expected Security Guard and Response Pruner lines in formatted doctor output:\n%s", formatted.String())
+	}
+}
+
+func TestAuditCommand_JSONCWithURLsAndNoSecretLeakAcrossAllFormatsAndFailOnThreshold(t *testing.T) {
+	dir := t.TempDir()
+	cursorDir := filepath.Join(dir, ".cursor")
+	vscodeDir := filepath.Join(dir, ".vscode")
+	if err := os.MkdirAll(cursorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(vscodeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	rawEnvSecret := "ghp_NeverLeakThisRawSecretToken999888777"
+	rawShortPw := "MyPw9876!"
+	rawHeaderSecret := "sk-NeverLeakBearerHeaderSecret1234567890"
+
+	// Cursor JSONC with // https:// comments AND https:// inside JSON string values + trailing commas
+	cursorJSONC := `{
+  // Documentation: https://docs.cursor.com/mcp
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"], // unpinned medium finding
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "` + rawEnvSecret + `",
+        "DB_PASSWORD": "` + rawShortPw + `",
+      },
+    },
+    "safe_remote": {
+      /* Remote docs: https://mcp.example.com/docs */
+      "url": "https://mcp.safe-corp.example/sse",
+      "headers": {
+        "Authorization": "Bearer ` + rawHeaderSecret + `"
+      },
+    },
+  },
+}`
+	if err := os.WriteFile(filepath.Join(cursorDir, "mcp.json"), []byte(cursorJSONC), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// VS Code JSONC with // https:// comment and valid pinned server
+	vscodeJSONC := `{
+  // See https://code.visualstudio.com/docs/copilot/chat/mcp-servers
+  "servers": {
+    "remote_ok": {
+      "url": "https://api.example.com/mcp", // trailing comment https://example.org
+    },
+  },
+}`
+	if err := os.WriteFile(filepath.Join(vscodeDir, "mcp.json"), []byte(vscodeJSONC), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Claude Code .mcp.json with JSONC comments
+	claudeJSONC := `{
+  // https://docs.anthropic.com/claude-code/mcp
+  "mcpServers": {
+    "local_pinned": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem@1.2.3"],
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(claudeJSONC), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Verify raw secrets NEVER leak in table, json, OR sarif output!
+	for _, format := range []string{"table", "json", "sarif"} {
+		buf := new(bytes.Buffer)
+		rootCmd.SetOut(buf)
+		rootCmd.SetErr(buf)
+		rootCmd.SetArgs([]string{"audit", "--all-ides", "--dir", dir, "--format", format})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("audit --format %s failed: %v", format, err)
+		}
+		out := buf.String()
+		for _, secret := range []string{rawEnvSecret, rawShortPw, rawHeaderSecret} {
+			if strings.Contains(out, secret) {
+				t.Errorf("CRITICAL: raw secret %q leaked into %s output!\n%s", secret, format, out)
+			}
+		}
+		if format == "sarif" {
+			var sarif security.SARIFLog
+			if err := json.Unmarshal(buf.Bytes(), &sarif); err != nil {
+				t.Fatalf("invalid SARIF output: %v", err)
+			}
+			for _, res := range sarif.Runs[0].Results {
+				for _, loc := range res.Locations {
+					if loc.PhysicalLocation != nil {
+						uri := loc.PhysicalLocation.ArtifactLocation.URI
+						if strings.Contains(uri, `\`) {
+							t.Errorf("SARIF URI must not contain backslashes: %q", uri)
+						}
+						if !strings.HasPrefix(uri, "file:///") && !strings.HasPrefix(uri, "file://") {
+							t.Errorf("absolute path SARIF URI should be file:// normalized, got %q", uri)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Verify --fail-on threshold accuracy on a schema with ONLY medium findings vs high findings:
+	//    In our test project above, highest severity is HIGH (hardcoded secret), ZERO critical findings.
+	//    -> --fail-on critical MUST PASS (nil error)
+	//    -> --fail-on high MUST FAIL (non-nil error)
+	bufCrit := new(bytes.Buffer)
+	rootCmd.SetOut(bufCrit)
+	rootCmd.SetErr(bufCrit)
+	rootCmd.SetArgs([]string{"audit", "--all-ides", "--dir", dir, "--format", "json", "--fail-on", "critical"})
+	if err := rootCmd.Execute(); err != nil {
+		// Note: host user configs might exist; skip strict pass check if a real host config had critical findings
+		var summary AuditSummary
+		if json.Unmarshal(bufCrit.Bytes(), &summary) == nil && summary.Counts["critical"] == 0 {
+			t.Fatalf("expected --fail-on critical to succeed when critical count is 0, got err=%v", err)
+		}
+	}
+
+	bufHigh := new(bytes.Buffer)
+	rootCmd.SetOut(bufHigh)
+	rootCmd.SetErr(bufHigh)
+	rootCmd.SetArgs([]string{"audit", "--all-ides", "--dir", dir, "--format", "json", "--fail-on", "high"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected --fail-on high to fail on hardcoded secret findings")
+	}
+}
+
+func TestTopCommand_ErrorHandlingEdgeCases(t *testing.T) {
+	// 1. Invalid URL scheme
+	buf := new(bytes.Buffer)
+	rootCmd.SetOut(buf)
+	rootCmd.SetErr(buf)
+	rootCmd.SetArgs([]string{"top", "--url", "not-a-url", "--once"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected error for invalid --url")
+	}
+
+	// 2. Unreachable endpoint
+	tsClosed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closedURL := tsClosed.URL + "/api/stats"
+	tsClosed.Close()
+
+	buf.Reset()
+	rootCmd.SetArgs([]string{"top", "--url", closedURL, "--once"})
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("expected clean error for unreachable telemetry endpoint")
+	}
+
+	// 3. Invalid JSON & null JSON responses
+	for _, payload := range []string{"not-json", "null", "[]"} {
+		tsBad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(payload))
+		}))
+		buf.Reset()
+		rootCmd.SetArgs([]string{"top", "--url", tsBad.URL + "/api/stats", "--once"})
+		err := rootCmd.Execute()
+		tsBad.Close()
+		if err == nil {
+			t.Errorf("expected error from top --once on invalid JSON body %q", payload)
+		}
 	}
 }

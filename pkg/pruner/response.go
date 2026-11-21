@@ -6,6 +6,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
@@ -164,12 +165,23 @@ func (rp *ResponsePruner) pruneContentItems(items []mcp.ContentItem, totalBudget
 		return false
 	}
 
+	minSlot := totalBudget / len(slots)
+	if minSlot > 16 {
+		minSlot = 16
+	}
+	if minSlot < 1 {
+		minSlot = 1
+	}
+
 	modified := false
 	for _, s := range slots {
-		// Allocate budget proportionally to raw size (minimum 16 tokens per slot)
+		// Allocate budget proportionally to raw size without letting a per-slot floor exceed totalBudget
 		slotBudget := int(math.Floor(float64(totalBudget) * float64(s.rawTokens) / float64(totalRaw)))
-		if slotBudget < 16 {
-			slotBudget = 16
+		if slotBudget < minSlot {
+			slotBudget = minSlot
+		}
+		if slotBudget > totalBudget {
+			slotBudget = totalBudget
 		}
 		if s.rawTokens <= slotBudget {
 			continue
@@ -276,9 +288,86 @@ func (rp *ResponsePruner) pruneJSONArray(raw string, maxTokens int) (string, boo
 	return truncateHeadTail(string(encoded), maxTokens, false), true
 }
 
+const maxJSONPruneDepth = 32
+
+func hasPrunableJSONArray(v any, depth int) bool {
+	if depth > maxJSONPruneDepth {
+		return false
+	}
+	switch val := v.(type) {
+	case []any:
+		if len(val) > 2 {
+			return true
+		}
+		for _, item := range val {
+			if hasPrunableJSONArray(item, depth+1) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, sub := range val {
+			if hasPrunableJSONArray(sub, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compactNestedJSONArrays(v any, k int, depth int) (any, bool) {
+	if depth > maxJSONPruneDepth {
+		return v, false
+	}
+	switch val := v.(type) {
+	case []any:
+		trimmed := false
+		if len(val) > 2*k {
+			omitted := len(val) - 2*k
+			compact := make([]any, 0, 2*k+1)
+			for _, item := range val[:k] {
+				sub, _ := compactNestedJSONArrays(item, k, depth+1)
+				compact = append(compact, sub)
+			}
+			compact = append(compact, fmt.Sprintf("[... %d items omitted by ToolPrune ...]", omitted))
+			for _, item := range val[len(val)-k:] {
+				sub, _ := compactNestedJSONArrays(item, k, depth+1)
+				compact = append(compact, sub)
+			}
+			return compact, true
+		}
+		out := make([]any, len(val))
+		for i, item := range val {
+			sub, subTrimmed := compactNestedJSONArrays(item, k, depth+1)
+			out[i] = sub
+			if subTrimmed {
+				trimmed = true
+			}
+		}
+		return out, trimmed
+
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		trimmed := false
+		for key, subVal := range val {
+			sub, subTrimmed := compactNestedJSONArrays(subVal, k, depth+1)
+			out[key] = sub
+			if subTrimmed {
+				trimmed = true
+			}
+		}
+		return out, trimmed
+	default:
+		return v, false
+	}
+}
+
 func (rp *ResponsePruner) pruneJSONObjectArrays(raw string, maxTokens int) (string, bool) {
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(raw), &obj); err != nil || len(obj) == 0 {
+		return "", false
+	}
+
+	if !hasPrunableJSONArray(obj, 0) {
 		return "", false
 	}
 
@@ -287,44 +376,24 @@ func (rp *ResponsePruner) pruneJSONObjectArrays(raw string, maxTokens int) (stri
 		kStart = 5
 	}
 
-	hasLargeArray := false
-	for _, v := range obj {
-		if arr, ok := v.([]any); ok && len(arr) > 2 {
-			hasLargeArray = true
-			break
-		}
-	}
-	if !hasLargeArray {
-		return "", false
-	}
-
+	lastCompacted := ""
 	for k := kStart; k >= 1; k-- {
-		cp := make(map[string]any, len(obj))
-		trimmedAny := false
-		for key, v := range obj {
-			if arr, ok := v.([]any); ok && len(arr) > 2*k {
-				omitted := len(arr) - 2*k
-				compact := make([]any, 0, 2*k+1)
-				compact = append(compact, arr[:k]...)
-				compact = append(compact, fmt.Sprintf("[... %d items omitted by ToolPrune ...]", omitted))
-				compact = append(compact, arr[len(arr)-k:]...)
-				cp[key] = compact
-				trimmedAny = true
-			} else {
-				cp[key] = v
-			}
-		}
+		compacted, trimmedAny := compactNestedJSONArrays(obj, k, 0)
 		if !trimmedAny {
 			continue
 		}
-		encoded, err := json.Marshal(cp)
+		encoded, err := json.Marshal(compacted)
 		if err != nil {
 			return "", false
 		}
 		outStr := string(encoded)
+		lastCompacted = outStr
 		if EstimateTextTokens(outStr) <= maxTokens {
 			return outStr, true
 		}
+	}
+	if lastCompacted != "" {
+		return truncateHeadTail(lastCompacted, maxTokens, false), true
 	}
 	return "", false
 }
@@ -383,15 +452,31 @@ func DeduplicateConsecutiveLines(input string) string {
 }
 
 // truncateHeadTail performs deterministic, UTF-8 rune-safe head+tail truncation
-// keeping ~60% head and ~40% tail within maxTokens.
+// keeping ~60% head / ~40% tail (or ~70% head / ~30% tail for errors) strictly within maxTokens.
 func truncateHeadTail(text string, maxTokens int, isError bool) string {
-	// Target byte budget slightly conservative (4.2 bytes/token) to stay strictly <= maxTokens
-	targetBytes := int(math.Floor(float64(maxTokens) * 4.2))
-	if targetBytes < 64 {
-		targetBytes = 64
-	}
-	if len(text) <= targetBytes {
+	if maxTokens <= 0 {
 		return text
+	}
+	if EstimateTextTokens(text) <= maxTokens {
+		return text
+	}
+
+	// Exact byte ceiling that keeps EstimateTextTokens <= maxTokens (accounting for math.Round).
+	maxBytes := int(math.Floor((float64(maxTokens) + 0.49) * 4.45))
+	if maxBytes < 4 {
+		maxBytes = 4
+	}
+	targetBytes := int(math.Floor(float64(maxTokens) * 4.2))
+	if targetBytes > maxBytes {
+		targetBytes = maxBytes
+	}
+	if targetBytes < 4 {
+		targetBytes = maxBytes
+	}
+
+	headRatio := 0.60
+	if isError {
+		headRatio = 0.70
 	}
 
 	marker := "\n[... %d lines omitted by ToolPrune ...]\n"
@@ -400,83 +485,154 @@ func truncateHeadTail(text string, maxTokens int, isError bool) string {
 	}
 
 	lines := strings.Split(text, "\n")
-	if len(lines) >= 6 {
+	if len(lines) >= 6 && targetBytes > 100 {
 		// Reserve marker budget (~56 bytes)
 		usableBytes := targetBytes - 60
-		if usableBytes < 40 {
-			usableBytes = 40
-		}
-		headBudget := int(float64(usableBytes) * 0.60)
-		tailBudget := usableBytes - headBudget
+		if usableBytes >= 40 {
+			headBudget := int(float64(usableBytes) * headRatio)
+			tailBudget := usableBytes - headBudget
 
-		var headLines []string
-		headUsed := 0
-		headIdx := 0
-		for headIdx < len(lines) {
-			cost := len(lines[headIdx]) + 1
-			if len(headLines) > 0 && headUsed+cost > headBudget {
-				break
+			var headLines []string
+			headUsed := 0
+			headIdx := 0
+			for headIdx < len(lines) {
+				cost := len(lines[headIdx]) + 1
+				if len(headLines) > 0 && headUsed+cost > headBudget {
+					break
+				}
+				if len(headLines) == 0 && cost > headBudget {
+					break
+				}
+				headLines = append(headLines, lines[headIdx])
+				headUsed += cost
+				headIdx++
 			}
-			if len(headLines) == 0 && cost > headBudget {
-				break
-			}
-			headLines = append(headLines, lines[headIdx])
-			headUsed += cost
-			headIdx++
-		}
 
-		var tailLines []string
-		tailUsed := 0
-		tailIdx := len(lines) - 1
-		for tailIdx >= headIdx {
-			cost := len(lines[tailIdx]) + 1
-			if len(tailLines) > 0 && tailUsed+cost > tailBudget {
-				break
+			var tailLines []string
+			tailUsed := 0
+			tailIdx := len(lines) - 1
+			for tailIdx >= headIdx {
+				cost := len(lines[tailIdx]) + 1
+				if len(tailLines) > 0 && tailUsed+cost > tailBudget {
+					break
+				}
+				if len(tailLines) == 0 && cost > tailBudget {
+					break
+				}
+				tailLines = append(tailLines, lines[tailIdx])
+				tailUsed += cost
+				tailIdx--
 			}
-			if len(tailLines) == 0 && cost > tailBudget {
-				break
+
+			// Reverse tailLines back to original order
+			for l, r := 0, len(tailLines)-1; l < r; l, r = l+1, r-1 {
+				tailLines[l], tailLines[r] = tailLines[r], tailLines[l]
 			}
-			tailLines = append(tailLines, lines[tailIdx])
-			tailUsed += cost
-			tailIdx--
-		}
 
-		// Reverse tailLines back to original order
-		for l, r := 0, len(tailLines)-1; l < r; l, r = l+1, r-1 {
-			tailLines[l], tailLines[r] = tailLines[r], tailLines[l]
-		}
-
-		omitted := (tailIdx - headIdx) + 1
-		if len(headLines) > 0 && len(tailLines) > 0 && omitted > 0 {
-			candidate := strings.Join(headLines, "\n") + fmt.Sprintf(marker, omitted) + strings.Join(tailLines, "\n")
-			if EstimateTextTokens(candidate) <= maxTokens {
-				return candidate
+			omitted := (tailIdx - headIdx) + 1
+			if len(headLines) > 0 && len(tailLines) > 0 && omitted > 0 {
+				candidate := strings.Join(headLines, "\n") + fmt.Sprintf(marker, omitted) + strings.Join(tailLines, "\n")
+				if EstimateTextTokens(candidate) <= maxTokens {
+					return candidate
+				}
 			}
 		}
 	}
 
-	// Single-line or ultra-long-line UTF-8 rune-safe head+tail fallback
-	runes := []rune(text)
+	// Single-line, tiny-budget, or multi-byte UTF-8 rune-safe head+tail fallback
 	charMarker := " [... omitted by ToolPrune ...] "
-	if isError {
+	if isError && maxBytes >= 140 {
 		charMarker = " [... error tail omitted by ToolPrune ...] "
+	} else if maxBytes < 100 {
+		charMarker = " [...] "
 	}
-	avail := targetBytes - len(charMarker)
-	if avail < 20 {
-		avail = 20
+
+	availBytes := maxBytes - len(charMarker)
+	if availBytes < 8 {
+		// Ultra-tiny budget: emit a strict UTF-8 rune-safe prefix + ellipsis within maxBytes.
+		ellipsis := "..."
+		prefixBudget := maxBytes - len(ellipsis)
+		if prefixBudget <= 0 {
+			return utf8PrefixBytes(text, maxBytes)
+		}
+		return utf8PrefixBytes(text, prefixBudget) + ellipsis
 	}
-	// Estimate safe rune budget (conservative for multi-byte UTF-8)
-	headRunes := int(float64(avail) * 0.60)
-	tailRunes := avail - headRunes
-	if headRunes+tailRunes >= len(runes) {
-		return text
+
+	headByteBudget := int(math.Floor(float64(availBytes) * headRatio))
+	tailByteBudget := availBytes - headByteBudget
+
+	runes := []rune(text)
+	headEnd := 0
+	headBytes := 0
+	for headEnd < len(runes) {
+		rl := utf8.RuneLen(runes[headEnd])
+		if rl < 0 {
+			rl = 3 // utf8.RuneError replacement bytes
+		}
+		if headBytes+rl > headByteBudget {
+			break
+		}
+		headBytes += rl
+		headEnd++
 	}
-	res := string(runes[:headRunes]) + charMarker + string(runes[len(runes)-tailRunes:])
-	// Tighten if multi-byte UTF-8 pushed byte length over target
-	for EstimateTextTokens(res) > maxTokens && headRunes > 10 && tailRunes > 6 {
-		headRunes = int(float64(headRunes) * 0.8)
-		tailRunes = int(float64(tailRunes) * 0.8)
-		res = string(runes[:headRunes]) + charMarker + string(runes[len(runes)-tailRunes:])
+
+	tailStart := len(runes)
+	tailBytes := 0
+	for tailStart > headEnd {
+		rl := utf8.RuneLen(runes[tailStart-1])
+		if rl < 0 {
+			rl = 3
+		}
+		if tailBytes+rl > tailByteBudget {
+			break
+		}
+		tailBytes += rl
+		tailStart--
+	}
+
+	// Guarantee strict compliance with EstimateTextTokens <= maxTokens even on boundary rounding
+	res := string(runes[:headEnd]) + charMarker + string(runes[tailStart:])
+	for EstimateTextTokens(res) > maxTokens && (headEnd > 0 || tailStart < len(runes)) {
+		if tailStart < len(runes) && (headEnd <= 1 || tailBytes >= headBytes) {
+			rl := utf8.RuneLen(runes[tailStart])
+			if rl < 0 {
+				rl = 3
+			}
+			tailBytes -= rl
+			tailStart++
+		} else if headEnd > 0 {
+			headEnd--
+			rl := utf8.RuneLen(runes[headEnd])
+			if rl < 0 {
+				rl = 3
+			}
+			headBytes -= rl
+		}
+		res = string(runes[:headEnd]) + charMarker + string(runes[tailStart:])
 	}
 	return res
+}
+
+// utf8PrefixBytes returns the longest valid UTF-8 prefix of s whose byte length <= maxBytes.
+func utf8PrefixBytes(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) == 0 {
+		return ""
+	}
+	if len(s) <= maxBytes && utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		rl := utf8.RuneLen(r)
+		if rl < 0 {
+			rl = 3
+		}
+		if used+rl > maxBytes {
+			break
+		}
+		b.WriteRune(r)
+		used += rl
+	}
+	return b.String()
 }

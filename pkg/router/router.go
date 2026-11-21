@@ -13,6 +13,7 @@ import (
 	"github.com/aloneangel45/toolprune/pkg/metrics"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
 	"github.com/aloneangel45/toolprune/pkg/pruner"
+	"github.com/aloneangel45/toolprune/pkg/security"
 )
 
 // RouterConfig holds settings for the Unified Router Engine.
@@ -64,12 +65,13 @@ type Router struct {
 	pruner       *pruner.Engine
 	filter       FilterEngine
 	window       WindowEngine
-	schemaStore  *SchemaStore
-	schemaDirty  atomic.Bool
-	streamFilter *proxy.StreamFilter
-	telemetry    *metrics.Registry
-	logger       *slog.Logger
-	notifier     func() // Broadcast notifications/tools/list_changed to clients
+	schemaStore   *SchemaStore
+	schemaDirty   atomic.Bool
+	streamFilter  *proxy.StreamFilter
+	telemetry     *metrics.Registry
+	securityGuard *security.Guard
+	logger        *slog.Logger
+	notifier      func() // Broadcast notifications/tools/list_changed to clients
 
 	listsIntercepted  atomic.Uint64
 	callsIntercepted  atomic.Uint64
@@ -254,6 +256,26 @@ func (r *Router) AttachTelemetry(reg *metrics.Registry) {
 	r.mu.Unlock()
 }
 
+// AttachSecurityGuard attaches a runtime security guard to enforce quarantine on all routed calls.
+func (r *Router) AttachSecurityGuard(guard *security.Guard) {
+	r.mu.Lock()
+	r.securityGuard = guard
+	r.mu.Unlock()
+}
+
+func (r *Router) checkQuarantined(upstreamID, toolName string) (string, bool) {
+	r.mu.RLock()
+	guard := r.securityGuard
+	r.mu.RUnlock()
+	if guard == nil {
+		return "", false
+	}
+	if upstreamID != "" {
+		return guard.IsQuarantined(upstreamID, toolName)
+	}
+	return guard.IsQuarantinedAnyUpstream(toolName)
+}
+
 // Multiplexer returns the internal multiplexer instance.
 func (r *Router) Multiplexer() *Multiplexer {
 	return r.multiplexer
@@ -422,6 +444,7 @@ func (r *Router) PreValidateCall(msg *mcp.Message) *mcp.Message {
 	r.mu.RLock()
 	cfg := r.cfg
 	filter := r.filter
+	tel := r.telemetry
 	r.mu.RUnlock()
 
 	if filter != nil && !filter.IsAllowed(params.Name) {
@@ -430,7 +453,37 @@ func (r *Router) PreValidateCall(msg *mcp.Message) *mcp.Message {
 
 	route, ok := r.multiplexer.ResolveRoute(params.Name)
 	if !ok {
+		if reason, blocked := r.checkQuarantined("", params.Name); blocked {
+			r.preBindRejections.Add(1)
+			if tel != nil {
+				tel.RecordRequest("gateway", 0, true)
+			}
+			res := mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", params.Name, reason))
+			if resp, err := mcp.NewResponse(*msg.ID, res); err == nil {
+				return resp
+			}
+		}
 		return nil
+	}
+
+	if reason, blocked := r.checkQuarantined(route.UpstreamID, route.OriginalName); blocked {
+		r.preBindRejections.Add(1)
+		if tel != nil {
+			tel.RecordRequest(route.UpstreamID, 0, true)
+		}
+		res := mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", route.ExposedName, reason))
+		if resp, err := mcp.NewResponse(*msg.ID, res); err == nil {
+			return resp
+		}
+	} else if reason, blocked := r.checkQuarantined(route.UpstreamID, route.ExposedName); blocked {
+		r.preBindRejections.Add(1)
+		if tel != nil {
+			tel.RecordRequest(route.UpstreamID, 0, true)
+		}
+		res := mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", route.ExposedName, reason))
+		if resp, err := mcp.NewResponse(*msg.ID, res); err == nil {
+			return resp
+		}
 	}
 
 	if r.streamFilter != nil {
@@ -500,7 +553,18 @@ func (r *Router) RouteToolCall(msg *mcp.Message) (UpstreamTransport, *mcp.Messag
 	// 2. Resolve Route via Multiplexer
 	route, ok := r.multiplexer.ResolveRoute(params.Name)
 	if !ok {
+		if reason, blocked := r.checkQuarantined("", params.Name); blocked {
+			return nil, nil, mcp.NewInvalidRequest(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", params.Name, reason))
+		}
 		return nil, nil, mcp.NewMethodNotFound(fmt.Sprintf("tool %q not found in router catalog", params.Name))
+	}
+
+	// Re-check resolved exposed & original names against security guard quarantine
+	if reason, blocked := r.checkQuarantined(route.UpstreamID, route.OriginalName); blocked {
+		return nil, nil, mcp.NewInvalidRequest(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", route.ExposedName, reason))
+	}
+	if reason, blocked := r.checkQuarantined(route.UpstreamID, route.ExposedName); blocked {
+		return nil, nil, mcp.NewInvalidRequest(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", route.ExposedName, reason))
 	}
 
 	// Re-check resolved exposed name against filter to defeat unprefixed fallback bypass!
@@ -676,7 +740,21 @@ func (r *Router) HandleInternalToolCall(msg *mcp.Message) (*mcp.Message, bool) {
 		route, ok := r.multiplexer.ResolveRoute(targetName)
 		if !ok {
 			r.preBindRejections.Add(1)
+			if reason, blocked := r.checkQuarantined("", targetName); blocked {
+				resp, _ := mcp.NewResponse(reqID, mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", targetName, reason)))
+				return resp, true
+			}
 			resp, _ := mcp.NewResponse(reqID, mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q not found in router catalog", targetName)))
+			return resp, true
+		}
+		if reason, blocked := r.checkQuarantined(route.UpstreamID, route.OriginalName); blocked {
+			r.preBindRejections.Add(1)
+			resp, _ := mcp.NewResponse(reqID, mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", route.ExposedName, reason)))
+			return resp, true
+		}
+		if reason, blocked := r.checkQuarantined(route.UpstreamID, route.ExposedName); blocked {
+			r.preBindRejections.Add(1)
+			resp, _ := mcp.NewResponse(reqID, mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", route.ExposedName, reason)))
 			return resp, true
 		}
 		if filter != nil && !filter.IsAllowed(route.ExposedName) {

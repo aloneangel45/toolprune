@@ -2,8 +2,9 @@ package security
 
 import (
 	"encoding/json"
-	"path/filepath"
+	"net/url"
 	"sort"
+	"strings"
 )
 
 const (
@@ -101,7 +102,7 @@ type SARIFLogicalLocation struct {
 // BuildSARIF constructs a valid SARIF 2.1.0 document from ToolPrune security findings.
 func BuildSARIF(findings []Finding, version string) SARIFLog {
 	if version == "" {
-		version = "1.4.0"
+		version = "1.4.1"
 	}
 
 	rulesMap := make(map[string]SARIFRule)
@@ -128,7 +129,7 @@ func BuildSARIF(findings []Finding, version string) SARIFLog {
 		if f.FilePath != "" {
 			loc.PhysicalLocation = &SARIFPhysicalLocation{
 				ArtifactLocation: SARIFArtifactLocation{
-					URI: filepath.ToSlash(f.FilePath),
+					URI: NormalizeSARIFURI(f.FilePath),
 				},
 			}
 		}
@@ -263,4 +264,74 @@ func ruleSummary(ruleID, fallback string) string {
 	default:
 		return fallback
 	}
+}
+
+// NormalizeSARIFURI converts a local OS path (Windows drive path, UNC path, POSIX absolute
+// path, or relative path) into an RFC 3986 / OASIS SARIF 2.1.0 compliant URI.
+func NormalizeSARIFURI(p string) string {
+	s := strings.TrimSpace(p)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "file://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return s
+	}
+
+	// Cross-platform slash normalization (works identically on Linux, macOS, and Windows).
+	s = strings.ReplaceAll(s, "\\", "/")
+
+	// Windows UNC path: //server/share/path -> file://server/share/path
+	if strings.HasPrefix(s, "//") {
+		trimmed := strings.TrimPrefix(s, "//")
+		host, rest, hasRest := strings.Cut(trimmed, "/")
+		encodedRest := encodeURIPathSegments(rest)
+		if hasRest {
+			return "file://" + host + "/" + encodedRest
+		}
+		return "file://" + host
+	}
+
+	// Windows drive path: C:/Users/... -> file:///C:/Users/...
+	if len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':' {
+		drive := strings.ToUpper(s[:1]) + ":"
+		rest := ""
+		if len(s) > 2 {
+			rest = strings.TrimPrefix(s[2:], "/")
+		}
+		encoded := encodeURIPathSegments(rest)
+		if encoded == "" {
+			return "file:///" + drive + "/"
+		}
+		return "file:///" + drive + "/" + encoded
+	}
+
+	// POSIX absolute path: /home/user/... -> file:///home/user/...
+	if strings.HasPrefix(s, "/") {
+		return "file:///" + encodeURIPathSegments(strings.TrimPrefix(s, "/"))
+	}
+
+	// Relative path: strip leading ./ and percent-encode segments
+	for strings.HasPrefix(s, "./") {
+		s = strings.TrimPrefix(s, "./")
+	}
+	return encodeURIPathSegments(s)
+}
+
+func isASCIIAlpha(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+func encodeURIPathSegments(pathStr string) string {
+	if pathStr == "" {
+		return ""
+	}
+	parts := strings.Split(pathStr, "/")
+	for i, seg := range parts {
+		if seg == "" {
+			continue
+		}
+		parts[i] = url.PathEscape(seg)
+	}
+	return strings.Join(parts, "/")
 }

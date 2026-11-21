@@ -5,6 +5,26 @@ All notable changes to **ToolPrune** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-11-21
+
+### Security & Bug Fixes
+- **MCP Security Guard & Quarantine Bypass Hardening (`pkg/security/guard.go`, `pkg/security/lockfile.go`, `pkg/proxy/proxy.go`, `pkg/router/router.go`, `cmd/toolprune/proxy.go`)**:
+  - Blocked notification-smuggled `tools/call` payloads (missing JSON-RPC `id`, both standalone and inside JSON-RPC 2.0 batches `[...]`) in `Proxy.handleClientNotification` so quarantined or profile-blocked tools can never be invoked via notification forwarding.
+  - Re-checked `SecurityGuard.IsQuarantined` and `ToolFilterFunc` after `DynamicCatalog.InterceptCall` unwraps `toolprune_invoke` in wrapper mode, and attached `SecurityGuard` to multi-upstream `Router` (`AttachSecurityGuard`) to enforce quarantine across `PreValidateCall`, `RouteToolCall`, `toolprune_invoke`, and JSON-RPC 2.0 batches with per-upstream isolation.
+  - Normalized prefixed (`server__tool`) vs unprefixed (`tool`) lookups in `Guard.IsQuarantined`, `Guard.IsQuarantinedAnyUpstream`, and `Lockfile.Verify` so namespace mismatches never bypass quarantine or cause false lockfile drift.
+  - Closed tool-poisoning scanner bypasses: added two-pass HTML entity decoding (`&#x3c;IMPORTANT&#x3e;`, `&lt;SYSTEM&gt;`, `&amp;lt;...&amp;gt;`) and concealed-Unicode stripping before regex evaluation, broadened tag/bracket rules for attributes and whitespace (`<IMPORTANT priority="high">`, `[ SYSTEM ]`, `[/INST]`), increased recursive schema depth to 64, and extended scanning to map property keys, arbitrary string fields (`x-instructions`, etc.), `[]string`/`[]map[string]any` slices, `required`, `dependentRequired`, and `icons`.
+  - Closed SHA-256 rug-pull hash blind spot by including `title`, `outputSchema`, and `annotations` (`omitempty`) in `ComputeToolHash`; added `fsync` before close in atomic `SaveLockfile` writes and `Guard.Close`, enforced `0600` permissions on pre-existing `--security-log` files on POSIX, added `TOOLPRUNE_LOCKFILE` env support, and fixed a signal-handler goroutine leak in `runProxy`.
+- **Tool Output / Response Pruner Hardening (`pkg/pruner/response.go`)**:
+  - Fixed a multi-byte UTF-8 rune-vs-byte budget bug in `truncateHeadTail` where 3/4-byte strings (CJK, emojis) could bypass truncation or exceed tiny budgets (`--max-response-tokens 20`), replacing rune-count guessing with exact `utf8.RuneLen` byte accumulation so output is always valid UTF-8 and strictly within budget (with 70/30 head-weighted preservation for `isError: true` headers).
+  - Upgraded `pruneJSONObjectArrays` to recursively compact large arrays nested inside arbitrary JSON object/array hierarchies (e.g., `{"data": {"items": [...]}}`) while preserving valid JSON and keeping compacted summaries when `k=1` still exceeds budget.
+- **Live Telemetry & `toolprune top` Hardening (`pkg/metrics/telemetry.go`, `cmd/toolprune/top.go`)**:
+  - Replaced Go `%q` label formatting in `RenderPrometheus` with strict Prometheus 0.0.4 escaping (`\` -> `\\`, `"` -> `\"`, `\n` -> `\n`) so tabs and non-ASCII UTF-8 upstream IDs never emit invalid `\t`/`\u` escape sequences.
+  - Configured `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, and `IdleTimeout` on the `--metrics-addr` HTTP server, and guarded `SetPricePerMillionTokens` and computed snapshot floats against `NaN`, `±Inf`, and division-by-zero.
+  - Hardened `toolprune top` with URL scheme/host validation, 4 MiB body cap, strict JSON object checks (rejecting `null`/non-objects), nil-context safety, and uptime overflow guards.
+- **`toolprune audit` Secret Redaction & SARIF 2.1.0 URI Normalization (`cmd/toolprune/audit.go`, `pkg/security/guard.go`, `pkg/security/sarif.go`)**:
+  - Hardened `redactSecret` (`[REDACTED]` for `<= 12` runes, 3-char prefix + `****[REDACTED]` for longer secrets), sanitized credentials/tokens in CLI `args` and HTTP `url` evidence, and audited IDE `headers` maps (while allowing `Bearer ${ENV_VAR}` placeholders) so raw secrets never leak into table, JSON, or SARIF output.
+  - Added cross-platform `NormalizeSARIFURI` emitting RFC 3986 / SARIF 2.1.0 `file:///` URIs for Windows drive paths (`C:\...`), UNC paths (`\\server\...`), and POSIX absolute paths with proper percent-encoding, and stripped UTF-8 BOM in `--schema-file` loading.
+
 ## [1.4.0] - 2026-11-21
 
 ### Added

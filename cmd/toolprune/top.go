@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -61,12 +64,21 @@ func runTop(cmd *cobra.Command, args []string) error {
 	if interval <= 0 {
 		return fmt.Errorf("invalid --interval %s: must be positive", interval)
 	}
+	parsedURL, uErr := url.Parse(targetURL)
+	if uErr != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return fmt.Errorf("invalid telemetry --url %q: must be an http:// or https:// URL", targetURL)
+	}
+
+	baseCtx := cmd.Context()
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	out := cmd.OutOrStdout()
 
 	if once {
-		snap, err := fetchTelemetrySnapshot(cmd.Context(), client, targetURL)
+		snap, err := fetchTelemetrySnapshot(baseCtx, client, targetURL)
 		if err != nil {
 			return err
 		}
@@ -74,7 +86,7 @@ func runTop(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(baseCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	ticker := time.NewTicker(interval)
@@ -118,8 +130,21 @@ func fetchTelemetrySnapshot(ctx context.Context, client *http.Client, targetURL 
 		return nil, fmt.Errorf("telemetry endpoint %q returned HTTP %d", targetURL, resp.StatusCode)
 	}
 
+	const maxStatsBody = 4 * 1024 * 1024
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxStatsBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read telemetry response from %q: %w", targetURL, err)
+	}
+	if len(body) > maxStatsBody {
+		return nil, fmt.Errorf("telemetry response from %q exceeded maximum allowed size (%d bytes)", targetURL, maxStatsBody)
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("failed to decode telemetry JSON from %q: expected JSON object", targetURL)
+	}
+
 	var snap metrics.TelemetrySnapshot
-	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+	if err := json.Unmarshal(trimmed, &snap); err != nil {
 		return nil, fmt.Errorf("failed to decode telemetry JSON from %q: %w", targetURL, err)
 	}
 	return &snap, nil
@@ -129,7 +154,13 @@ func renderTopDashboard(w io.Writer, endpoint string, snap *metrics.TelemetrySna
 	if snap == nil {
 		return
 	}
-	uptime := (time.Duration(snap.UptimeSeconds * float64(time.Second))).Round(time.Second)
+	uptimeSecs := snap.UptimeSeconds
+	if math.IsNaN(uptimeSecs) || math.IsInf(uptimeSecs, 0) || uptimeSecs < 0 {
+		uptimeSecs = 0
+	} else if uptimeSecs > 365*100*86400 {
+		uptimeSecs = 365 * 100 * 86400
+	}
+	uptime := (time.Duration(uptimeSecs * float64(time.Second))).Round(time.Second)
 	fmt.Fprintf(w, "ToolPrune Live Telemetry (v%s)  |  Endpoint: %s  |  Uptime: %s\n",
 		snap.Version, endpoint, uptime)
 	fmt.Fprintln(w, strings.Repeat("=", 96))

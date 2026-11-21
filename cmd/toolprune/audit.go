@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -241,6 +242,7 @@ func loadToolsFromJSONFile(path string) ([]mcp.Tool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read schema file %q: %w", path, err)
 	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	var tools []mcp.Tool
 	if err := json.Unmarshal(data, &tools); err == nil {
 		return tools, nil
@@ -410,6 +412,7 @@ func extractServerAuditInput(source, filePath, name, schemaKey string, entry map
 	}
 	in.Args = anySliceToStrings(entry["args"])
 	in.Env = anyMapToStringMap(entry["env"])
+	in.Headers = anyMapToStringMap(entry["headers"])
 	if u, ok := entry["url"].(string); ok && u != "" {
 		in.URL = u
 	} else if su, ok := entry["serverUrl"].(string); ok && su != "" {

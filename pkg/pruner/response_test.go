@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
 )
@@ -144,5 +145,112 @@ func TestResponsePruner_DisabledOrUnderBudgetPassesUnchanged(t *testing.T) {
 	out2, metrics2 := rpDisabled.PruneCallResult(*mcp.NewToolTextResult(strings.Repeat("x", 5000)))
 	if metrics2.Modified || len(out2.Content[0].Text) != 5000 {
 		t.Fatalf("disabled response pruner must pass unchanged")
+	}
+
+	rpNeg := NewResponsePruner(ResponsePrunerOptions{MaxResponseTokens: -50})
+	out3, metrics3 := rpNeg.PruneCallResult(*mcp.NewToolTextResult(strings.Repeat("y", 1000)))
+	if metrics3.Modified || len(out3.Content[0].Text) != 1000 {
+		t.Fatalf("negative MaxResponseTokens must disable pruning cleanly")
+	}
+}
+
+func TestResponsePruner_UTF8MultiByteRuneSafetyAndTinyBudgets(t *testing.T) {
+	// 40 4-byte emojis = 160 bytes (~36 tokens), previously bypassed truncation due to rune-vs-byte mismatch!
+	emojiPayload := strings.Repeat("🚀🔥🎯💎", 10)
+	// CJK + Turkish multi-byte string
+	multiBytePayload := "Başlangıç: " + strings.Repeat("日本語テストデータğüşiöç", 40) + " :Bitiş"
+
+	for _, budget := range []int{20, 10, 5} {
+		rp := NewResponsePruner(ResponsePrunerOptions{
+			MaxResponseTokens: budget,
+			PreserveErrors:    true,
+			ArrayHeadTail:     3,
+			DeduplicateLogs:   true,
+		})
+
+		for _, payload := range []string{emojiPayload, multiBytePayload} {
+			pruned, m := rp.PruneCallResult(*mcp.NewToolTextResult(payload))
+			text := pruned.Content[0].Text
+			if !utf8.ValidString(text) {
+				t.Fatalf("budget=%d produced invalid UTF-8 bytes!", budget)
+			}
+			if !m.Modified {
+				t.Errorf("budget=%d: expected multi-byte payload (raw=%d tok) to be pruned", budget, m.RawTokens)
+			}
+			if m.PrunedTokens > budget {
+				t.Errorf("budget=%d: pruned tokens %d exceeded hard budget (text=%q)", budget, m.PrunedTokens, text)
+			}
+		}
+	}
+
+	// Multi-slot response with tiny budget must not blow past totalBudget
+	rpMulti := NewResponsePruner(ResponsePrunerOptions{MaxResponseTokens: 20})
+	multiRes := mcp.CallToolResult{
+		Content: []mcp.ContentItem{
+			{Type: "text", Text: strings.Repeat("alpha ", 60)},
+			{Type: "text", Text: strings.Repeat("beta ", 60)},
+			{Type: "text", Text: strings.Repeat("gamma ", 60)},
+		},
+	}
+	prunedMulti, mMulti := rpMulti.PruneCallResult(multiRes)
+	if !mMulti.Modified || mMulti.PrunedTokens > 20 {
+		t.Errorf("multi-slot tiny budget violated: modified=%t pruned=%d (want <= 20)", mMulti.Modified, mMulti.PrunedTokens)
+	}
+	for i, item := range prunedMulti.Content {
+		if !utf8.ValidString(item.Text) {
+			t.Errorf("slot %d produced invalid UTF-8", i)
+		}
+	}
+}
+
+func TestResponsePruner_NestedJSONObjectArrays(t *testing.T) {
+	items := make([]map[string]any, 400)
+	for i := range items {
+		items[i] = map[string]any{
+			"id":     i + 1,
+			"status": "open",
+			"detail": fmt.Sprintf("Nested item payload #%d with contextual description", i+1),
+		}
+	}
+	nested := map[string]any{
+		"ok": true,
+		"data": map[string]any{
+			"total": len(items),
+			"items": items,
+		},
+	}
+	raw, err := json.Marshal(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rp := NewResponsePruner(ResponsePrunerOptions{
+		MaxResponseTokens: 350,
+		PreserveErrors:    true,
+		ArrayHeadTail:     3,
+		DeduplicateLogs:   true,
+	})
+
+	pruned, m := rp.PruneCallResult(*mcp.NewToolTextResult(string(raw)))
+	if !m.Modified {
+		t.Fatalf("expected nested JSON object array to be pruned")
+	}
+	if m.PrunedTokens > 350 {
+		t.Errorf("expected pruned tokens <= 350, got %d", m.PrunedTokens)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(pruned.Content[0].Text), &decoded); err != nil {
+		t.Fatalf("nested JSON object must remain valid JSON after pruning: %v\npayload=%s", err, pruned.Content[0].Text)
+	}
+	dataObj, ok := decoded["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected nested 'data' object to be preserved, got %+v", decoded)
+	}
+	arr, ok := dataObj["items"].([]any)
+	if !ok || len(arr) >= 20 {
+		t.Fatalf("expected compacted nested 'items' array, got len=%d", len(arr))
+	}
+	if !strings.Contains(pruned.Content[0].Text, "items omitted by ToolPrune") {
+		t.Errorf("expected omission summary marker inside nested array, got: %s", pruned.Content[0].Text)
 	}
 }

@@ -7,12 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -92,7 +94,7 @@ func ParseSeverity(s string) (Severity, error) {
 	case string(SeverityInfo):
 		return SeverityInfo, nil
 	default:
-		return "", fmt.Errorf("invalid severity %q: must be one of critical, high, medium, low", s)
+		return "", fmt.Errorf("invalid severity %q: must be one of critical, high, medium, low, info", s)
 	}
 }
 
@@ -218,6 +220,9 @@ func NewGuard(cfg GuardConfig) (*Guard, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open security log %q: %w", cfg.SecurityLogPath, err)
 		}
+		if runtime.GOOS != "windows" {
+			_ = f.Chmod(0600)
+		}
 		g.logFile = f
 	}
 
@@ -232,9 +237,13 @@ func (g *Guard) Close() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.logFile != nil {
-		err := g.logFile.Close()
+		syncErr := g.logFile.Sync()
+		closeErr := g.logFile.Close()
 		g.logFile = nil
-		return err
+		if closeErr != nil {
+			return closeErr
+		}
+		return syncErr
 	}
 	return nil
 }
@@ -253,17 +262,80 @@ func (g *Guard) Enabled() bool {
 }
 
 // IsQuarantined reports whether the named tool for an upstream was blocked in enforce mode.
+// Handles both prefixed ("server__tool") and unprefixed ("tool") names so namespace
+// differences never bypass quarantine enforcement.
 func (g *Guard) IsQuarantined(upstream, toolName string) (string, bool) {
 	if g == nil || g.cfg.Mode != ModeEnforce {
+		return "", false
+	}
+	upstream = strings.TrimSpace(upstream)
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
 		return "", false
 	}
 	if upstream == "" {
 		upstream = "default"
 	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	reason, ok := g.quarantined[upstream+"\x00"+toolName]
-	return reason, ok
+
+	if reason, ok := g.quarantined[upstream+"\x00"+toolName]; ok {
+		return reason, true
+	}
+	// Handle prefixed caller name ("server__tool") when quarantined under bare "tool"
+	prefix := upstream + "__"
+	if strings.HasPrefix(toolName, prefix) {
+		bare := strings.TrimPrefix(toolName, prefix)
+		if reason, ok := g.quarantined[upstream+"\x00"+bare]; ok {
+			return reason, true
+		}
+	} else {
+		// Handle bare caller name ("tool") when quarantined under prefixed "server__tool"
+		if reason, ok := g.quarantined[upstream+"\x00"+prefix+toolName]; ok {
+			return reason, true
+		}
+	}
+	// Handle explicit "prefix__tool" when caller omitted or used a different upstream label
+	if pfx, bare, hasDelim := strings.Cut(toolName, "__"); hasDelim && pfx != "" && bare != "" {
+		if reason, ok := g.quarantined[pfx+"\x00"+bare]; ok {
+			return reason, true
+		}
+		if reason, ok := g.quarantined[pfx+"\x00"+toolName]; ok {
+			return reason, true
+		}
+	}
+	return "", false
+}
+
+// IsQuarantinedAnyUpstream reports whether toolName (prefixed or bare) matches any
+// quarantined tool across all upstreams in enforce mode.
+func (g *Guard) IsQuarantinedAnyUpstream(toolName string) (string, bool) {
+	if g == nil || g.cfg.Mode != ModeEnforce {
+		return "", false
+	}
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" {
+		return "", false
+	}
+	if pfx, bare, hasDelim := strings.Cut(toolName, "__"); hasDelim && pfx != "" && bare != "" {
+		if reason, ok := g.IsQuarantined(pfx, bare); ok {
+			return reason, true
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for key, reason := range g.quarantined {
+		up, name, ok := strings.Cut(key, "\x00")
+		if !ok {
+			continue
+		}
+		if name == toolName || (up+"__"+name) == toolName {
+			return reason, true
+		}
+	}
+	return "", false
 }
 
 // EvaluateTools scans an upstream's tools/list response for tool-poisoning payloads,
@@ -441,7 +513,7 @@ var (
 			ruleName:    "PromptInjectionTagOrDirective",
 			category:    CategoryPromptInjection,
 			severity:    SeverityCritical,
-			regex:       regexp.MustCompile(`(?i)<\s*/?\s*(?:IMPORTANT|SYSTEM|INSTRUCTIONS|HIDDEN|ADMIN)\s*>|\[(?:SYSTEM|INST)\]`),
+			regex:       regexp.MustCompile(`(?i)<\s*/?\s*(?:IMPORTANT|SYSTEM|INSTRUCTIONS?|HIDDEN|ADMIN)\b[^>]{0,120}>|\[\s*/?\s*(?:SYSTEM|INST|IMPORTANT|INSTRUCTIONS?|HIDDEN|ADMIN)\s*\]`),
 			description: "hidden prompt-injection tag detected in tool metadata",
 			remediation: "Remove embedded instruction tags (<IMPORTANT>, <SYSTEM>, etc.) from tool descriptions or reject untrusted MCP server.",
 		},
@@ -540,16 +612,37 @@ func ScanTool(upstream string, tool mcp.Tool) []Finding {
 	walkSchemaSliceStrings(tool.InputSchema.OneOf, "inputSchema.oneOf", 0, scan)
 	walkSchemaSliceStrings(tool.InputSchema.AllOf, "inputSchema.allOf", 0, scan)
 	walkSchemaSliceStrings(tool.InputSchema.Examples, "inputSchema.examples", 0, scan)
+	for i, req := range tool.InputSchema.Required {
+		scan(fmt.Sprintf("inputSchema.required[%d]", i), req)
+	}
+	if len(tool.InputSchema.DependentRequired) > 0 {
+		depKeys := make([]string, 0, len(tool.InputSchema.DependentRequired))
+		for k := range tool.InputSchema.DependentRequired {
+			depKeys = append(depKeys, k)
+		}
+		sort.Strings(depKeys)
+		for _, k := range depKeys {
+			scan("inputSchema.dependentRequired."+k+"(key)", k)
+			for i, dep := range tool.InputSchema.DependentRequired[k] {
+				scan(fmt.Sprintf("inputSchema.dependentRequired.%s[%d]", k, i), dep)
+			}
+		}
+	}
 	if ap, ok := tool.InputSchema.AdditionalProperties.(map[string]any); ok {
 		walkSchemaStrings(ap, "inputSchema.additionalProperties", 0, scan)
+	}
+	for i, icon := range tool.Icons {
+		scan(fmt.Sprintf("icons[%d].src", i), icon.Src)
 	}
 	walkSchemaStrings(tool.OutputSchema, "outputSchema", 0, scan)
 
 	return findings
 }
 
+const maxSchemaScanDepth = 64
+
 func walkSchemaStrings(m map[string]any, prefix string, depth int, emit func(field, text string)) {
-	if len(m) == 0 || depth > 16 {
+	if len(m) == 0 || depth > maxSchemaScanDepth {
 		return
 	}
 	keys := make([]string, 0, len(m))
@@ -561,36 +654,91 @@ func walkSchemaStrings(m map[string]any, prefix string, depth int, emit func(fie
 	for _, k := range keys {
 		v := m[k]
 		field := prefix + "." + k
+		if len(k) >= 4 {
+			emit(field+"(key)", k)
+		}
 		switch val := v.(type) {
 		case string:
-			// Scan descriptive and string-literal schema fields
-			switch k {
-			case "description", "title", "$comment", "default", "const", "example", "pattern":
+			if len(val) >= 4 {
 				emit(field, val)
 			}
 		case map[string]any:
 			walkSchemaStrings(val, field, depth+1, emit)
 		case []any:
 			walkSchemaSliceStrings(val, field, depth+1, emit)
+		case []string:
+			for i, item := range val {
+				if len(item) >= 4 {
+					emit(fmt.Sprintf("%s[%d]", field, i), item)
+				}
+			}
+		case []map[string]any:
+			for i, item := range val {
+				walkSchemaStrings(item, fmt.Sprintf("%s[%d]", field, i), depth+1, emit)
+			}
 		}
 	}
 }
 
 func walkSchemaSliceStrings(s []any, prefix string, depth int, emit func(field, text string)) {
-	if len(s) == 0 || depth > 16 {
+	if len(s) == 0 || depth > maxSchemaScanDepth {
 		return
 	}
 	for i, item := range s {
 		field := fmt.Sprintf("%s[%d]", prefix, i)
 		switch val := item.(type) {
 		case string:
-			emit(field, val)
+			if len(val) >= 4 {
+				emit(field, val)
+			}
 		case map[string]any:
 			walkSchemaStrings(val, field, depth+1, emit)
 		case []any:
 			walkSchemaSliceStrings(val, field, depth+1, emit)
+		case []string:
+			for j, sub := range val {
+				if len(sub) >= 4 {
+					emit(fmt.Sprintf("%s[%d]", field, j), sub)
+				}
+			}
+		case []map[string]any:
+			for j, sub := range val {
+				walkSchemaStrings(sub, fmt.Sprintf("%s[%d]", field, j), depth+1, emit)
+			}
 		}
 	}
+}
+
+func isConcealedUnicodeRune(r rune, idx int) bool {
+	return (r >= 0x200B && r <= 0x200F) || // Zero-width space/joiners & LRM/RLM
+		(r >= 0x202A && r <= 0x202E) || // BiDi embeddings & overrides
+		(r >= 0x2066 && r <= 0x2069) || // BiDi isolates
+		r == 0x2060 || // Word joiner
+		(r == 0xFEFF && idx > 0) || // Mid-string BOM / ZWNBSP
+		(r >= 0xE0000 && r <= 0xE007F) // Unicode Tags smuggling block
+}
+
+// normalizeForPoisoningScan unescapes up to two layers of HTML entities (e.g. &#x3c;IMPORTANT&#x3e;,
+// &amp;lt;SYSTEM&amp;gt;) and strips concealed zero-width/BiDi/tag runes so obfuscated
+// prompt-injection payloads cannot evade regex detection.
+func normalizeForPoisoningScan(text string) string {
+	norm := text
+	for i := 0; i < 2; i++ {
+		unescaped := html.UnescapeString(norm)
+		if unescaped == norm {
+			break
+		}
+		norm = unescaped
+	}
+	var b strings.Builder
+	b.Grow(len(norm))
+	for i, r := range norm {
+		if isConcealedUnicodeRune(r, i) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // ScanText scans a single text field belonging to a tool for all tool-poisoning indicators.
@@ -600,10 +748,25 @@ func ScanText(upstream, toolName, field, text string) []Finding {
 	}
 	var findings []Finding
 
+	normalized := normalizeForPoisoningScan(text)
+	candidates := []string{text}
+	if normalized != text {
+		candidates = append(candidates, normalized)
+	}
+
+	matchRule := func(r patternRule) (matchedText string, loc []int) {
+		for _, cand := range candidates {
+			if l := r.regex.FindStringIndex(cand); l != nil {
+				return cand, l
+			}
+		}
+		return "", nil
+	}
+
 	// 1. Prompt injection tags & directives
 	seenInjection := false
 	for _, r := range promptInjectionRules {
-		if loc := r.regex.FindStringIndex(text); loc != nil {
+		if cand, loc := matchRule(r); loc != nil {
 			if seenInjection && r.ruleName == "PromptInjectionStealthDirective" {
 				continue
 			}
@@ -617,7 +780,7 @@ func ScanText(upstream, toolName, field, text string) []Finding {
 				Upstream:    upstream,
 				Field:       field,
 				Message:     fmt.Sprintf("%s in %s.%s", r.description, toolName, field),
-				Evidence:    extractSnippet(text, loc[0], loc[1]),
+				Evidence:    extractSnippet(cand, loc[0], loc[1]),
 				Remediation: r.remediation,
 			})
 		}
@@ -625,7 +788,7 @@ func ScanText(upstream, toolName, field, text string) []Finding {
 
 	// 2. Sensitive path exfiltration
 	for _, r := range sensitivePathRules {
-		if loc := r.regex.FindStringIndex(text); loc != nil {
+		if cand, loc := matchRule(r); loc != nil {
 			findings = append(findings, Finding{
 				RuleID:      r.ruleID,
 				RuleName:    r.ruleName,
@@ -635,7 +798,7 @@ func ScanText(upstream, toolName, field, text string) []Finding {
 				Upstream:    upstream,
 				Field:       field,
 				Message:     fmt.Sprintf("%s in %s.%s", r.description, toolName, field),
-				Evidence:    extractSnippet(text, loc[0], loc[1]),
+				Evidence:    extractSnippet(cand, loc[0], loc[1]),
 				Remediation: r.remediation,
 			})
 			break
@@ -689,7 +852,7 @@ func ScanText(upstream, toolName, field, text string) []Finding {
 
 	// 5. Command / shell smuggling
 	for _, r := range commandSmugglingRules {
-		if loc := r.regex.FindStringIndex(text); loc != nil {
+		if cand, loc := matchRule(r); loc != nil {
 			findings = append(findings, Finding{
 				RuleID:      r.ruleID,
 				RuleName:    r.ruleName,
@@ -699,7 +862,7 @@ func ScanText(upstream, toolName, field, text string) []Finding {
 				Upstream:    upstream,
 				Field:       field,
 				Message:     fmt.Sprintf("%s in %s.%s", r.description, toolName, field),
-				Evidence:    extractSnippet(text, loc[0], loc[1]),
+				Evidence:    extractSnippet(cand, loc[0], loc[1]),
 				Remediation: r.remediation,
 			})
 			break
@@ -713,13 +876,7 @@ func detectConcealedUnicode(s string) []rune {
 	var found []rune
 	seen := make(map[rune]bool)
 	for i, r := range s {
-		suspicious := (r >= 0x200B && r <= 0x200F) || // Zero-width space/joiners & LRM/RLM
-			(r >= 0x202A && r <= 0x202E) || // BiDi embeddings & overrides
-			(r >= 0x2066 && r <= 0x2069) || // BiDi isolates
-			r == 0x2060 || // Word joiner
-			(r == 0xFEFF && i > 0) || // Mid-string BOM / ZWNBSP
-			(r >= 0xE0000 && r <= 0xE007F) // Unicode Tags smuggling block
-		if suspicious && !seen[r] {
+		if isConcealedUnicodeRune(r, i) && !seen[r] {
 			seen[r] = true
 			found = append(found, r)
 		}
@@ -820,18 +977,20 @@ type ServerAuditInput struct {
 	Args     []string          // Stdio command args
 	URL      string            // Remote SSE / Streamable HTTP URL
 	Env      map[string]string // Configured environment variables
+	Headers  map[string]string // Optional HTTP headers (e.g. Authorization)
 }
 
 var (
 	knownSecretValueRegex = regexp.MustCompile(`^(?:ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{16,}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})$`)
-	secretKeyHintRegex    = regexp.MustCompile(`(?i)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|AUTH_HEADER|BEARER)`)
+	secretKeyHintRegex    = regexp.MustCompile(`(?i)(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|AUTH_HEADER|AUTHORIZATION|BEARER)`)
+	envPlaceholderRe      = regexp.MustCompile(`\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*`)
 	npmPinnedVersionRegex = regexp.MustCompile(`@(?:[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][0-9A-Za-z.-]+)?)$`)
 	uvPinnedVersionRegex  = regexp.MustCompile(`(?:==|@)[0-9]+\.[0-9]+`)
 )
 
 // AuditServerConfig checks an MCP server definition for:
 //   - Unpinned npx / uvx package execution (supply-chain rug-pull risk)
-//   - Hardcoded plaintext secrets / API tokens in env
+//   - Hardcoded plaintext secrets / API tokens in env and headers
 //   - Insecure non-loopback http:// remote MCP server URLs
 func AuditServerConfig(in ServerAuditInput) []Finding {
 	var findings []Finding
@@ -850,7 +1009,7 @@ func AuditServerConfig(in ServerAuditInput) []Finding {
 				Field:       "command/args",
 				FilePath:    in.FilePath,
 				Message:     fmt.Sprintf("server %q (%s) executes unpinned npx package %q without an explicit version", in.Name, in.Source, pkg),
-				Evidence:    fmt.Sprintf("%s %s", cmd, strings.Join(args, " ")),
+				Evidence:    sanitizeCommandEvidence(cmd, args),
 				Remediation: fmt.Sprintf("Pin the package to an exact immutable version (e.g., %s@1.2.3) and enable toolprune.lock.", pkg),
 			})
 		}
@@ -865,38 +1024,56 @@ func AuditServerConfig(in ServerAuditInput) []Finding {
 				Field:       "command/args",
 				FilePath:    in.FilePath,
 				Message:     fmt.Sprintf("server %q (%s) executes unpinned uvx package %q without an explicit version", in.Name, in.Source, pkg),
-				Evidence:    fmt.Sprintf("%s %s", cmd, strings.Join(args, " ")),
+				Evidence:    sanitizeCommandEvidence(cmd, args),
 				Remediation: fmt.Sprintf("Pin the package to an exact version (e.g., %s==1.0.0) and enable toolprune.lock.", pkg),
 			})
 		}
 	}
 
-	// 2. Check hardcoded secrets in env map
-	envKeys := make([]string, 0, len(in.Env))
-	for k := range in.Env {
-		envKeys = append(envKeys, k)
-	}
-	sort.Strings(envKeys)
-	for _, k := range envKeys {
-		val := strings.TrimSpace(in.Env[k])
-		if val == "" || isEnvPlaceholder(val) || isDummyPlaceholder(val) {
-			continue
+	// 2. Check hardcoded secrets in env map and HTTP headers (never emitting raw secret values)
+	auditSecretMap := func(m map[string]string, fieldPrefix string) {
+		if len(m) == 0 {
+			return
 		}
-		if knownSecretValueRegex.MatchString(val) || (secretKeyHintRegex.MatchString(k) && len(val) >= 8) {
-			findings = append(findings, Finding{
-				RuleID:      RuleHardcodedSecret,
-				RuleName:    "HardcodedEnvSecret",
-				Category:    CategorySecretExposure,
-				Severity:    SeverityHigh,
-				Upstream:    in.Name,
-				Field:       "env." + k,
-				FilePath:    in.FilePath,
-				Message:     fmt.Sprintf("hardcoded secret or token detected in %s server %q env.%s", in.Source, in.Name, k),
-				Evidence:    fmt.Sprintf("%s=%s", k, redactSecret(val)),
-				Remediation: fmt.Sprintf("Replace literal value with an environment placeholder like \"${%s}\" or a secret manager.", k),
-			})
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			val := strings.TrimSpace(m[k])
+			if val == "" || isEnvPlaceholder(val) || isDummyPlaceholder(val) {
+				continue
+			}
+			// Strip optional "Bearer " / "Token " prefix when inspecting value format
+			probe := val
+			for _, pfx := range []string{"bearer ", "token ", "basic "} {
+				if len(val) > len(pfx) && strings.EqualFold(val[:len(pfx)], pfx) {
+					probe = strings.TrimSpace(val[len(pfx):])
+					break
+				}
+			}
+			if probe == "" || isEnvPlaceholder(probe) || isDummyPlaceholder(probe) {
+				continue
+			}
+			if knownSecretValueRegex.MatchString(probe) || (secretKeyHintRegex.MatchString(k) && len(probe) >= 8) {
+				findings = append(findings, Finding{
+					RuleID:      RuleHardcodedSecret,
+					RuleName:    "HardcodedEnvSecret",
+					Category:    CategorySecretExposure,
+					Severity:    SeverityHigh,
+					Upstream:    in.Name,
+					Field:       fieldPrefix + k,
+					FilePath:    in.FilePath,
+					Message:     fmt.Sprintf("hardcoded secret or token detected in %s server %q %s%s", in.Source, in.Name, fieldPrefix, k),
+					Evidence:    fmt.Sprintf("%s=%s", k, redactSecret(val)),
+					Remediation: fmt.Sprintf("Replace literal value with an environment placeholder like \"${%s}\" or a secret manager.", k),
+				})
+			}
 		}
 	}
+	auditSecretMap(in.Env, "env.")
+	auditSecretMap(in.Headers, "headers.")
 
 	// 3. Check insecure HTTP remote URL
 	if rawURL := strings.TrimSpace(in.URL); rawURL != "" && !isEnvPlaceholder(rawURL) {
@@ -912,7 +1089,7 @@ func AuditServerConfig(in ServerAuditInput) []Finding {
 					Field:       "url",
 					FilePath:    in.FilePath,
 					Message:     fmt.Sprintf("remote MCP server %q (%s) uses unencrypted HTTP transport to non-loopback host %q", in.Name, in.Source, host),
-					Evidence:    rawURL,
+					Evidence:    sanitizeURLEvidence(u),
 					Remediation: "Switch remote MCP endpoints to HTTPS (TLS) to prevent MITM tool-schema tampering.",
 				})
 			}
@@ -920,6 +1097,63 @@ func AuditServerConfig(in ServerAuditInput) []Finding {
 	}
 
 	return findings
+}
+
+func sanitizeCommandEvidence(cmd string, args []string) string {
+	if len(args) == 0 {
+		return cmd
+	}
+	safeArgs := make([]string, 0, len(args))
+	redactNext := false
+	for _, a := range args {
+		if redactNext {
+			redactNext = false
+			safeArgs = append(safeArgs, redactSecret(a))
+			continue
+		}
+		if eqIdx := strings.IndexByte(a, '='); eqIdx > 0 {
+			k := a[:eqIdx]
+			v := a[eqIdx+1:]
+			if secretKeyHintRegex.MatchString(k) || knownSecretValueRegex.MatchString(strings.TrimSpace(v)) {
+				safeArgs = append(safeArgs, k+"="+redactSecret(v))
+				continue
+			}
+		}
+		if strings.HasPrefix(a, "-") && secretKeyHintRegex.MatchString(a) {
+			redactNext = true
+			safeArgs = append(safeArgs, a)
+			continue
+		}
+		if knownSecretValueRegex.MatchString(strings.TrimSpace(a)) {
+			safeArgs = append(safeArgs, redactSecret(a))
+			continue
+		}
+		safeArgs = append(safeArgs, a)
+	}
+	return fmt.Sprintf("%s %s", cmd, strings.Join(safeArgs, " "))
+}
+
+func sanitizeURLEvidence(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	cp := *u
+	if cp.User != nil {
+		cp.User = url.User("***")
+	}
+	if cp.RawQuery != "" {
+		q := cp.Query()
+		for k, vals := range q {
+			for i, v := range vals {
+				if secretKeyHintRegex.MatchString(k) || knownSecretValueRegex.MatchString(strings.TrimSpace(v)) {
+					vals[i] = "REDACTED"
+				}
+			}
+			q[k] = vals
+		}
+		cp.RawQuery = q.Encode()
+	}
+	return cp.String()
 }
 
 func unwrapToolpruneCommand(cmd string, args []string) (string, []string) {
@@ -982,6 +1216,13 @@ func isEnvPlaceholder(val string) bool {
 	if strings.HasPrefix(val, "${input:") {
 		return true
 	}
+	// Handle composite values like "Bearer ${API_TOKEN}" where the secret itself is an env placeholder
+	if envPlaceholderRe.MatchString(val) {
+		remainder := strings.TrimSpace(envPlaceholderRe.ReplaceAllString(val, ""))
+		if remainder == "" || strings.EqualFold(remainder, "bearer") || strings.EqualFold(remainder, "token") || strings.EqualFold(remainder, "basic") {
+			return true
+		}
+	}
 	return false
 }
 
@@ -995,12 +1236,13 @@ func isDummyPlaceholder(val string) bool {
 	return false
 }
 
+// redactSecret masks secret values so raw credentials never leak into table, JSON, or SARIF output.
 func redactSecret(val string) string {
-	runes := []rune(val)
-	if len(runes) <= 6 {
-		return "****"
+	runes := []rune(strings.TrimSpace(val))
+	if len(runes) <= 12 {
+		return "[REDACTED]"
 	}
-	return string(runes[:4]) + "****" + string(runes[len(runes)-2:])
+	return string(runes[:3]) + "****[REDACTED]"
 }
 
 func isLoopbackHost(host string) bool {

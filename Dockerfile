@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 FROM golang:1.23-alpine AS builder
-ARG VERSION=1.4.0
+ARG VERSION=1.4.1
 ARG GIT_COMMIT=unknown
 ARG BUILD_DATE=unknown
 WORKDIR /src
