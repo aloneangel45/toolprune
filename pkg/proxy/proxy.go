@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
+	"github.com/aloneangel45/toolprune/pkg/metrics"
+	"github.com/aloneangel45/toolprune/pkg/security"
 )
 
 // UpstreamTransport abstracts communication with the upstream MCP server (stdio child process or remote server).
@@ -35,6 +37,18 @@ type PruneMetrics struct {
 	SavingsRatio float64
 }
 
+// ResponsePruneMetrics captures token optimization metrics for tools/call responses.
+type ResponsePruneMetrics struct {
+	RawTokens    int
+	PrunedTokens int
+	Modified     bool
+}
+
+// ResponsePruner deterministically trims oversized tools/call results within a token ceiling.
+type ResponsePruner interface {
+	PruneCallResult(result mcp.CallToolResult) (mcp.CallToolResult, ResponsePruneMetrics)
+}
+
 // LocalCatalogInterceptor allows dynamic catalog meta-tools (Tier 4) to be served in wrapper mode.
 type LocalCatalogInterceptor interface {
 	SyncUpstreamTools(tools []mcp.Tool) ([]mcp.Tool, error)
@@ -43,12 +57,15 @@ type LocalCatalogInterceptor interface {
 
 // SessionStatsSnapshot reports cumulative token savings and RPC interception counts for a session.
 type SessionStatsSnapshot struct {
-	ListsIntercepted  uint64
-	CallsIntercepted  uint64
-	PreBindRejections uint64
-	CacheHits         uint64
-	RawTokensTotal    uint64
-	PrunedTokensTotal uint64
+	ListsIntercepted     uint64
+	CallsIntercepted     uint64
+	PreBindRejections    uint64
+	CacheHits            uint64
+	RawTokensTotal       uint64
+	PrunedTokensTotal    uint64
+	ResponseTokensRaw    uint64
+	ResponseTokensPruned uint64
+	SecurityAlerts       uint64
 }
 
 // TokensSaved returns cumulative tokens saved across all tools/list responses.
@@ -69,11 +86,15 @@ func (s SessionStatsSnapshot) SavingsPercent() float64 {
 
 // ProxyConfig holds operational settings for the proxy engine.
 type ProxyConfig struct {
+	UpstreamID             string                  // Label for security guard and telemetry (default: "upstream")
 	PruneMode              string                  // "none", "lossless", "compact", "aggressive", "dynamic"
 	MaxSchemaTokens        int                     // RFC #1 progressive token budget cap (0 = disabled)
 	PinnedTools            []string                // Tools immune to Pass 5 stub projection
 	ToolFilterFunc         func(name string) bool  // Optional profile allowlist/blocklist predicate
 	DynamicCatalog         LocalCatalogInterceptor // Optional Tier 4 dynamic catalog handler for wrapper mode
+	SecurityGuard          *security.Guard         // Optional v1.4.0 tool-poisoning & SHA-256 rug-pull guard
+	ResponsePruner         ResponsePruner          // Optional v1.4.0 deterministic tools/call response pruner
+	Telemetry              *metrics.Registry       // Optional v1.4.0 live Prometheus & JSON telemetry tracker
 	RequestTimeout         time.Duration           // Default: 60s
 	TimeoutSweeperInterval time.Duration           // Interval for sweeper ticker (default: min(RequestTimeout/2, 5s), min 50ms)
 	InjectProxyInfo        bool                    // Inject ToolPrune identification into initialize response
@@ -193,16 +214,22 @@ type Proxy struct {
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 
-	listsIntercepted  atomic.Uint64
-	callsIntercepted  atomic.Uint64
-	preBindRejections atomic.Uint64
-	cacheHits         atomic.Uint64
-	rawTokensTotal    atomic.Uint64
-	prunedTokensTotal atomic.Uint64
+	listsIntercepted     atomic.Uint64
+	callsIntercepted     atomic.Uint64
+	preBindRejections    atomic.Uint64
+	cacheHits            atomic.Uint64
+	rawTokensTotal       atomic.Uint64
+	prunedTokensTotal    atomic.Uint64
+	responseTokensRaw    atomic.Uint64
+	responseTokensPruned atomic.Uint64
+	securityAlerts       atomic.Uint64
 }
 
 // NewProxy instantiates a new Proxy engine.
 func NewProxy(cfg ProxyConfig, upstream UpstreamTransport, pruner PruneEngine) *Proxy {
+	if cfg.UpstreamID == "" {
+		cfg.UpstreamID = "upstream"
+	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 60 * time.Second
 	}
@@ -260,12 +287,15 @@ func (p *Proxy) StreamFilter() *StreamFilter {
 // Stats returns a thread-safe snapshot of session pruning and call statistics.
 func (p *Proxy) Stats() SessionStatsSnapshot {
 	return SessionStatsSnapshot{
-		ListsIntercepted:  p.listsIntercepted.Load(),
-		CallsIntercepted:  p.callsIntercepted.Load(),
-		PreBindRejections: p.preBindRejections.Load(),
-		CacheHits:         p.cacheHits.Load(),
-		RawTokensTotal:    p.rawTokensTotal.Load(),
-		PrunedTokensTotal: p.prunedTokensTotal.Load(),
+		ListsIntercepted:     p.listsIntercepted.Load(),
+		CallsIntercepted:     p.callsIntercepted.Load(),
+		PreBindRejections:    p.preBindRejections.Load(),
+		CacheHits:            p.cacheHits.Load(),
+		RawTokensTotal:       p.rawTokensTotal.Load(),
+		PrunedTokensTotal:    p.prunedTokensTotal.Load(),
+		ResponseTokensRaw:    p.responseTokensRaw.Load(),
+		ResponseTokensPruned: p.responseTokensPruned.Load(),
+		SecurityAlerts:       p.securityAlerts.Load(),
 	}
 }
 
@@ -353,6 +383,19 @@ func (p *Proxy) handleClientRequest(session ClientSession, msg *mcp.Message) err
 		p.callsIntercepted.Add(1)
 		var callParams mcp.CallToolRequestParams
 		if len(msg.Params) > 0 && json.Unmarshal(msg.Params, &callParams) == nil && callParams.Name != "" {
+			// Check security guard quarantine before forwarding tools/call
+			if p.config.SecurityGuard != nil {
+				if reason, blocked := p.config.SecurityGuard.IsQuarantined(p.config.UpstreamID, callParams.Name); blocked {
+					p.preBindRejections.Add(1)
+					if p.config.Telemetry != nil {
+						p.config.Telemetry.RecordRequest(p.config.UpstreamID, 0, true)
+					}
+					res := mcp.NewToolExecutionErrorResult(fmt.Sprintf("tool %q is quarantined by ToolPrune security guard: %s", callParams.Name, reason))
+					resp, _ := mcp.NewResponse(*msg.ID, res)
+					return session.Send(resp)
+				}
+			}
+
 			// Check profile filter before forwarding tools/call if configured
 			if p.config.ToolFilterFunc != nil && !strings.HasPrefix(callParams.Name, "toolprune_") {
 				if !p.config.ToolFilterFunc(callParams.Name) {
@@ -518,9 +561,13 @@ func (p *Proxy) handleUpstreamResponse(msg *mcp.Message) {
 
 	// Restore original client ID
 	msg.ID = req.ClientID
+	latency := time.Since(req.StartTime)
 
 	// If upstream returned an error, preserve it and deliver immediately to client
 	if msg.Error != nil {
+		if p.config.Telemetry != nil {
+			p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, true)
+		}
 		slog.Warn("upstream returned protocol error", "code", msg.Error.Code, "msg", msg.Error.Message)
 		_ = req.ClientSession.Send(msg)
 		return
@@ -529,21 +576,61 @@ func (p *Proxy) handleUpstreamResponse(msg *mcp.Message) {
 	// Interception Gate
 	switch req.Method {
 	case mcp.MethodToolsList:
-		p.interceptToolsListResponse(req, msg)
+		p.interceptToolsListResponse(req, msg, latency)
+	case mcp.MethodToolsCall:
+		p.interceptToolsCallResponse(req, msg, latency)
 	case mcp.MethodInitialize:
+		if p.config.Telemetry != nil {
+			p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
+		}
 		p.interceptInitializeResponse(req, msg)
 	default:
-		// Pass-through for tools/call, ping, prompts/*, resources/*
+		if p.config.Telemetry != nil {
+			p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
+		}
+		// Pass-through for ping, prompts/*, resources/*
 		_ = req.ClientSession.Send(msg)
 	}
 }
 
-// interceptToolsListResponse applies profile filtering, schema pruning, and RFC #1 token budgeting to tools/list results.
-func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Message) {
+// interceptToolsCallResponse applies deterministic response pruning and telemetry recording to tools/call results.
+func (p *Proxy) interceptToolsCallResponse(req *InFlightRequest, msg *mcp.Message, latency time.Duration) {
+	isErr := false
+	if p.config.ResponsePruner != nil || p.config.Telemetry != nil {
+		var callRes mcp.CallToolResult
+		if err := json.Unmarshal(msg.Result, &callRes); err == nil {
+			isErr = callRes.IsError
+			if p.config.ResponsePruner != nil {
+				prunedRes, rm := p.config.ResponsePruner.PruneCallResult(callRes)
+				if rm.RawTokens > 0 {
+					p.responseTokensRaw.Add(uint64(rm.RawTokens))
+					p.responseTokensPruned.Add(uint64(rm.PrunedTokens))
+					if p.config.Telemetry != nil {
+						p.config.Telemetry.RecordResponsePruning(p.config.UpstreamID, rm.RawTokens, rm.PrunedTokens)
+					}
+				}
+				if rm.Modified {
+					if encoded, mErr := json.Marshal(prunedRes); mErr == nil {
+						msg.Result = encoded
+					}
+				}
+			}
+		}
+	}
+	if p.config.Telemetry != nil {
+		p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, isErr)
+	}
+	_ = req.ClientSession.Send(msg)
+}
+
+// interceptToolsListResponse applies security guard, profile filtering, schema pruning, and RFC #1 token budgeting to tools/list results.
+func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Message, latency time.Duration) {
 	p.listsIntercepted.Add(1)
 	prunerEngine := p.getPruner()
+	guardActive := p.config.SecurityGuard != nil && p.config.SecurityGuard.Enabled()
 
-	needsInterception := (prunerEngine != nil && (p.config.PruneMode != "none" || p.config.MaxSchemaTokens > 0)) ||
+	needsInterception := guardActive ||
+		(prunerEngine != nil && (p.config.PruneMode != "none" || p.config.MaxSchemaTokens > 0)) ||
 		p.config.ToolFilterFunc != nil ||
 		p.config.DynamicCatalog != nil
 
@@ -551,11 +638,30 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 		var listResult mcp.ListToolsResult
 		if err := json.Unmarshal(msg.Result, &listResult); err != nil {
 			slog.Error("failed to unmarshal tools/list payload for pruning, falling back to unpruned", "err", err)
+			if p.config.Telemetry != nil {
+				p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
+			}
 			_ = req.ClientSession.Send(msg)
 			return
 		}
 
 		tools := listResult.Tools
+
+		// v1.4.0 Security Guard: scan raw upstream tool definitions for poisoning & SHA-256 rug-pull mutations
+		if guardActive {
+			allowedTools, secFindings, blockedCount := p.config.SecurityGuard.EvaluateTools(p.config.UpstreamID, tools)
+			if len(secFindings) > 0 {
+				p.securityAlerts.Add(uint64(len(secFindings)))
+				if p.config.Telemetry != nil {
+					p.config.Telemetry.RecordSecurityAlert(p.config.UpstreamID, len(secFindings))
+				}
+			}
+			if blockedCount > 0 && p.streamFilter != nil {
+				p.streamFilter.InvalidateCache()
+			}
+			tools = allowedTools
+		}
+
 		if p.config.ToolFilterFunc != nil {
 			filtered := make([]mcp.Tool, 0, len(tools))
 			for _, t := range tools {
@@ -580,12 +686,18 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 							projected = budgeted
 							p.rawTokensTotal.Add(uint64(bMetrics.RawTokens))
 							p.prunedTokensTotal.Add(uint64(bMetrics.PrunedTokens))
+							if p.config.Telemetry != nil {
+								p.config.Telemetry.RecordSchemaPruning(p.config.UpstreamID, bMetrics.RawTokens, bMetrics.PrunedTokens)
+							}
 						}
 					}
 				}
 				listResult.Tools = projected
 				if newResult, mErr := json.Marshal(listResult); mErr == nil {
 					msg.Result = newResult
+				}
+				if p.config.Telemetry != nil {
+					p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
 				}
 				_ = req.ClientSession.Send(msg)
 				return
@@ -606,6 +718,9 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 			}
 			if err != nil {
 				slog.Error("pruning failed, falling back to raw schemas", "err", err)
+				if p.config.Telemetry != nil {
+					p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
+				}
 				_ = req.ClientSession.Send(msg)
 				return
 			}
@@ -618,6 +733,9 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 			}
 			if bMetrics.PrunedTokens > 0 {
 				p.prunedTokensTotal.Add(uint64(bMetrics.PrunedTokens))
+			}
+			if p.config.Telemetry != nil && (bMetrics.RawTokens > 0 || bMetrics.PrunedTokens > 0) {
+				p.config.Telemetry.RecordSchemaPruning(p.config.UpstreamID, bMetrics.RawTokens, bMetrics.PrunedTokens)
 			}
 
 			listResult.Tools = prunedTools
@@ -632,6 +750,9 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 		newResult, err := json.Marshal(listResult)
 		if err != nil {
 			slog.Error("failed to re-marshal pruned tools result", "err", err)
+			if p.config.Telemetry != nil {
+				p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
+			}
 			_ = req.ClientSession.Send(msg)
 			return
 		}
@@ -642,6 +763,9 @@ func (p *Proxy) interceptToolsListResponse(req *InFlightRequest, msg *mcp.Messag
 		)
 	}
 
+	if p.config.Telemetry != nil {
+		p.config.Telemetry.RecordRequest(p.config.UpstreamID, latency, false)
+	}
 	_ = req.ClientSession.Send(msg)
 }
 

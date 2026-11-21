@@ -11,7 +11,7 @@ import (
 
 var (
 	// Build metadata populated via -ldflags during build
-	Version   = "1.3.2"
+	Version   = "1.4.0"
 	GitCommit = "dev"
 	BuildDate = "unknown"
 
@@ -52,6 +52,8 @@ func init() {
 	// Register subcommands
 	rootCmd.AddCommand(proxyCmd)
 	rootCmd.AddCommand(benchCmd)
+	rootCmd.AddCommand(auditCmd)
+	rootCmd.AddCommand(topCmd)
 	rootCmd.AddCommand(routesCmd)
 	rootCmd.AddCommand(configCmd)
 	rootCmd.AddCommand(presetcmd.NewCommand())

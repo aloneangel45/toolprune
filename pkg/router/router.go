@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
+	"github.com/aloneangel45/toolprune/pkg/metrics"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
 	"github.com/aloneangel45/toolprune/pkg/pruner"
 )
@@ -66,6 +67,7 @@ type Router struct {
 	schemaStore  *SchemaStore
 	schemaDirty  atomic.Bool
 	streamFilter *proxy.StreamFilter
+	telemetry    *metrics.Registry
 	logger       *slog.Logger
 	notifier     func() // Broadcast notifications/tools/list_changed to clients
 
@@ -245,6 +247,13 @@ func (r *Router) SetNotifier(notifier func()) {
 	r.mu.Unlock()
 }
 
+// AttachTelemetry attaches a live metrics registry to the router.
+func (r *Router) AttachTelemetry(reg *metrics.Registry) {
+	r.mu.Lock()
+	r.telemetry = reg
+	r.mu.Unlock()
+}
+
 // Multiplexer returns the internal multiplexer instance.
 func (r *Router) Multiplexer() *Multiplexer {
 	return r.multiplexer
@@ -369,6 +378,12 @@ func (r *Router) HandleToolsList(ctx context.Context, req *mcp.Message) (*mcp.Me
 	if rawTok > 0 {
 		r.rawTokensTotal.Add(uint64(rawTok))
 		r.prunedTokensTotal.Add(uint64(prunedTok))
+		r.mu.RLock()
+		tel := r.telemetry
+		r.mu.RUnlock()
+		if tel != nil {
+			tel.RecordSchemaPruning("gateway", rawTok, prunedTok)
+		}
 	}
 
 	listResult := mcp.ListToolsResult{

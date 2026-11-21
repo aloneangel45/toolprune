@@ -18,22 +18,29 @@ import (
 
 	"github.com/aloneangel45/toolprune/pkg/config"
 	"github.com/aloneangel45/toolprune/pkg/mcp"
+	"github.com/aloneangel45/toolprune/pkg/metrics"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
 	"github.com/aloneangel45/toolprune/pkg/pruner"
 	"github.com/aloneangel45/toolprune/pkg/router"
+	"github.com/aloneangel45/toolprune/pkg/security"
 )
 
 type proxyFlags struct {
-	mode            string
-	preset          string
-	maxSchemaTokens int
-	transport       string
-	port            int
-	host            string
-	profile         string
-	timeout         time.Duration
-	stats           bool
-	namespace       string
+	mode              string
+	preset            string
+	maxSchemaTokens   int
+	maxResponseTokens int
+	securityMode      string
+	lockfile          string
+	securityLog       string
+	metricsAddr       string
+	transport         string
+	port              int
+	host              string
+	profile           string
+	timeout           time.Duration
+	stats             bool
+	namespace         string
 }
 
 var pFlags proxyFlags
@@ -59,6 +66,11 @@ func init() {
 	proxyCmd.Flags().StringVarP(&pFlags.mode, "mode", "m", "aggressive", "Pruning tier (none, lossless, compact, aggressive, dynamic)")
 	proxyCmd.Flags().StringVar(&pFlags.preset, "preset", "", "Pruning preset alias (fast, balanced, strict, dynamic)")
 	proxyCmd.Flags().IntVar(&pFlags.maxSchemaTokens, "max-schema-tokens", 0, "Maximum token budget for tools/list schemas (0 = unlimited)")
+	proxyCmd.Flags().IntVar(&pFlags.maxResponseTokens, "max-response-tokens", 0, "Maximum token budget for tools/call responses (0 = unlimited)")
+	proxyCmd.Flags().StringVar(&pFlags.securityMode, "security-mode", "", "MCP tool-poisoning & rug-pull guard mode (off, warn, enforce, update)")
+	proxyCmd.Flags().StringVar(&pFlags.lockfile, "lockfile", "", "Path to SHA-256 toolprune.lock file")
+	proxyCmd.Flags().StringVar(&pFlags.securityLog, "security-log", "", "Path to write MCPGate-compatible JSONL security event log")
+	proxyCmd.Flags().StringVar(&pFlags.metricsAddr, "metrics-addr", "", "Bind address for live Prometheus (/metrics) and JSON (/api/stats) telemetry (e.g. 127.0.0.1:9095)")
 	proxyCmd.Flags().StringVarP(&pFlags.transport, "transport", "t", "stdio", "Client transport type (stdio, sse)")
 	proxyCmd.Flags().IntVarP(&pFlags.port, "port", "p", 8080, "Listen port for HTTP/SSE and Streamable HTTP transport")
 	proxyCmd.Flags().StringVar(&pFlags.host, "host", "127.0.0.1", "Listen host address for HTTP/SSE transport")
@@ -105,8 +117,9 @@ func collectChangedFlags(cmd *cobra.Command) map[string]bool {
 		return changed
 	}
 	for _, name := range []string{
-		"mode", "preset", "max-schema-tokens", "transport",
-		"port", "host", "profile", "timeout", "stats", "namespace",
+		"mode", "preset", "max-schema-tokens", "max-response-tokens",
+		"security-mode", "lockfile", "security-log", "metrics-addr",
+		"transport", "port", "host", "profile", "timeout", "stats", "namespace",
 	} {
 		if cmd.Flags().Changed(name) {
 			changed[name] = true
@@ -149,6 +162,22 @@ func runProxy(cmd *cobra.Command, args []string) error {
 				pFlags.maxSchemaTokens = n
 			}
 		})
+	}
+	if !changed["max-response-tokens"] {
+		bindEnvFallback("max-response-tokens", "TOOLPRUNE_MAX_RESPONSE_TOKENS", func(v string) {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+				pFlags.maxResponseTokens = n
+			}
+		})
+	}
+	if !changed["security-mode"] {
+		bindEnvFallback("security-mode", "TOOLPRUNE_SECURITY_MODE", func(v string) { pFlags.securityMode = v })
+	}
+	if !changed["security-log"] {
+		bindEnvFallback("security-log", "TOOLPRUNE_SECURITY_LOG", func(v string) { pFlags.securityLog = v })
+	}
+	if !changed["metrics-addr"] {
+		bindEnvFallback("metrics-addr", "TOOLPRUNE_METRICS_ADDR", func(v string) { pFlags.metricsAddr = v })
 	}
 	if !changed["transport"] {
 		bindEnvFallback("transport", "TOOLPRUNE_TRANSPORT", func(v string) { pFlags.transport = v })
@@ -235,6 +264,24 @@ func runWrapperModeWithFlags(ctx context.Context, cmdArgs []string, changed map[
 	if pFlags.maxSchemaTokens > 0 || (changed != nil && changed["max-schema-tokens"]) {
 		cfg.Pruning.MaxSchemaTokens = pFlags.maxSchemaTokens
 	}
+	if pFlags.maxResponseTokens > 0 || (changed != nil && changed["max-response-tokens"]) {
+		cfg.ResponsePruning.MaxResponseTokens = pFlags.maxResponseTokens
+	}
+	if pFlags.securityMode != "" || (changed != nil && changed["security-mode"]) {
+		cfg.Security.Mode = pFlags.securityMode
+	}
+	if pFlags.lockfile != "" || (changed != nil && changed["lockfile"]) {
+		cfg.Security.Lockfile = pFlags.lockfile
+	}
+	if pFlags.securityLog != "" || (changed != nil && changed["security-log"]) {
+		cfg.Security.SecurityLog = pFlags.securityLog
+	}
+	if pFlags.metricsAddr != "" || (changed != nil && changed["metrics-addr"]) {
+		cfg.Server.MetricsAddr = pFlags.metricsAddr
+	}
+	if err := config.Validate(cfg); err != nil {
+		return fmt.Errorf("invalid proxy configuration: %w", err)
+	}
 	if pFlags.profile != "" {
 		cfg.Routing.DefaultProfile = pFlags.profile
 	}
@@ -287,7 +334,38 @@ func runWrapperModeWithFlags(ctx context.Context, cmdArgs []string, changed map[
 	pruneEngine := pruner.New(pruneOpts)
 
 	proxyCfg := cfg.ToProxyConfig()
+	proxyCfg.UpstreamID = upSpec.ID
 	proxyCfg.ToolFilterFunc = toolFilter.IsAllowed
+
+	// v1.4.0 Live Telemetry Server
+	telemetryReg := metrics.NewRegistry(Version)
+	proxyCfg.Telemetry = telemetryReg
+	if strings.TrimSpace(cfg.Server.MetricsAddr) != "" {
+		metricsSrv, mErr := metrics.StartServer(cfg.Server.MetricsAddr, telemetryReg, logger)
+		if mErr != nil {
+			return fmt.Errorf("failed to start telemetry server: %w", mErr)
+		}
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutCtx)
+		}()
+	}
+
+	// v1.4.0 Security Guard (Tool Poisoning + SHA-256 Rug-Pull Lockfile)
+	if !strings.EqualFold(cfg.Security.Mode, security.ModeOff) {
+		secGuard, gErr := security.NewGuard(cfg.ToSecurityGuardConfig(logger))
+		if gErr != nil {
+			return fmt.Errorf("failed to initialize security guard: %w", gErr)
+		}
+		defer func() { _ = secGuard.Close() }()
+		proxyCfg.SecurityGuard = secGuard
+	}
+
+	// v1.4.0 Deterministic Tool Output / Response Pruner
+	if cfg.ResponsePruning.MaxResponseTokens > 0 {
+		proxyCfg.ResponsePruner = pruner.NewResponsePruner(cfg.ToResponsePrunerOptions())
+	}
 
 	var p *proxy.Proxy
 	var notifier *router.DebouncedNotifier
@@ -429,6 +507,21 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 		if changed["max-schema-tokens"] {
 			cfg.Pruning.MaxSchemaTokens = pFlags.maxSchemaTokens
 		}
+		if changed["max-response-tokens"] {
+			cfg.ResponsePruning.MaxResponseTokens = pFlags.maxResponseTokens
+		}
+		if changed["security-mode"] {
+			cfg.Security.Mode = pFlags.securityMode
+		}
+		if changed["lockfile"] {
+			cfg.Security.Lockfile = pFlags.lockfile
+		}
+		if changed["security-log"] {
+			cfg.Security.SecurityLog = pFlags.securityLog
+		}
+		if changed["metrics-addr"] {
+			cfg.Server.MetricsAddr = pFlags.metricsAddr
+		}
 		if changed["transport"] {
 			cfg.Server.Transport = pFlags.transport
 		}
@@ -467,10 +560,44 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 	pruneEngine := pruner.New(pruneOpts)
 	r := router.NewRouter(rCfg, pruneEngine, logger)
 
+	// v1.4.0 Live Telemetry Server
+	telemetryReg := metrics.NewRegistry(Version)
+	r.AttachTelemetry(telemetryReg)
+	if strings.TrimSpace(cfg.Server.MetricsAddr) != "" {
+		metricsSrv, mErr := metrics.StartServer(cfg.Server.MetricsAddr, telemetryReg, logger)
+		if mErr != nil {
+			return fmt.Errorf("failed to start telemetry server: %w", mErr)
+		}
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutCtx)
+		}()
+	}
+
+	// v1.4.0 Security Guard
+	var secGuard *security.Guard
+	if !strings.EqualFold(cfg.Security.Mode, security.ModeOff) {
+		var gErr error
+		secGuard, gErr = security.NewGuard(cfg.ToSecurityGuardConfig(logger))
+		if gErr != nil {
+			return fmt.Errorf("failed to initialize security guard: %w", gErr)
+		}
+		defer func() { _ = secGuard.Close() }()
+	}
+
+	// v1.4.0 Deterministic Tool Output / Response Pruner
+	var respPruner proxy.ResponsePruner
+	if cfg.ResponsePruning.MaxResponseTokens > 0 {
+		respPruner = pruner.NewResponsePruner(cfg.ToResponsePrunerOptions())
+	}
+
 	gw := router.NewRouterGateway(r, router.GatewayConfig{
 		RequestTimeout:  time.Duration(cfg.Server.Timeout),
 		InjectProxyInfo: cfg.Server.InjectProxyInfo,
 		ServerVersion:   Version,
+		ResponsePruner:  respPruner,
+		Telemetry:       telemetryReg,
 		Logger:          logger,
 	})
 	defer gw.Shutdown()
@@ -550,6 +677,13 @@ func runMultiUpstreamModeWithFlags(ctx context.Context, configPath string, chang
 		}); regErr != nil {
 			_ = upTransport.Close()
 			return fmt.Errorf("failed to register upstream %q: %w", u.ID, regErr)
+		}
+		if secGuard != nil && secGuard.Enabled() {
+			allowedTools, secFindings, _ := secGuard.EvaluateTools(u.ID, tools)
+			if len(secFindings) > 0 {
+				telemetryReg.RecordSecurityAlert(u.ID, len(secFindings))
+			}
+			tools = allowedTools
 		}
 		r.Multiplexer().SyncUpstreamTools(ctx, u.ID, tools)
 	}

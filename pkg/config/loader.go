@@ -143,6 +143,31 @@ func (c *Config) ApplyEnvOverrides() error {
 			c.Pruning.MaxSchemaTokens = n
 		}
 	}
+	if raw, ok := os.LookupEnv("TOOLPRUNE_MAX_RESPONSE_TOKENS"); ok {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed != "" {
+			n, err := strconv.Atoi(trimmed)
+			if err != nil || n < 0 {
+				return fmt.Errorf("invalid TOOLPRUNE_MAX_RESPONSE_TOKENS=%q: must be a non-negative integer", raw)
+			}
+			c.ResponsePruning.MaxResponseTokens = n
+		}
+	}
+	if raw, ok := os.LookupEnv("TOOLPRUNE_SECURITY_MODE"); ok {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			c.Security.Mode = trimmed
+		}
+	}
+	if raw, ok := os.LookupEnv("TOOLPRUNE_SECURITY_LOG"); ok {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			c.Security.SecurityLog = trimmed
+		}
+	}
+	if raw, ok := os.LookupEnv("TOOLPRUNE_METRICS_ADDR"); ok {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			c.Server.MetricsAddr = trimmed
+		}
+	}
 	return nil
 }
 
@@ -272,6 +297,18 @@ pruning:
   strict_draft07: true
   strip_code_blocks: true
   strip_html_tags: true
+
+response_pruning:
+  max_response_tokens: 0
+  preserve_errors: true
+  array_head_tail: 5
+  deduplicate_logs: true
+
+security:
+  mode: "warn"
+  lockfile: "toolprune.lock"
+  security_log: ""
+  block_on_poisoning: true
 
 routing:
   default_profile: "full"

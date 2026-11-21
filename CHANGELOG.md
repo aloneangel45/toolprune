@@ -5,6 +5,25 @@ All notable changes to **ToolPrune** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-21
+
+### Added
+- **MCP Tool-Poisoning Guard & SHA-256 Rug-Pull Lockfile (`pkg/security`, `pkg/proxy`, `pkg/config`)**:
+  - Added static and runtime tool-poisoning scanner inspecting MCP tool `name`, `title`, `description`, and nested JSON Schema descriptions for hidden prompt-injection tags & stealth directives (`<IMPORTANT>`, `<SYSTEM>`, `ignore previous instructions`, `disregard prior`, `you must first`, `before calling this tool`, `do not mention to the user`, `silently`), sensitive path exfiltration targets (`~/.ssh`, `id_rsa`, `~/.aws`, `.env`, `/etc/passwd`, `credentials.json`), concealed zero-width/BiDi Unicode spoofing (`U+200B..U+200F`, `U+202A..U+202E`, `U+2066..U+2069`), large embedded Base64 blobs, and shell command smuggling patterns.
+  - Added canonical SHA-256 rug-pull lockfile (`toolprune.lock`) pinning `(name, description, inputSchema)` per upstream server with `off`, `warn`, `enforce`, and `update` modes (`--security-mode`, `--lockfile`, `security:` in `toolprune.yaml`). In `enforce` mode, ToolPrune quarantines tools that mutate mid-session, drift from `toolprune.lock`, or trigger high/critical poisoning rules and blocks direct `tools/call` execution against quarantined tools.
+  - Added structured MCPGate-compatible JSONL security event logging (`--security-log <path>`, `security.security_log`).
+- **`toolprune audit` Security Subcommand & SARIF 2.1.0 Export (`cmd/toolprune/audit.go`, `pkg/security/sarif.go`)**:
+  - Audits `toolprune.yaml` (`-c`), static JSON tool schema files (`--schema-file`, supporting both `[]Tool` and `{"tools": [...]}`), and host IDE MCP configs (`--all-ides` across Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, and Zed — flagging unpinned `npx`/`uvx` commands, hardcoded secrets in `env` with redacted evidence, and insecure non-loopback `http://` remote URLs).
+  - Supports `--format table|json|sarif` (OASIS SARIF 2.1.0), `--fail-on critical|high|medium|low` CI exit gating, and `--lockfile` / `--update-lockfile`.
+  - Integrated `security` and `response_pruning` configuration diagnostics into `toolprune doctor` (`pkg/doctor`).
+- **Deterministic Tool Output / Response Pruner (`pkg/pruner/response.go`, `pkg/proxy`, `pkg/router`, `pkg/config`)**:
+  - Added `ResponsePruningConfig` (`max_response_tokens`, `preserve_errors`, `array_head_tail`, `deduplicate_logs`) and `--max-response-tokens <N>` / `TOOLPRUNE_MAX_RESPONSE_TOKENS` on `toolprune proxy`.
+  - Intercepts `tools/call` responses in both wrapper and multi-upstream gateway modes: preserves `isError: true` error messages intact (only trimming massive non-essential tails when grossly over budget), compacts JSON arrays to head+tail `K` items with deterministic `[... N items omitted by ToolPrune ...]` summary markers, deduplicates consecutive identical/near-identical log lines as `(repeated Nx)`, and enforces deterministic UTF-8 rune-safe head+tail truncation within the token ceiling.
+- **Live Token & Latency Telemetry + `toolprune top` Dashboard (`pkg/metrics`, `cmd/toolprune/top.go`)**:
+  - Added thread-safe per-upstream telemetry tracking `requests`, `errors`, `schema_tokens_raw`, `schema_tokens_pruned`, `response_tokens_raw`, `response_tokens_pruned`, `security_alerts`, `avg_latency_ms`, and estimated USD saved.
+  - Added `--metrics-addr <host:port>` (`server.metrics_addr`, `TOOLPRUNE_METRICS_ADDR`) on `toolprune proxy` serving Prometheus text exposition at `/metrics`, structured JSON at `/api/stats`, and `/healthz`.
+  - Added `toolprune top [--url http://127.0.0.1:9095/api/stats] [--once] [--interval 1s]` live terminal telemetry dashboard.
+
 ## [1.3.2] - 2026-11-15
 
 ### Fixed

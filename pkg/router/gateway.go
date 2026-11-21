@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aloneangel45/toolprune/pkg/mcp"
+	"github.com/aloneangel45/toolprune/pkg/metrics"
 	"github.com/aloneangel45/toolprune/pkg/proxy"
 )
 
@@ -20,6 +22,8 @@ type GatewayConfig struct {
 	InjectProxyInfo  bool
 	ServerVersion    string
 	DebounceInterval time.Duration
+	ResponsePruner   proxy.ResponsePruner
+	Telemetry        *metrics.Registry
 	Logger           *slog.Logger
 }
 
@@ -67,7 +71,7 @@ func NewRouterGateway(r *Router, cfg GatewayConfig) *RouterGateway {
 		cfg.RequestTimeout = 60 * time.Second
 	}
 	if cfg.ServerVersion == "" {
-		cfg.ServerVersion = "1.3.2"
+		cfg.ServerVersion = "1.4.0"
 	}
 	if cfg.DebounceInterval <= 0 {
 		cfg.DebounceInterval = 50 * time.Millisecond
@@ -220,9 +224,13 @@ func (g *RouterGateway) HandleClientMessage(session proxy.ClientSession, msg *mc
 		return session.Send(resp)
 
 	case mcp.MethodToolsList:
+		start := time.Now()
 		resp, err := g.router.HandleToolsList(session.Context(), msg)
 		if err != nil {
 			resp = mcp.NewErrorMessage(msg.ID, mcp.CodeInternalError, err.Error())
+		}
+		if g.cfg.Telemetry != nil {
+			g.cfg.Telemetry.RecordRequest("gateway", time.Since(start), err != nil)
 		}
 		return session.Send(resp)
 
@@ -337,6 +345,29 @@ func (g *RouterGateway) HandleUpstreamResponse(upstreamID string, msg *mcp.Messa
 
 	out := *msg
 	out.ID = req.ClientID
+	latency := time.Since(req.StartTime)
+	isErr := out.Error != nil
+
+	if !isErr && req.Method == mcp.MethodToolsCall && (g.cfg.ResponsePruner != nil || g.cfg.Telemetry != nil) {
+		var callRes mcp.CallToolResult
+		if err := json.Unmarshal(out.Result, &callRes); err == nil {
+			isErr = callRes.IsError
+			if g.cfg.ResponsePruner != nil {
+				prunedRes, rm := g.cfg.ResponsePruner.PruneCallResult(callRes)
+				if rm.RawTokens > 0 && g.cfg.Telemetry != nil {
+					g.cfg.Telemetry.RecordResponsePruning(upstreamID, rm.RawTokens, rm.PrunedTokens)
+				}
+				if rm.Modified {
+					if encoded, mErr := json.Marshal(prunedRes); mErr == nil {
+						out.Result = encoded
+					}
+				}
+			}
+		}
+	}
+	if g.cfg.Telemetry != nil {
+		g.cfg.Telemetry.RecordRequest(upstreamID, latency, isErr)
+	}
 	_ = req.ClientSession.Send(&out)
 }
 

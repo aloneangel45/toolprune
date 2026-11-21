@@ -31,7 +31,7 @@ function Install-ToolPrune {
     # 2. Configure TLS 1.2+ without clobbering TLS 1.3 and Resolve Release
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-    $Tag = "v1.3.2"
+    $Tag = "v1.4.0"
     $AssetDir = $env:TOOLPRUNE_ASSET_DIR
     if ([string]::IsNullOrWhiteSpace($AssetDir)) {
         [Console]::WriteLine(">>> [INFO] Resolving latest release version from GitHub...")

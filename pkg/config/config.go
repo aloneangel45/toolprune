@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/aloneangel45/toolprune/pkg/proxy"
 	"github.com/aloneangel45/toolprune/pkg/pruner"
 	"github.com/aloneangel45/toolprune/pkg/router"
+	"github.com/aloneangel45/toolprune/pkg/security"
 )
 
 // Duration wraps time.Duration to provide seamless YAML/JSON string parsing (e.g. "60s", "2m").
@@ -83,6 +85,7 @@ type ServerConfig struct {
 	CORSOrigins     []string `json:"corsOrigins" yaml:"cors_origins"`          // Allowed CORS origins (default: ["*"])
 	Timeout         Duration `json:"timeout" yaml:"timeout"`                   // Request timeout (default: "60s")
 	InjectProxyInfo bool     `json:"injectProxyInfo" yaml:"inject_proxy_info"` // Inject ToolPrune banner in init (default: true)
+	MetricsAddr     string   `json:"metricsAddr,omitempty" yaml:"metrics_addr,omitempty"` // Optional live telemetry address (e.g. "127.0.0.1:9095")
 }
 
 // UpstreamConfig defines connection parameters for an upstream MCP server.
@@ -134,13 +137,31 @@ type RoutingConfig struct {
 	Profiles         map[string]ProfileConfig `json:"profiles" yaml:"profiles"`                   // Named profile configurations
 }
 
+// SecurityConfig specifies tool-poisoning scanning, SHA-256 lockfile rug-pull protection, and JSONL event logging.
+type SecurityConfig struct {
+	Mode             string `json:"mode" yaml:"mode"`                                           // "off" | "warn" | "enforce" | "update" (default: "off")
+	Lockfile         string `json:"lockfile,omitempty" yaml:"lockfile,omitempty"`               // Path to toolprune.lock (default: "toolprune.lock")
+	SecurityLog      string `json:"securityLog,omitempty" yaml:"security_log,omitempty"`        // Optional MCPGate-compatible JSONL event log path
+	BlockOnPoisoning bool   `json:"blockOnPoisoning" yaml:"block_on_poisoning"`                 // Quarantine high/critical poisoned tools in enforce mode (default: true)
+}
+
+// ResponsePruningConfig specifies deterministic tools/call payload trimming controls.
+type ResponsePruningConfig struct {
+	MaxResponseTokens int  `json:"maxResponseTokens,omitempty" yaml:"max_response_tokens,omitempty"` // Hard token ceiling per tools/call response (0 = disabled)
+	PreserveErrors    bool `json:"preserveErrors" yaml:"preserve_errors"`                            // Keep isError: true payloads intact (default: true)
+	ArrayHeadTail     int  `json:"arrayHeadTail" yaml:"array_head_tail"`                             // Head/tail items kept when trimming JSON arrays (default: 5)
+	DeduplicateLogs   bool `json:"deduplicateLogs" yaml:"deduplicate_logs"`                          // Deduplicate consecutive identical/near-identical log lines (default: true)
+}
+
 // Config represents the top-level configuration for ToolPrune.
 type Config struct {
-	Version   string           `json:"version" yaml:"version"`
-	Server    ServerConfig     `json:"server" yaml:"server"`
-	Pruning   PruningConfig    `json:"pruning" yaml:"pruning"`
-	Routing   RoutingConfig    `json:"routing" yaml:"routing"`
-	Upstreams []UpstreamConfig `json:"upstreams" yaml:"upstreams"`
+	Version         string                `json:"version" yaml:"version"`
+	Server          ServerConfig          `json:"server" yaml:"server"`
+	Pruning         PruningConfig         `json:"pruning" yaml:"pruning"`
+	ResponsePruning ResponsePruningConfig `json:"responsePruning" yaml:"response_pruning"`
+	Security        SecurityConfig        `json:"security" yaml:"security"`
+	Routing         RoutingConfig         `json:"routing" yaml:"routing"`
+	Upstreams       []UpstreamConfig      `json:"upstreams" yaml:"upstreams"`
 }
 
 // DefaultServerConfig returns production defaults for the server block.
@@ -189,14 +210,36 @@ func DefaultRoutingConfig() RoutingConfig {
 	}
 }
 
+// DefaultSecurityConfig returns safe defaults for MCP security scanning and lockfile verification.
+func DefaultSecurityConfig() SecurityConfig {
+	return SecurityConfig{
+		Mode:             security.ModeOff,
+		Lockfile:         security.DefaultLockfileName,
+		SecurityLog:      "",
+		BlockOnPoisoning: true,
+	}
+}
+
+// DefaultResponsePruningConfig returns safe defaults for deterministic tools/call response pruning.
+func DefaultResponsePruningConfig() ResponsePruningConfig {
+	return ResponsePruningConfig{
+		MaxResponseTokens: 0,
+		PreserveErrors:    true,
+		ArrayHeadTail:     5,
+		DeduplicateLogs:   true,
+	}
+}
+
 // DefaultConfig returns a fully populated Config initialized with standard production defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		Version:   "1",
-		Server:    DefaultServerConfig(),
-		Pruning:   DefaultPruningConfig(),
-		Routing:   DefaultRoutingConfig(),
-		Upstreams: make([]UpstreamConfig, 0),
+		Version:         "1",
+		Server:          DefaultServerConfig(),
+		Pruning:         DefaultPruningConfig(),
+		ResponsePruning: DefaultResponsePruningConfig(),
+		Security:        DefaultSecurityConfig(),
+		Routing:         DefaultRoutingConfig(),
+		Upstreams:       make([]UpstreamConfig, 0),
 	}
 }
 
@@ -235,6 +278,19 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Pruning.MaxRegexLength <= 0 {
 		c.Pruning.MaxRegexLength = 25
+	}
+
+	// Security defaults
+	if strings.TrimSpace(c.Security.Mode) == "" {
+		c.Security.Mode = security.ModeOff
+	}
+	if strings.TrimSpace(c.Security.Lockfile) == "" {
+		c.Security.Lockfile = security.DefaultLockfileName
+	}
+
+	// Response pruning defaults
+	if c.ResponsePruning.ArrayHeadTail == 0 {
+		c.ResponsePruning.ArrayHeadTail = 5
 	}
 
 	// Routing defaults
@@ -312,8 +368,13 @@ func (c *Config) Validate() error {
 	if time.Duration(c.Server.Timeout) < 0 {
 		errs = append(errs, "server.timeout cannot be negative")
 	}
+	if addr := strings.TrimSpace(c.Server.MetricsAddr); addr != "" {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			errs = append(errs, fmt.Sprintf("server.metrics_addr %q is invalid: %v", addr, err))
+		}
+	}
 
-	// 2. Pruning validation
+	// 2. Pruning & Response Pruning validation
 	validTiers := map[string]bool{
 		"none":       true,
 		"lossless":   true,
@@ -336,6 +397,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Pruning.MaxSchemaTokens < 0 {
 		errs = append(errs, "pruning.max_schema_tokens cannot be negative")
+	}
+	if c.ResponsePruning.MaxResponseTokens < 0 {
+		errs = append(errs, "response_pruning.max_response_tokens cannot be negative")
+	}
+	if c.ResponsePruning.ArrayHeadTail < 0 {
+		errs = append(errs, "response_pruning.array_head_tail cannot be negative")
+	}
+
+	// 2b. Security validation
+	secMode := strings.ToLower(strings.TrimSpace(c.Security.Mode))
+	if secMode != "" && !security.ValidMode(secMode) {
+		errs = append(errs, fmt.Sprintf("security.mode %q is invalid: must be off, warn, enforce, or update", c.Security.Mode))
 	}
 
 	// 3. Routing validation
@@ -562,6 +635,35 @@ func (c *Config) ToPrunerOptions() pruner.PruneOptions {
 	opts.Condense.StripCodeBlocks = c.Pruning.StripCodeBlocks
 	opts.Condense.StripHTMLTags = c.Pruning.StripHTMLTags
 	return opts
+}
+
+// ToResponsePrunerOptions converts configuration to pruner.ResponsePrunerOptions.
+func (c *Config) ToResponsePrunerOptions() pruner.ResponsePrunerOptions {
+	ht := c.ResponsePruning.ArrayHeadTail
+	if ht <= 0 {
+		ht = 5
+	}
+	return pruner.ResponsePrunerOptions{
+		MaxResponseTokens: c.ResponsePruning.MaxResponseTokens,
+		PreserveErrors:    c.ResponsePruning.PreserveErrors,
+		ArrayHeadTail:     ht,
+		DeduplicateLogs:   c.ResponsePruning.DeduplicateLogs,
+	}
+}
+
+// ToSecurityGuardConfig converts configuration to security.GuardConfig.
+func (c *Config) ToSecurityGuardConfig(logger *slog.Logger) security.GuardConfig {
+	mode := strings.ToLower(strings.TrimSpace(c.Security.Mode))
+	if mode == "" {
+		mode = security.ModeOff
+	}
+	return security.GuardConfig{
+		Mode:             mode,
+		LockfilePath:     strings.TrimSpace(c.Security.Lockfile),
+		SecurityLogPath:  strings.TrimSpace(c.Security.SecurityLog),
+		BlockOnPoisoning: c.Security.BlockOnPoisoning,
+		Logger:           logger,
+	}
 }
 
 // ToSupervisorConfig creates a proxy.SupervisorConfig for an upstream stdio server.

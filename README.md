@@ -67,6 +67,8 @@ irm https://raw.githubusercontent.com/aloneangel45/toolprune/main/install.ps1 | 
   - [Windsurf & Zed](#windsurf--zed)
 - [CLI Reference](#cli-reference)
   - [`toolprune proxy`](#toolprune-proxy)
+  - [`toolprune audit`](#toolprune-audit)
+  - [`toolprune top`](#toolprune-top)
   - [`toolprune bench`](#toolprune-bench)
   - [`toolprune routes`](#toolprune-routes)
   - [`toolprune config`](#toolprune-config)
@@ -115,6 +117,9 @@ The **Model Context Protocol (MCP)** standardizes how frontier LLMs connect to d
 - **Tier 3 (`aggressive` / `--preset strict`)**: Strips redundant docstrings on self-evident parameters (`id`, `path`, `query`, `repo`, `branch`) while preserving `type`, `properties`, `required`, `enum`, `const`, `$ref`, `$defs`/`definitions`, `anyOf`/`oneOf`/`allOf`, `not`, bounds, and MCP `annotations`.
 - **Tier 4 (`dynamic` / `--preset dynamic`)**: Exposes compact tool cards managed by an LRU active sliding window plus four built-in discovery/invocation meta-tools (`toolprune_search_tools`, `toolprune_get_tool_schema`, `toolprune_activate_tools`, `toolprune_invoke`). Dormant tools auto-hydrate on demand.
 - **RFC #1 Adaptive Token-Budget Compactor (`--max-schema-tokens=N`)**: Enforces a hard upper bound on `tools/list` tokens in `<0.5ms` using a 5-pass structural AST compactor weighted by live `tools/call` recency and domain affinity, paired with `<0.1ms` pre-binding argument validation that returns self-correcting `CallToolResult{IsError: true}` diagnostics before invalid calls reach upstream servers.
+- **Deterministic Tool Output / Response Pruner (`--max-response-tokens=N`)**: Caps bloated `tools/call` outputs while preserving `isError: true` error messages intact, compacting oversized JSON arrays to head+tail elements with `[... N items omitted by ToolPrune ...]` markers, and deduplicating repetitive log lines as `(repeated Nx)`.
+- **MCP Tool-Poisoning Guard & SHA-256 Rug-Pull Lockfile (`--security-mode`, `toolprune.lock`)**: Scans tool metadata and nested JSON schema descriptions for prompt-injection tags (`<IMPORTANT>`, `<SYSTEM>`, stealth directives), credential exfiltration paths (`~/.ssh`, `.env`, `/etc/passwd`), zero-width/BiDi Unicode spoofing, Base64 payloads, and shell smuggling; pins canonical SHA-256 tool hashes in `toolprune.lock`, quarantines mid-session rug-pulls in `enforce` mode, and logs MCPGate-compatible JSONL events (`--security-log`).
+- **Live Prometheus Telemetry & `toolprune top` (`--metrics-addr`)**: Tracks per-upstream request counts, error rates, schema & response token savings, security alerts, average latency, and estimated USD saved over `/metrics` (Prometheus) and `/api/stats` (JSON).
 
 ---
 
@@ -440,18 +445,54 @@ Usage:
   toolprune proxy [flags] [-- <upstream_cmd> [args...]]
 
 Flags:
-  -c, --config string           Path to toolprune.yaml configuration file
-  -m, --mode string             Pruning tier: none, lossless, compact, aggressive, dynamic (default "aggressive")
-      --preset string           Preset alias: fast (lossless), balanced (compact), strict (aggressive), dynamic
-      --max-schema-tokens int   Hard token budget for tools/list schemas (0 = disabled; env TOOLPRUNE_MAX_SCHEMA_TOKENS)
-  -t, --transport string        Inbound transport protocol: stdio, sse (serves /sse, /messages, and /mcp) (default "stdio")
-      --host string             Listen host address for SSE/HTTP transport (default "127.0.0.1")
-  -p, --port int                Listen port for SSE/HTTP transport (default 8080)
-      --profile string          Active routing profile: full, read_only, dev, minimal (default "full")
-      --namespace string        Namespacing strategy: auto, always, on_collision, none (default "auto")
-      --timeout duration        Request timeout duration (default 1m0s)
-      --stats                   Print session token savings summary to stderr on exit (default true)
-      --log-level string        Log level: debug, info, warn, error (default "info")
+  -c, --config string             Path to toolprune.yaml configuration file
+  -m, --mode string               Pruning tier: none, lossless, compact, aggressive, dynamic (default "aggressive")
+      --preset string             Preset alias: fast (lossless), balanced (compact), strict (aggressive), dynamic
+      --max-schema-tokens int     Hard token budget for tools/list schemas (0 = disabled; env TOOLPRUNE_MAX_SCHEMA_TOKENS)
+      --max-response-tokens int   Hard token budget for tools/call outputs (0 = disabled; env TOOLPRUNE_MAX_RESPONSE_TOKENS)
+      --security-mode string      MCP poisoning & rug-pull guard mode: off, warn, enforce, update (env TOOLPRUNE_SECURITY_MODE)
+      --lockfile string           Path to SHA-256 toolprune.lock file (default "toolprune.lock")
+      --security-log string       Path to MCPGate-compatible JSONL security event log (env TOOLPRUNE_SECURITY_LOG)
+      --metrics-addr string       Listen address for live Prometheus (/metrics) & JSON (/api/stats) telemetry (e.g. 127.0.0.1:9095)
+  -t, --transport string          Inbound transport protocol: stdio, sse (serves /sse, /messages, and /mcp) (default "stdio")
+      --host string               Listen host address for SSE/HTTP transport (default "127.0.0.1")
+  -p, --port int                  Listen port for SSE/HTTP transport (default 8080)
+      --profile string            Active routing profile: full, read_only, dev, minimal (default "full")
+      --namespace string          Namespacing strategy: auto, always, on_collision, none (default "auto")
+      --timeout duration          Request timeout duration (default 1m0s)
+      --stats                     Print session token savings summary to stderr on exit (default true)
+      --log-level string          Log level: debug, info, warn, error (default "info")
+```
+
+### `toolprune audit`
+Audits `toolprune.yaml`, static JSON tool schema files, and host IDE MCP configs for tool-poisoning payloads, SHA-256 lockfile drift, unpinned `npx`/`uvx` commands, hardcoded secrets, and insecure remote HTTP URLs.
+
+```text
+Usage:
+  toolprune audit [flags]
+
+Flags:
+  -c, --config string       Audit a toolprune.yaml configuration file
+      --schema-file string  Audit a JSON tool schema file ([]Tool or {tools: [...]})
+      --all-ides            Discover and audit Claude Desktop, Claude Code, Cursor, VS Code, Windsurf, and Zed MCP configs
+      --dir string          Target project directory for project-level IDE configs
+      --format string       Output format: table, json, sarif (SARIF 2.1.0) (default "table")
+      --fail-on string      Exit non-zero if any finding meets/exceeds severity: critical, high, medium, low
+      --lockfile string     Path to toolprune.lock for verifying or updating SHA-256 tool pins
+      --update-lockfile     Write/refresh canonical SHA-256 tool hashes into --lockfile
+```
+
+### `toolprune top`
+Displays a live terminal dashboard of per-upstream request counts, schema/response token reduction, security alerts, latency, and estimated USD saved from a running proxy's `--metrics-addr` endpoint.
+
+```text
+Usage:
+  toolprune top [flags]
+
+Flags:
+      --url string          Telemetry stats endpoint (default "http://127.0.0.1:9095/api/stats")
+      --once                Print a single telemetry snapshot and exit
+      --interval duration   Refresh interval in live dashboard mode (default 1s)
 ```
 
 ### `toolprune bench`
@@ -539,6 +580,7 @@ server:
   cors_origins: []
   timeout: "60s"
   inject_proxy_info: true
+  metrics_addr: "127.0.0.1:9095" # Optional live Prometheus (/metrics) & JSON (/api/stats) listener
 
 pruning:
   tier: "aggressive"          # none | lossless | compact | aggressive | dynamic
@@ -551,6 +593,18 @@ pruning:
   strict_draft07: true
   strip_code_blocks: true
   strip_html_tags: true
+
+response_pruning:
+  max_response_tokens: 0      # Cap oversized tools/call payloads (0 = disabled; env TOOLPRUNE_MAX_RESPONSE_TOKENS)
+  preserve_errors: true       # Keep isError: true error diagnostics intact
+  array_head_tail: 5          # Preserve first/last K elements of oversized JSON arrays
+  deduplicate_logs: true      # Collapse consecutive repeated log lines as "(repeated Nx)"
+
+security:
+  mode: "warn"                # off | warn | enforce | update
+  lockfile: "toolprune.lock"  # Canonical SHA-256 rug-pull lockfile
+  security_log: ""            # Optional MCPGate-compatible JSONL security event log path
+  block_on_poisoning: true    # Quarantine high/critical poisoned tools in enforce mode
 
 routing:
   default_profile: "full"     # full | read_only | dev | minimal | custom

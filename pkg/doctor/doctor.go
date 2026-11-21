@@ -54,14 +54,37 @@ type UpstreamCheck struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// SecurityCheck summarizes the configured ToolPrune security guard & lockfile status.
+type SecurityCheck struct {
+	Mode             string `json:"mode"`
+	Lockfile         string `json:"lockfile,omitempty"`
+	LockfileFound    bool   `json:"lockfileFound"`
+	SecurityLog      string `json:"securityLog,omitempty"`
+	BlockOnPoisoning bool   `json:"blockOnPoisoning"`
+	Status           string `json:"status"`
+	Hint             string `json:"hint,omitempty"`
+}
+
+// ResponsePruningCheck summarizes deterministic tools/call response pruning settings.
+type ResponsePruningCheck struct {
+	Enabled           bool   `json:"enabled"`
+	MaxResponseTokens int    `json:"maxResponseTokens"`
+	PreserveErrors    bool   `json:"preserveErrors"`
+	ArrayHeadTail     int    `json:"arrayHeadTail"`
+	DeduplicateLogs   bool   `json:"deduplicateLogs"`
+	Status            string `json:"status"`
+}
+
 // ConfigReport summarizes discovery and validation of toolprune.yaml and its upstreams.
 type ConfigReport struct {
-	Found     bool            `json:"found"`
-	Path      string          `json:"path,omitempty"`
-	Valid     bool            `json:"valid"`
-	Status    string          `json:"status"`
-	Error     string          `json:"error,omitempty"`
-	Upstreams []UpstreamCheck `json:"upstreams,omitempty"`
+	Found           bool                  `json:"found"`
+	Path            string                `json:"path,omitempty"`
+	Valid           bool                  `json:"valid"`
+	Status          string                `json:"status"`
+	Error           string                `json:"error,omitempty"`
+	Upstreams       []UpstreamCheck       `json:"upstreams,omitempty"`
+	Security        *SecurityCheck        `json:"security,omitempty"`
+	ResponsePruning *ResponsePruningCheck `json:"responsePruning,omitempty"`
 }
 
 // ClientConfigCheck summarizes read-only inspection of a discovered or candidate MCP client config.
@@ -339,14 +362,73 @@ func checkToolpruneConfig(projectDir string, dirExplicit bool, explicitConfig st
 		errSummary = strings.Join(errs, "; ")
 	}
 
+	secCheck := inspectSecurityConfig(cfg, filepath.Dir(cfgPath))
+	respCheck := inspectResponsePruningConfig(cfg)
+
 	return ConfigReport{
-		Found:     true,
-		Path:      cfgPath,
-		Valid:     valid,
-		Status:    status,
-		Error:     errSummary,
-		Upstreams: checks,
+		Found:           true,
+		Path:            cfgPath,
+		Valid:           valid,
+		Status:          status,
+		Error:           errSummary,
+		Upstreams:       checks,
+		Security:        secCheck,
+		ResponsePruning: respCheck,
 	}, errs
+}
+
+func inspectSecurityConfig(cfg *config.Config, baseDir string) *SecurityCheck {
+	mode := strings.ToLower(strings.TrimSpace(cfg.Security.Mode))
+	if mode == "" {
+		mode = "off"
+	}
+	lockPath := strings.TrimSpace(cfg.Security.Lockfile)
+	resolvedLock := lockPath
+	if lockPath != "" && !filepath.IsAbs(lockPath) && baseDir != "" {
+		resolvedLock = filepath.Join(baseDir, lockPath)
+	}
+	lockFound := false
+	if resolvedLock != "" {
+		if fi, err := os.Stat(resolvedLock); err == nil && !fi.IsDir() {
+			lockFound = true
+		}
+	}
+
+	sc := &SecurityCheck{
+		Mode:             mode,
+		Lockfile:         lockPath,
+		LockfileFound:    lockFound,
+		SecurityLog:      strings.TrimSpace(cfg.Security.SecurityLog),
+		BlockOnPoisoning: cfg.Security.BlockOnPoisoning,
+		Status:           "ok",
+	}
+	switch mode {
+	case "off":
+		sc.Status = "warn"
+		sc.Hint = "Enable security.mode: warn or enforce to guard against MCP tool poisoning and rug-pull mutations"
+	case "enforce":
+		if lockPath != "" && !lockFound {
+			sc.Status = "warn"
+			sc.Hint = fmt.Sprintf("Lockfile %q not found yet; run 'toolprune proxy --security-mode update' or 'toolprune audit --update-lockfile' to initialize SHA-256 pins", lockPath)
+		}
+	}
+	return sc
+}
+
+func inspectResponsePruningConfig(cfg *config.Config) *ResponsePruningCheck {
+	enabled := cfg.ResponsePruning.MaxResponseTokens > 0
+	status := "disabled"
+	if enabled {
+		status = "ok"
+	}
+	return &ResponsePruningCheck{
+		Enabled:           enabled,
+		MaxResponseTokens: cfg.ResponsePruning.MaxResponseTokens,
+		PreserveErrors:    cfg.ResponsePruning.PreserveErrors,
+		ArrayHeadTail:     cfg.ResponsePruning.ArrayHeadTail,
+		DeduplicateLogs:   cfg.ResponsePruning.DeduplicateLogs,
+		Status:            status,
+	}
 }
 
 func resolveUpstreamExecutable(cmdName, upDir, projectDir string) (string, error) {
@@ -620,6 +702,31 @@ func FormatReport(w io.Writer, r *Report) {
 			fmt.Fprintf(tw, "   %s\t%s\t%s\t%s\n", up.ID, up.Transport, strings.ToUpper(up.Status), detail)
 		}
 		_ = tw.Flush()
+	}
+	if r.Config.Security != nil {
+		sc := r.Config.Security
+		tag := "[OK]  "
+		if sc.Status == "warn" {
+			tag = "[WARN]"
+		}
+		lockState := "not_found"
+		if sc.LockfileFound {
+			lockState = "present"
+		}
+		fmt.Fprintf(w, "   %s Security Guard: mode=%s lockfile=%s (%s) block_on_poisoning=%t\n",
+			tag, sc.Mode, sc.Lockfile, lockState, sc.BlockOnPoisoning)
+		if sc.Hint != "" {
+			fmt.Fprintf(w, "          Hint: %s\n", sc.Hint)
+		}
+	}
+	if r.Config.ResponsePruning != nil {
+		rp := r.Config.ResponsePruning
+		if rp.Enabled {
+			fmt.Fprintf(w, "   [OK]   Response Pruner: max_response_tokens=%d preserve_errors=%t array_head_tail=%d deduplicate_logs=%t\n",
+				rp.MaxResponseTokens, rp.PreserveErrors, rp.ArrayHeadTail, rp.DeduplicateLogs)
+		} else {
+			fmt.Fprintln(w, "   [INFO] Response Pruner: disabled (set response_pruning.max_response_tokens or --max-response-tokens to cap tool outputs)")
+		}
 	}
 	fmt.Fprintln(w)
 
