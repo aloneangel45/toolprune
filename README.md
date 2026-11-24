@@ -17,6 +17,7 @@
   <a href="#"><img src="https://img.shields.io/badge/Schema-Draft--07%20%7C%202020--12-orange?style=flat-square" alt="Schema Compliant"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-Stdio%20%7C%20SSE%20%7C%20Streamable%20HTTP-blueviolet?style=flat-square" alt="MCP Protocol"/></a>
   <a href="https://github.com/aloneangel45/toolprune/releases"><img src="https://img.shields.io/github/v/release/aloneangel45/toolprune?style=flat-square&color=blue" alt="Latest Release"/></a>
+  <a href="https://glama.ai/mcp/servers/aloneangel45/toolprune"><img src="https://glama.ai/mcp/servers/aloneangel45/toolprune/badges/score.svg" alt="aloneangel45/toolprune MCP server"/></a>
 </p>
 
 ```text
